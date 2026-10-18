@@ -277,14 +277,16 @@ public:
                         modulationDials.push_back (dial);
                     }
             }
-        const StringArray names { "SYNTH", "EFFECTS", "MATRIX", "GLOBAL", "EDITOR", "SAMPLE" };
+        // Page 3 (about) has no tab; the ABOUT button in the header opens it.
+        const StringArray names { "SYNTH", "EFFECTS", "MATRIX", "EDITOR", "SAMPLE" };
         for (int i = 0; i < names.size(); ++i)
         {
-            tabs.push_back (std::make_unique<Action> (names[i], [this, i] { selectPage (i); }));
+            tabs.push_back (std::make_unique<Action> (names[i], [this, i] { selectPage (tabPages[(size_t) i]); }));
             tabs.back()->quiet = true;
             if (i == 0) tabs.back()->onModulationHover = [this] { selectPage (0); };
             addAndMakeVisible (*tabs.back());
         }
+        addAndMakeVisible (about);
         for (int i = 0; i < fxNames.size(); ++i)
         {
             fxButtons.push_back (std::make_unique<Action> (fxNames[i], [this, i]
@@ -332,6 +334,7 @@ public:
         gain.setBounds (1040, 7, 88, 77); meter.setBounds (1140, 8, 58, 75);
         voiceMode.setBounds (846, 28, 104, 28); glide.setBounds (956, 7, 80, 77);
         for (int i = 0; i < (int) tabs.size(); ++i) tabs[(size_t) i]->setBounds (20 + i * 106, 94, 98, 31);
+        about.setBounds (1060, 96, 160, 28);
         tableSelector.setBounds (34, 177, 278, 27);
         flat.setBounds (322, 178, 38, 25); stack.setBounds (366, 178, 38, 25); fftView.setBounds (410, 178, 44, 25);
         tablePrevious.setBounds (264, 489, 88, 25); tableNext.setBounds (360, 489, 88, 25);
@@ -398,10 +401,9 @@ public:
         label (g, "W A V E   /   WAVETABLE SYNTH", { 84, 52, 242, 18 }, 9, muted);
         label (g, "FACTORY / " + String (currentPatch >= 0 ? bw::factoryPresets()[(size_t) currentPatch].category : "USER"), { 406, 9, 356, 13 }, 8, muted);
         label (g, "VOICE ENGINE", { 846, 10, 104, 15 }, 9, muted);
-        badge (g, "BORATO WAVE  /  0.1", { 1060, 99, 160, 22 }, muted);
+
         const StringArray captions { "SOUND STARTS HERE.", "SHAPE THE SPACE.", "MAKE CONNECTIONS.", "THE INSTRUMENT, AT A GLANCE.", "DRAW YOUR OWN TABLES.", "PLAY ANY RECORDING." };
-        label (g, captions[page],
-               { 532, 98, 480, 24 }, 10, faint, Justification::centredRight);
+        label (g, captions[page], { 560, 98, 490, 24 }, 10, faint, Justification::centredRight);
         if (page == 0) paintSynth (g);
         if (page == 1) paintEffects (g);
 
@@ -480,11 +482,11 @@ private:
     }
     void paintGlobal (Graphics& g)
     {
-        section (g, { 20, 144, 1200, 654 }, "GLOBAL", "ENGINE", mint);
+        section (g, { 20, 144, 1200, 654 }, "ABOUT", "0.1", mint);
         label (g, "An instrument made to evolve.", { 48, 193, 1120, 40 }, 29, text);
         const StringArray titles { "VOICE ENGINE", "WAVETABLE", "INTERFACE" };
         const StringArray values { "16 voices", "8 tables", "100% vector" };
-        const StringArray details { "Poly, mono or legato / glide / bend +/-2 st", "Dual oscillator / sub / white noise", "Custom controls / scalable drawing" };
+        const StringArray details { "Poly, mono or legato / glide / bend +/-2 st", "A/B with FM / editor / sample / sub / noise", "Custom controls / scalable drawing" };
         for (int i = 0; i < 3; ++i)
         {
             Rectangle<int> r (48 + i * 386, 261, 362, 132);
@@ -504,7 +506,8 @@ private:
     void selectPage (int index)
     {
         page = index;
-        for (int i = 0; i < (int) tabs.size(); ++i) tabs[(size_t) i]->setSelected (page == i);
+        for (int i = 0; i < (int) tabs.size(); ++i) tabs[(size_t) i]->setSelected (page == tabPages[(size_t) i]);
+        about.setSelected (page == 3);
         for (Component* c : std::initializer_list<Component*> { &wt, &env, &filter, &lfo, &wtPos, &level, &cutoff, &reso,
              &attack, &decay, &sustain, &release, &flat, &stack, &fftView, &tableSelector, &tablePrevious, &tableNext,
              &wtB, &wtPosB, &levelB, &pitchA, &fineA, &panA, &pitchB, &fineB, &panB, &subLevel, &subOctave, &noiseLevel,
@@ -767,6 +770,8 @@ private:
     Meter meter;
     Action preset, previous, next, flat, stack, fftView, tableSelector, tablePrevious, tableNext, flatB, stackB, fftB, selectorB, previousB, nextB, octaveDown, octaveUp;
     std::vector<std::unique_ptr<Action>> tabs, fxButtons;
+    static constexpr std::array<int, 5> tabPages { 0, 1, 2, 4, 5 };
+    Action about { "ABOUT  0.1", [this] { selectPage (page == 3 ? 0 : 3); } };
     std::vector<std::unique_ptr<Dial>> unisonDials;
     std::vector<Dial*> modulationDials;
     String status = "READY";

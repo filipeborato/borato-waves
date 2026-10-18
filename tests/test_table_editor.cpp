@@ -26,6 +26,17 @@ juce::MouseEvent mouseEvent (Component& c, float x, float y)
     return { juce::Desktop::getInstance().getMainMouseSource(), point, juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0,
              &c, &c, juce::Time::getCurrentTime(), point, juce::Time::getCurrentTime(), 1, false };
 }
+// JUCE runs pending timers for at most 100 ms per call, and the editor's own timer is slow in Debug.
+template <typename Condition>
+bool pumpTimersUntil (Condition done)
+{
+    for (int attempt = 0; attempt < 20 && ! done(); ++attempt)
+    {
+        juce::Thread::sleep (80);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    return done();
+}
 void press (Component& editor, const juce::String& title)
 {
     auto* control = findControl (editor, title);
@@ -226,9 +237,7 @@ void testEditorPanel()
     assert (panel->selectedFrame() == 1);
     assert (std::abs (processor.apvts.getRawParameterValue ("wtPos")->load() - 1.0f / (float) (frames - 1)) < 1.0e-4f);
     processor.apvts.getParameter ("wtPos")->setValueNotifyingHost (1);
-    juce::Thread::sleep (100);
-    juce::Timer::callPendingTimersSynchronously();
-    assert (panel->selectedFrame() == frames - 1);
+    assert (pumpTimersUntil ([&] { return panel->selectedFrame() == frames - 1; }));
     press (*editor, "< FRAME");
     press (*editor, "< FRAME");
     assert (panel->selectedFrame() == frames - 3);
@@ -248,9 +257,8 @@ void testEditorPanel()
 
     // A preset load replaces the table under the editor; the editor follows instead of republishing.
     processor.loadFactoryPreset (0);
-    juce::Thread::sleep (100);
-    juce::Timer::callPendingTimersSynchronously();
-    assert (! processor.usingUserTable (1) && panel->frames() == processor.wavetableBank[0].numFrames);
+    assert (pumpTimersUntil ([&] { return panel->frames() == processor.wavetableBank[0].numFrames; }));
+    assert (! processor.usingUserTable (1));
 
     // Screenshots for review.
     const auto shots = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("borato-wave-ui");

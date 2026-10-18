@@ -292,7 +292,7 @@ int main (int argc, char** argv)
     findControl (editor, "Init / Pure wave    /    INIT")->keyPressed (KeyPress (KeyPress::returnKey));
 
     // Exercise every page and factory patch through the same keyboard actions as users.
-    for (const char* title : { "SYNTH", "EFFECTS", "MATRIX", "GLOBAL" })
+    for (const char* title : { "SYNTH", "EFFECTS", "MATRIX", "EDITOR", "SAMPLE", "ABOUT  0.1" })
     {
         auto* tab = findControl (editor, title);
         assert (tab != nullptr && tab->keyPressed (KeyPress (KeyPress::returnKey)));
