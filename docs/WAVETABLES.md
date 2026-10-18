@@ -21,7 +21,7 @@ Every table contains 16 original procedural frames of 2048 samples with 11 FFT b
 
 ## DSP and state
 
-`WavetableBank` constructs all tables before playback. Voices share the immutable bank, whose lifetime exceeds theirs. `TableOscillator` owns per-voice transition state and reads at most two tables per sample. A linear 15 ms crossfade preserves oscillator phase during a bank change. Rapid changes retain the latest pending choice and finish the current fade before starting another, reaching a settled final choice within approximately 30 ms plus the parameter polling interval. Frame position keeps the existing 20 ms smoothing.
+`WavetableBank` constructs all tables before playback, once per process (`WavetableBank::shared()`); every plug-in instance and voice shares that immutable bank, whose lifetime exceeds theirs. `TableOscillator` owns per-voice transition state and reads at most two tables per sample. A linear 15 ms crossfade preserves oscillator phase during a bank change. Rapid changes retain the latest pending choice and finish the current fade before starting another, reaching a settled final choice within approximately 30 ms plus the parameter polling interval. Frame position keeps the existing 20 ms smoothing.
 
 Bank generation, FFT displays, text filtering and browser allocations run outside the audio callback. The new sample path has no locks, allocation, I/O or table destruction. Existing JUCE synthesizer/keyboard synchronization remains separate from this change. Notes with fundamentals at or above Nyquist are silent, preventing invalid phase reads at unusually low device sample rates.
 
@@ -39,8 +39,34 @@ See [WAVETABLE_RESEARCH.md](WAVETABLE_RESEARCH.md) for the Serum context, saved 
 
 Debug tests cover every bank/frame/mip, spectral cutoff, DC, finite samples, peak normalization, interpolation, legacy equality, bank distinctness, transition continuity and rapid switching at 8–192 kHz. Processor/UI tests cover actual MIDI output differences, held-note automation, state migration, GUI selection labels, search, gestures, frame scanning, FFT rendering and resizing. Standalone and VST3 Release builds are produced in `build-ui/BoratoWave_artefacts/Release/`.
 
-WAV import and FFT editing remain pending. Unison and modulation routing are now implemented; see [MODULATION.md](MODULATION.md). Hardware listening and DAW automation remain manual validation.
+WAV import and frame/harmonic editing are implemented (see below). Unison and modulation routing are now implemented; see [MODULATION.md](MODULATION.md). Hardware listening and DAW automation remain manual validation.
 
 [Library](images/wavetables.png) | [Filtered library](images/wavetable-search.png) | [Harmonics](images/wavetable-spectrum.png)
 
 Both OSC A and B now select these tables independently; see [SOURCES.md](SOURCES.md).
+
+## Frame and harmonic editor
+
+The **EDITOR** page edits OSC A's or B's current table, factory or user, as a copy:
+
+- **Draw:** dragging over the cycle draws straight strokes.
+- **Harmonics:** dragging the 32 bars sets each harmonic's level relative to the strongest of them. A harmonic keeps its phase; one that was silent starts as a sine.
+- **Frames:** the selected frame is the one the oscillator plays: choosing a frame moves the oscillator's POSITION, and moving POSITION elsewhere selects the frame. < FRAME / FRAME > select a frame; + FRAME duplicates it, up to 256 frames; - FRAME removes it, keeping at least one.
+- **EXPORT WAV** writes the frames back to back as 2048-sample 32-bit float cycles, which IMPORT WAV reads back as the same table.
+
+Edits publish as the oscillator's user table, named after the source table with " edit". Publishing happens on mouse-up and at most 15 times a second while dragging. During a drag the editor also waits until the audio thread has let go of the previous edit, so memory stays bounded when no audio is running. Notes keep sounding through the 15 ms table crossfade. Building runs on the message thread and rebuilds only the frames edited since the last build. A frame-count change rebuilds every frame. The audio thread only swaps a pointer.
+
+Built frames go through the normal table path: no DC, peak normalised to 1 at level 0, and a wrap sample on every band level. The editor adopts that result, so what it shows is what plays. Drawing a small change may therefore rescale the whole frame. A preset load, import or table choice that replaces the oscillator's table reloads the editor; the editor never republishes over it. Edited tables are saved in the state and in presets like imported ones.
+
+`test_table_editor` covers:
+
+- the harmonic levels heard (h3/h1 = 0.5 ± 0.03 at 44.1/48/96 kHz, with no h2);
+- normalisation, DC and wrap after setting every harmonic and after a random scribble;
+- alias-free playback of a scribble at MIDI 96;
+- frame limits;
+- 60 edits published under a held note at the panel's rate, with no dropout and superseded tables freed;
+- state and WAV round trips;
+- the panel itself driven by mouse and key events: harmonic drag, drawing, frame buttons, OSC B and reload after a preset.
+
+It also writes `editor.png`, `sample.png` and `synth.png` screenshots to the temp folder `borato-wave-ui`.
+

@@ -27,6 +27,13 @@ public:
         { "Phase Bend", "Digital", "Sine with increasing periodic phase distortion" }
     }};
 
+    // The factory bank is immutable: build it once per process.
+    static const WavetableBank& shared()
+    {
+        static const WavetableBank bank;
+        return bank;
+    }
+
     WavetableBank()
     {
         tables[0] = Wavetable::makeBasic();

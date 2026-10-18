@@ -3,6 +3,8 @@
 #include "UI/Displays.h"
 #include "UI/WavetableBrowser.h"
 #include "UI/ModulationUI.h"
+#include "UI/TableEditor.h"
+#include "UI/SamplePanel.h"
 
 using namespace juce;
 using namespace bw::ui;
@@ -235,7 +237,8 @@ public:
           envTab1 ("ENV 1", [this] { selectEnvelope (0); }), envTab2 ("ENV 2", [this] { selectEnvelope (1); }), dragEnv2 ("DRAG ENV 2", 9),
           voiceMode (p.apvts, "voiceMode", "", "Voice mode"), glide (p.apvts, "glide", "GLIDE"),
           warpOnA (p.apvts, "oscAWarpOn", "WARP"), warpOnB (p.apvts, "oscBWarpOn", "B WARP"),
-          warpA (p.apvts, "oscAWarp", "A WARP"), warpB (p.apvts, "oscBWarp", "B WARP", violet)
+          warpA (p.apvts, "oscAWarp", "A WARP"), warpB (p.apvts, "oscBWarp", "B WARP", violet), fmDepth (p.apvts, "fmDepth", "FM FROM B"),
+          tableEditor (p), samplePanel (p)
     {
         setOpaque (true);
         for (Component* c : std::initializer_list<Component*> { &wt, &env, &filter, &lfo, &wtPos, &level, &cutoff, &reso,
@@ -243,7 +246,7 @@ public:
              &fftView, &tableSelector, &tablePrevious, &tableNext, &octaveDown, &octaveUp,
              &wtB, &wtPosB, &levelB, &pitchA, &fineA, &panA, &pitchB, &fineB, &panB, &subLevel, &subOctave, &noiseLevel,
              &onA, &onB, &subOn, &noiseOn, &flatB, &stackB, &fftB, &selectorB, &previousB, &nextB,
-             &voiceMode, &glide, &warpOnA, &warpOnB, &warpA, &warpB })
+             &voiceMode, &glide, &warpOnA, &warpOnB, &warpA, &warpB, &fmDepth })
             addAndMakeVisible (c);
         for (int oscillator = 0; oscillator < 2; ++oscillator)
         {
@@ -262,6 +265,8 @@ public:
              &importA, &importB, &filterTab1, &filterTab2, &env2Attack, &env2Decay, &env2Sustain, &env2Release, &envTab1, &envTab2, &dragEnv2 })
             addChildComponent (c);
         addChildComponent (matrix);
+        addChildComponent (tableEditor);
+        addChildComponent (samplePanel);
         for (auto* child : getChildren())
             if (auto* dial = dynamic_cast<Dial*> (child))
             {
@@ -272,7 +277,7 @@ public:
                         modulationDials.push_back (dial);
                     }
             }
-        const StringArray names { "SYNTH", "EFFECTS", "MATRIX", "GLOBAL" };
+        const StringArray names { "SYNTH", "EFFECTS", "MATRIX", "GLOBAL", "EDITOR", "SAMPLE" };
         for (int i = 0; i < names.size(); ++i)
         {
             tabs.push_back (std::make_unique<Action> (names[i], [this, i] { selectPage (i); }));
@@ -331,14 +336,13 @@ public:
         flat.setBounds (322, 178, 38, 25); stack.setBounds (366, 178, 38, 25); fftView.setBounds (410, 178, 44, 25);
         tablePrevious.setBounds (264, 489, 88, 25); tableNext.setBounds (360, 489, 88, 25);
         wt.setBounds (34, 210, 420, 104);
-        wtPos.setBounds (34, 320, 80, 79); level.setBounds (119, 320, 80, 79);
-        pitchA.setBounds (204, 320, 80, 79); fineA.setBounds (289, 320, 80, 79); panA.setBounds (374, 320, 80, 79);
+        auto dialRow = [] (int x, int y, std::initializer_list<Component*> dials) { for (auto* d : dials) { d->setBounds (x, y, 68, 79); x += 71; } };
+        dialRow (34, 320, { &wtPos, &level, &pitchA, &fineA, &panA, &fmDepth });
         onA.setBounds (382, 151, 72, 23); onB.setBounds (842, 151, 72, 23);
         selectorB.setBounds (494, 177, 260, 27);
         flatB.setBounds (762, 178, 44, 25); stackB.setBounds (812, 178, 44, 25); fftB.setBounds (862, 178, 52, 25);
         wtB.setBounds (494, 210, 420, 104);
-        wtPosB.setBounds (494, 320, 80, 79); levelB.setBounds (579, 320, 80, 79);
-        pitchB.setBounds (664, 320, 80, 79); fineB.setBounds (749, 320, 80, 79); panB.setBounds (834, 320, 80, 79);
+        dialRow (494, 320, { &wtPosB, &levelB, &pitchB, &fineB, &panB });
         previousB.setBounds (714, 489, 96, 25); nextB.setBounds (816, 489, 98, 25);
         for (int oscillator = 0; oscillator < 2; ++oscillator)
             for (int i = 0; i < 5; ++i)
@@ -371,6 +375,8 @@ public:
         dragEnv2.setBounds (314, 654, 140, 22);
         lfo.setBounds (480, 528, 448, 270);
         matrix.setBounds (20, 144, 1200, 654);
+        tableEditor.setBounds (20, 144, 1200, 654);
+        samplePanel.setBounds (20, 144, 1200, 654);
         piano.setBounds (164, 831, 1042, 72);
         octaveDown.setBounds (34, 872, 28, 28); octaveUp.setBounds (116, 872, 28, 28);
         for (int i = 0; i < (int) fxButtons.size(); ++i) fxButtons[(size_t) i]->setBounds (38, 239 + i * 54, 242, 42);
@@ -393,7 +399,8 @@ public:
         label (g, "FACTORY / " + String (currentPatch >= 0 ? bw::factoryPresets()[(size_t) currentPatch].category : "USER"), { 406, 9, 356, 13 }, 8, muted);
         label (g, "VOICE ENGINE", { 846, 10, 104, 15 }, 9, muted);
         badge (g, "BORATO WAVE  /  0.1", { 1060, 99, 160, 22 }, muted);
-        label (g, page == 0 ? "SOUND STARTS HERE." : page == 1 ? "SHAPE THE SPACE." : page == 2 ? "MAKE CONNECTIONS." : "THE INSTRUMENT, AT A GLANCE.",
+        const StringArray captions { "SOUND STARTS HERE.", "SHAPE THE SPACE.", "MAKE CONNECTIONS.", "THE INSTRUMENT, AT A GLANCE.", "DRAW YOUR OWN TABLES.", "PLAY ANY RECORDING." };
+        label (g, captions[page],
                { 532, 98, 480, 24 }, 10, faint, Justification::centredRight);
         if (page == 0) paintSynth (g);
         if (page == 1) paintEffects (g);
@@ -502,10 +509,12 @@ private:
              &attack, &decay, &sustain, &release, &flat, &stack, &fftView, &tableSelector, &tablePrevious, &tableNext,
              &wtB, &wtPosB, &levelB, &pitchA, &fineA, &panA, &pitchB, &fineB, &panB, &subLevel, &subOctave, &noiseLevel,
              &onA, &onB, &subOn, &noiseOn, &flatB, &stackB, &fftB, &selectorB, &previousB, &nextB,
-             &warpOnA, &warpOnB, &warpA, &warpB }) c->setVisible (page == 0);
+             &warpOnA, &warpOnB, &warpA, &warpB, &fmDepth }) c->setVisible (page == 0);
         for (auto& fx : fxButtons) fx->setVisible (page == 1);
         for (auto& dial : unisonDials) dial->setVisible (page == 0);
         matrix.setVisible (page == 2);
+        tableEditor.setVisible (page == 4);
+        samplePanel.setVisible (page == 5);
         updateVisibility();
         repaint();
     }
@@ -774,7 +783,9 @@ private:
     ParameterChoice voiceMode;
     Dial glide;
     ParameterToggle warpOnA, warpOnB;
-    Dial warpA, warpB;
+    Dial warpA, warpB, fmDepth;
+    TableEditor tableEditor;
+    SamplePanel samplePanel;
     const StringArray fxNames { "01    DISTORTION", "02    CHORUS", "03    DELAY", "04    REVERB", "05    EQUALIZER", "06    COMPRESSOR" };
     std::unique_ptr<FileChooser> chooser;
     std::unique_ptr<ParameterAttachment> tableAttachment, attachmentB;

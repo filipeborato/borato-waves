@@ -48,7 +48,7 @@ String Dial::valueText() const
     if (id == "cutoff" || id == "cutoff2") return plainValue >= 1000 ? String (plainValue / 1000.0f, 2) + " kHz" : String (plainValue, 0) + " Hz";
     if (id == "gain" || id == "distDrive") return String (plainValue, 1) + " dB";
     if (id == "delayTime") return String (plainValue, 0) + " ms";
-    if (id == "attack" || id == "decay" || id == "release")
+    if (id == "attack" || id == "decay" || id == "release" || id == "glide")
         return plainValue < 1 ? String (plainValue * 1000, 0) + " ms" : String (plainValue, 2) + " s";
     if (id == "reso" || id == "reso2") return String (plainValue, 2) + " Q";
     if (id.endsWith ("Unison")) return String (plainValue, 0) + " voices";

@@ -5,6 +5,7 @@
 #include "Filter.h"
 #include "Effects.h"
 #include "UserWavetable.h"
+#include "Sample.h"
 #include "FactoryPresets.h"
 #include <array>
 
@@ -19,9 +20,11 @@ struct SynthParams
     std::array<OscParams, 2> oscillators;
     std::atomic<float> *subOn, *subLevel, *subOctave, *noiseOn, *noiseLevel;
     std::atomic<float> *filterType, *filter2On, *filter2Type, *cutoff2, *reso2, *filterRouting, *subRoute, *noiseRoute;
-    std::atomic<float> *env2Attack, *env2Decay, *env2Sustain, *env2Release;
-    // Written by the audio thread at block start; null when no user table is loaded.
+    std::atomic<float> *env2Attack, *env2Decay, *env2Sustain, *env2Release, *fmDepth;
+    std::atomic<float> *sampleOn, *sampleLevel, *samplePitch, *sampleStart, *sampleEnd, *sampleLoop;
+    // Written by the audio thread at block start; null when no user table or sample is loaded.
     std::array<const bw::Wavetable*, 2> userTables {};
+    const bw::Sample* sample = nullptr;
 };
 
 inline juce::StringArray routeNames() { return { "Filter 1", "Filter 2", "Direct" }; }
@@ -48,6 +51,9 @@ public:
     // Mono/legato: the next startNote glides from the current pitch; legato changes pitch without retriggering.
     void setPendingGlide (float seconds) { pendingGlide = seconds; }
     void legato (int note, float glideSeconds);
+    // After a block: whether this voice reads only the current user table / sample.
+    bool settled (size_t oscillator) const { return ! isVoiceActive () || oscillators[oscillator].settled (); }
+    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && playingSample == params.sample); }
 
 private:
     void glideTo (int note, float seconds);
@@ -62,7 +68,7 @@ private:
     struct Lane
     {
         juce::SmoothedValue<float> gain, offset;
-        double phase = 0, frequency = 440;
+        double phase = 0, frequency = 440, cachedSpread = 0;
         float cachedPitch = 10000, cachedPan = 10000, cachedWidth = 0, leftGain = 1, rightGain = 1;
         int mip = 0;
     };
@@ -70,6 +76,8 @@ private:
     {
         juce::SmoothedValue<float> position, amplitude, pitch, fine, pan, detune, spread, enabled, warp, warpEnabled;
         std::array<Lane, 8> lanes;
+        float cachedSemitones = 10000;
+        double hz = 440;
     };
     std::array<OscState, 2> sources;
     bw::ModulationContext& modulation;
@@ -95,7 +103,7 @@ private:
     };
     std::array<RouteState, 16> routeStates;
     void updateModulation (bool reset);
-    juce::SmoothedValue<float> cutoff, resonance, subAmplitude, subPitch, noiseAmplitude, bend, subEnabled, noiseEnabled, cutoff2, resonance2, filter2Enabled;
+    juce::SmoothedValue<float> cutoff, resonance, subAmplitude, subPitch, noiseAmplitude, bend, subEnabled, noiseEnabled, cutoff2, resonance2, filter2Enabled, fmDepth;
     float cachedCutoff = -1, cachedResonance = -1, cachedCutoff2 = -1, cachedResonance2 = -1;
     double fundamental = 440, subPhase = 0, subFrequency = 220;
     float cachedSubPitch = 10000;
@@ -108,6 +116,14 @@ private:
     int noteNumber = 69;
     float pendingGlide = 0;
     int residualLeft = 0, residualLength = 240;
+    // A replaced sample fades out over residualLength while the new one fades in from its start.
+    juce::SmoothedValue<float> sampleAmplitude, sampleEnabled, samplePitch;
+    const bw::Sample* playingSample = nullptr;
+    const bw::Sample* fadingSample = nullptr;
+    bw::SamplePlayer player, fadingPlayer;
+    int swapLeft = 0;
+    float cachedSampleSemitones = 10000;
+    double sampleRatio = 1;
 };
 
 // Poly defers to JUCE. Mono/legato play voice 0 with last-note priority over the keys still down.
@@ -159,7 +175,7 @@ public:
     void setStateInformation (const void*, int) override;
 
     juce::AudioProcessorValueTreeState apvts;
-    const bw::WavetableBank wavetableBank;
+    const bw::WavetableBank& wavetableBank; // immutable, shared by every instance
     int selectedTable (bool oscillatorB = false) const
     {
         return juce::jlimit (0, bw::WavetableBank::kCount - 1,
@@ -180,9 +196,21 @@ public:
     juce::String importWavetable (int oscillator, const juce::File& file);
     void setUserTable (int oscillator, std::shared_ptr<const bw::Wavetable> table, const juce::String& name);
     std::shared_ptr<const bw::Wavetable> userTable (int oscillator) const;
+    // True once no replaced table of this oscillator is still waiting for the audio thread to let it go.
+    bool userTableSettled (int oscillator);
     juce::String userTableName (int oscillator) const;
     bool usingUserTable (int oscillator) const { return params.oscillators[(size_t) oscillator].user->load () >= .5f && userTable (oscillator) != nullptr; }
     std::atomic<unsigned> tableRevision { 0 };
+
+    // The sample source keeps a file reference. A missing or unreadable file keeps the reference (and the
+    // state that names it) but plays nothing. loadSample decodes on the calling (non-audio) thread.
+    juce::String loadSample (const juce::File& file);
+    void clearSample ();
+    std::shared_ptr<const bw::Sample> sample () const;
+    juce::File samplePath () const;
+    juce::String sampleName () const { return samplePath ().getFileNameWithoutExtension (); }
+    bool sampleMissing () const;
+    std::atomic<unsigned> sampleRevision { 0 };
 
     // Preset files hold the same XML as host state; newer format versions are refused.
     static constexpr int kStateVersion = 1;
@@ -202,6 +230,9 @@ private:
     std::array<bw::UserTableSlot, 2> userSlots;
     std::vector<std::vector<float>> factoryNormalised; // per preset, in getParameters() order
     std::array<juce::String, 2> userTableNames;
+    void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path);
+    bw::PublishSlot<bw::Sample> sampleSlot;
+    juce::File sampleFile;
     bw::Effects effects;
     bw::EffectParams effectParams {};
     bw::CurveExchange::Curves savedCurves { bw::LfoCurve::factory (0), bw::LfoCurve::factory (0) };

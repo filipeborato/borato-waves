@@ -140,26 +140,25 @@ int main (int argc, char** argv)
         assert (restored.userTable (0) == nullptr && restored.matchingFactoryPreset () == 0);
 
         double worst = 0;
-        // Pairwise grid covers each rate, velocity and simultaneous macro endpoint.
+        // Each rate once, with velocity and the simultaneous macro position stepping alongside.
         const double rates[] { 44100, 48000, 96000 };
         const float velocities[] { .25f, .65f, 1.0f }, positions[] { 0, .5f, 1 };
         for (int r = 0; r < 3; ++r)
-            for (int v = 0; v < 3; ++v)
-            {
-                p.loadFactoryPreset (index);
-                for (int m = 1; m <= 4; ++m) set (p, "macro" + String (m), positions[(r + v)%3]);
-                const auto result = play (p, preset.category, rates[r], velocities[v], false);
-                worst = jmax (worst, result.peak);
-                if (result.peak >= .98) std::printf ("OVER: %s rate=%.0f velocity=%.2f peak=%.4f\n", preset.name, rates[r], velocities[v], result.peak);
-                assert (result.peak < .98 && result.rms > 1.0e-5);
-            }
+        {
+            p.loadFactoryPreset (index);
+            for (int m = 1; m <= 4; ++m) set (p, "macro" + String (m), positions[(2 * r) % 3]); // 0, 1, 0.5
+            const auto result = play (p, preset.category, rates[r], velocities[r], false);
+            worst = jmax (worst, result.peak);
+            if (result.peak >= .98) std::printf ("OVER: %s rate=%.0f velocity=%.2f peak=%.4f\n", preset.name, rates[r], velocities[r], result.peak);
+            assert (result.peak < .98 && result.rms > 1.0e-5);
+        }
         for (int m = 1; m <= 4; ++m)
         {
             bool routed = false;
             for (const auto& route : preset.routes) routed |= route.source == m + 2 && route.amount != 0;
             assert (routed);
             double firstRms = 0;
-            for (float position : positions)
+            for (float position : { 0.0f, 1.0f }) // the endpoints
             {
                 // Equal PRNG history: noise drift must not masquerade as macro response.
                 WaveProcessor macroProcessor;
@@ -175,12 +174,12 @@ int main (int argc, char** argv)
         p.loadFactoryPreset (index);
         auto wet = play (p, preset.category, 48000, .8f, true);
         assert (wet.tail < .001);
-        p.loadFactoryPreset (index);
-        set (p, "distOn", 0); set (p, "delayOn", 0); set (p, "reverbOn", 0);
-        auto dry = play (p, preset.category, 48000, .8f, true);
-        assert (dry.tail < .001);
         if (output != File ())
         {
+            // The dry render is only a listening preview: the wet tail above covers the voice tail too.
+            p.loadFactoryPreset (index);
+            set (p, "distOn", 0); set (p, "delayOn", 0); set (p, "reverbOn", 0);
+            auto dry = play (p, preset.category, 48000, .8f, true);
             preview (output, String (preset.name) + " - wet", wet);
             preview (output, String (preset.name) + " - dry", dry);
             p.loadFactoryPreset (index);

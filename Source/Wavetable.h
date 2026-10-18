@@ -35,40 +35,43 @@ struct Wavetable
     {
         numFrames = (int) cycles.size();
         data.assign ((size_t) numFrames * kLevels * kStride, 0.0f);
-        juce::dsp::FFT fft (kOrder);
-        std::vector<float> spec (2 * kSize), buf (2 * kSize);
-
+        const juce::dsp::FFT fft (kOrder);
         for (int f = 0; f < numFrames; ++f)
+            setFrame (f, cycles[(size_t) f], fft);
+    }
+
+    // Rebuilds every band level of one existing frame from a kSize-sample cycle.
+    void setFrame (int f, const std::vector<float>& cycle) { setFrame (f, cycle, juce::dsp::FFT (kOrder)); }
+    void setFrame (int f, const std::vector<float>& cycle, const juce::dsp::FFT& fft)
+    {
+        std::vector<float> spec (2 * kSize, 0.0f), buf (2 * kSize);
+        std::copy (cycle.begin(), cycle.begin() + kSize, spec.begin());
+        fft.performRealOnlyForwardTransform (spec.data());
+        spec[0] = spec[1] = 0.0f; // drop DC
+
+        float peak = 0.0f;
+        for (int l = 0; l < kLevels; ++l)
         {
-            std::fill (spec.begin(), spec.end(), 0.0f);
-            std::copy (cycles[(size_t) f].begin(), cycles[(size_t) f].begin() + kSize, spec.begin());
-            fft.performRealOnlyForwardTransform (spec.data());
-            spec[0] = spec[1] = 0.0f; // drop DC
-
-            float peak = 0.0f;
-            for (int l = 0; l < kLevels; ++l)
+            buf = spec;
+            for (int k = maxHarmonic (l) + 1; k <= kSize / 2; ++k)
             {
-                buf = spec;
-                for (int k = maxHarmonic (l) + 1; k <= kSize / 2; ++k)
-                {
-                    buf[(size_t) 2 * k] = buf[(size_t) 2 * k + 1] = 0.0f;
-                    if (k < kSize / 2)
-                        buf[(size_t) 2 * (kSize - k)] = buf[(size_t) 2 * (kSize - k) + 1] = 0.0f;
-                }
-                fft.performRealOnlyInverseTransform (buf.data());
-
-                auto* dst = ptr (f, l);
-                std::copy (buf.begin(), buf.begin() + kSize, dst);
-                dst[kSize] = dst[0];
-                if (l == 0)
-                    for (int i = 0; i < kSize; ++i)
-                        peak = std::max (peak, std::abs (dst[i]));
+                buf[(size_t) 2 * k] = buf[(size_t) 2 * k + 1] = 0.0f;
+                if (k < kSize / 2)
+                    buf[(size_t) 2 * (kSize - k)] = buf[(size_t) 2 * (kSize - k) + 1] = 0.0f;
             }
+            fft.performRealOnlyInverseTransform (buf.data());
 
-            if (peak > 0.0f)
-                for (int l = 0; l < kLevels; ++l)
-                    juce::FloatVectorOperations::multiply (ptr (f, l), 1.0f / peak, kStride);
+            auto* dst = ptr (f, l);
+            std::copy (buf.begin(), buf.begin() + kSize, dst);
+            dst[kSize] = dst[0];
+            if (l == 0)
+                for (int i = 0; i < kSize; ++i)
+                    peak = std::max (peak, std::abs (dst[i]));
         }
+
+        if (peak > 0.0f)
+            for (int l = 0; l < kLevels; ++l)
+                juce::FloatVectorOperations::multiply (ptr (f, l), 1.0f / peak, kStride);
     }
 
     // phase in [0, 1), pos in [0, 1] across frames; linear interpolation in time and between frames.

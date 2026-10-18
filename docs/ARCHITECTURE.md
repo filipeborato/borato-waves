@@ -62,4 +62,8 @@ See [SOURCES.md](SOURCES.md) for source mixing and state compatibility, [OSCILLA
 
 ## Voices and warp
 
-`WaveSynth` (in `PluginProcessor.h`) extends JUCE's `Synthesiser` with mono/legato last-note priority; `WaveVoice` owns glide, steal declicking and the A/B phase warp. See [VOICES.md](VOICES.md).
+`WaveSynth` (in `PluginProcessor.h`) extends JUCE's `Synthesiser` with mono/legato last-note priority; `WaveVoice` owns glide, steal declicking, the A/B phase warp and FM from B into A. See [VOICES.md](VOICES.md).
+
+## Sample source and table editor
+
+`Sample.h` holds the immutable decoded sample and the per-voice `SamplePlayer`. `PublishSlot<T>` (in `UserWavetable.h`) publishes user tables and samples to the audio thread; the processor reports after each block when every voice has settled, so replaced data is freed promptly. `TableEdit.h` is the message-thread model behind the `UI/TableEditor` page. `UI/SamplePanel` drives the sample source. See [SOURCES.md](SOURCES.md) and [WAVETABLES.md](WAVETABLES.md).

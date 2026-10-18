@@ -55,6 +55,9 @@ public:
         }
     }
 
+    // Reads only the requested table: nothing older is referenced.
+    bool settled() const noexcept { return ! fading && current == requested; }
+
     float read (double phase, float position, int level) noexcept
     {
         const float result = readCurrent (phase, position, level);

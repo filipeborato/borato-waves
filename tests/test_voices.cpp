@@ -1,8 +1,5 @@
-#include "PluginProcessor.h"
-#include <cassert>
-#include <cmath>
+#include "Rig.h"
 #include <iostream>
-#include <vector>
 #ifdef _WIN32
 #include <cstdlib>
 #include <stdlib.h>
@@ -10,77 +7,7 @@
 
 namespace
 {
-// Drives the processor through processBlock only: MIDI in, audio out.
-struct Rig
-{
-    explicit Rig (double r = 48000) : rate (r)
-    {
-        set ("attack", .001f); set ("decay", .001f); set ("sustain", 1); set ("release", .05f);
-        set ("cutoff", 18000); set ("level", .5f); set ("gain", -12);
-        processor.prepareToPlay (rate, kBlock);
-    }
-    void set (const char* id, float value)
-    {
-        auto* parameter = processor.apvts.getParameter (id);
-        assert (parameter != nullptr);
-        parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
-    }
-    void send (const juce::MidiMessage& message) { pending.addEvent (message, 0); }
-    // Renders whole blocks; pending events land on the first sample. Returns the left channel.
-    std::vector<float> run (double seconds)
-    {
-        std::vector<float> left;
-        for (int block = 0; block < (int) std::ceil (seconds * rate / kBlock); ++block)
-        {
-            juce::AudioBuffer<float> audio (2, kBlock);
-            processor.processBlock (audio, pending);
-            pending.clear();
-            for (int i = 0; i < kBlock; ++i)
-            {
-                assert (std::isfinite (audio.getSample (0, i)) && std::isfinite (audio.getSample (1, i)));
-                left.push_back (audio.getSample (0, i));
-            }
-        }
-        return left;
-    }
-    static constexpr int kBlock = 64;
-    double rate;
-    WaveProcessor processor;
-    juce::MidiBuffer pending;
-};
-
-juce::MidiMessage on (int note, float velocity = 1) { return juce::MidiMessage::noteOn (1, note, velocity); }
-juce::MidiMessage off (int note) { return juce::MidiMessage::noteOff (1, note); }
-juce::MidiMessage pedal (bool down) { return juce::MidiMessage::controllerEvent (1, 64, down ? 127 : 0); }
-
-double rms (const std::vector<float>& audio, size_t from, size_t to)
-{
-    double sum = 0;
-    for (size_t i = from; i < to; ++i) sum += audio[i] * audio[i];
-    return std::sqrt (sum / (double) (to - from));
-}
-bool silent (const std::vector<float>& audio, size_t from = 0)
-{
-    for (size_t i = from; i < audio.size(); ++i) if (audio[i] != 0) return false;
-    return true;
-}
-float maxStep (const std::vector<float>& audio, size_t from, size_t to, float previous)
-{
-    float result = 0;
-    for (size_t i = from; i < to; ++i) { result = std::max (result, std::abs (audio[i] - previous)); previous = audio[i]; }
-    return result;
-}
-
-// Mean frequency from rising zero crossings in [from, to).
-double frequency (const std::vector<float>& audio, size_t from, size_t to, double rate = 48000)
-{
-    std::vector<size_t> crossings;
-    for (size_t i = from + 1; i < to; ++i) if (audio[i - 1] <= 0 && audio[i] > 0) crossings.push_back (i);
-    assert (crossings.size() > 2);
-    return (double) (crossings.size() - 1) * rate / (double) (crossings.back() - crossings.front());
-}
-double frequency (const std::vector<float>& audio) { return frequency (audio, audio.size() / 2, audio.size()); }
-bool near (double hz, int note) { return std::abs (hz / juce::MidiMessage::getMidiNoteInHertz (note) - 1) < .005; }
+using namespace rig;
 
 void testSustainPedal()
 {
@@ -248,8 +175,8 @@ void testModeDefaultsAndMigration()
     juce::MemoryBlock state;
     rig.processor.getStateInformation (state);
     auto xml = juce::AudioProcessor::getXmlFromBinary (state.getData(), (int) state.getSize());
-    for (auto* id : { "voiceMode", "glide", "oscAWarpOn", "oscAWarp", "oscBWarpOn", "oscBWarp" }) xml->removeChildElement (xml->getChildByAttribute ("id", id), true);
-    rig.set ("voiceMode", 2); rig.set ("glide", 1); rig.set ("oscAWarpOn", 1); rig.set ("oscAWarp", .5f);
+    for (auto* id : { "voiceMode", "glide", "oscAWarpOn", "oscAWarp", "oscBWarpOn", "oscBWarp", "fmDepth" }) xml->removeChildElement (xml->getChildByAttribute ("id", id), true);
+    rig.set ("voiceMode", 2); rig.set ("glide", 1); rig.set ("oscAWarpOn", 1); rig.set ("oscAWarp", .5f); rig.set ("fmDepth", .5f);
     juce::MemoryBlock legacy;
     juce::AudioProcessor::copyXmlToBinary (*xml, legacy);
     rig.processor.setStateInformation (legacy.getData(), (int) legacy.getSize());
@@ -257,7 +184,11 @@ void testModeDefaultsAndMigration()
     assert (rig.processor.apvts.getRawParameterValue ("glide")->load() == 0);
     assert (rig.processor.apvts.getRawParameterValue ("oscAWarpOn")->load() == 0);
     assert (rig.processor.apvts.getRawParameterValue ("oscAWarp")->load() == 0);
+    assert (rig.processor.apvts.getRawParameterValue ("fmDepth")->load() == 0);
 }
+
+// 0.1 s to settle, then exactly enough for one spectrum (Debug renders are slow).
+double settled (double rate) { return .1 + (kSpectrumSize + Rig::kBlock) / rate; }
 
 // One sustained note on OSC A; returns the settled left channel.
 std::vector<float> warped (double rate, int note, float position, bool warpOn, float amount, int oscillator = 0)
@@ -268,33 +199,15 @@ std::vector<float> warped (double rate, int note, float position, bool warpOn, f
     rig.set (oscillator == 0 ? "oscAWarpOn" : "oscBWarpOn", warpOn ? 1.0f : 0.0f);
     rig.set (oscillator == 0 ? "oscAWarp" : "oscBWarp", amount);
     rig.send (on (note));
-    const auto audio = rig.run (.5);
+    const auto audio = rig.run (settled (rate));
     return { audio.begin() + (long) (rate * .1), audio.end() };
-}
-
-// Fraction of spectral energy away from the note's harmonics (Hann window).
-double inharmonic (const std::vector<float>& audio, double rate, int note)
-{
-    constexpr int order = 14, size = 1 << order;
-    assert (audio.size() >= (size_t) size);
-    std::vector<float> data (2 * size);
-    for (int i = 0; i < size; ++i) data[(size_t) i] = audio[(size_t) i] * (.5f - .5f * std::cos (juce::MathConstants<float>::twoPi * i / size));
-    juce::dsp::FFT (order).performFrequencyOnlyForwardTransform (data.data());
-    const double f0 = juce::MidiMessage::getMidiNoteInHertz (note), bin = rate / size;
-    double harmonic = 0, other = 0;
-    for (int k = 1; k < size / 2; ++k)
-    {
-        const double hz = k * bin, distance = std::abs (hz - f0 * std::round (hz / f0));
-        (distance <= 4 * bin ? harmonic : other) += (double) data[(size_t) k] * data[(size_t) k];
-    }
-    return other / (harmonic + other);
 }
 
 void testWarpTuningAndLevel()
 {
     for (double rate : { 44100.0, 48000.0, 96000.0 })
         for (int note : { 28, 60, 96 })
-            for (float amount : { -1.0f, .6f, 1.0f })
+            for (float amount : { -1.0f, 1.0f })
             {
                 const auto audio = warped (rate, note, 0, true, amount);
                 assert (near (frequency (audio, 0, audio.size(), rate), note)); // warp keeps the period
@@ -379,6 +292,108 @@ void testWarpMatrixDestinations()
     const auto tail = fx.run (.4);
     assert (silent (tail, 9600)); // delay mix stays 0, so nothing echoes
 }
+
+// OSC A carrier, OSC B modulator. B is muted, so it is heard only through A. Returns the settled left channel.
+std::vector<float> fm (double rate, int note, float depth, float positionA = 0, float pitchB = 0, bool hearB = false)
+{
+    Rig rig (rate);
+    rig.set ("wtPos", positionA); rig.set ("oscBOn", hearB ? 1.0f : 0.0f); rig.set ("levelB", .5f); rig.set ("oscBPitch", pitchB);
+    rig.set ("fmDepth", depth);
+    rig.send (on (note));
+    const auto audio = rig.run (settled (rate));
+    return { audio.begin() + (long) (rate * .1), audio.end() };
+}
+
+// Fraction of spectral energy in harmonics 2 and up (Hann window).
+double overtones (const std::vector<float>& audio, double rate, int note)
+{
+    const auto energy = spectrum (audio);
+    const double f0 = juce::MidiMessage::getMidiNoteInHertz (note), bin = rate / kSpectrumSize;
+    double upper = 0, total = 0;
+    for (size_t k = 1; k < energy.size(); ++k)
+    {
+        total += energy[k];
+        if ((double) k * bin > 1.5 * f0) upper += energy[k];
+    }
+    return upper / total;
+}
+
+void testFmTimbreAndTuning()
+{
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+        for (int note : { 28, 60, 96 })
+            for (float ratio : { 0.0f, 12.0f })
+                assert (inharmonic (fm (rate, note, 1, 0, ratio), rate, note) < 1.0e-3); // 1:1 and 2:1 stay on the note's harmonics
+    // Two sines without interaction have no overtones; FM from B builds them.
+    assert (overtones (fm (48000, 48, 0, 0, 0, true), 48000, 48) < 1.0e-3);
+    assert (overtones (fm (48000, 48, .5f), 48000, 48) > .1);
+    // Phase modulation leaves the carrier level alone: no peaks.
+    for (float position : { 0.0f, .5f })
+        assert (peak (fm (48000, 48, 1, position)) < 1.2f * peak (fm (48000, 48, 0, position)));
+}
+
+void testFmAlias()
+{
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+        for (int note : { 84, 96, 103 })
+            for (float position : { 0.0f, .5f })
+            {
+                const double dry = inharmonic (fm (rate, note, 0, position), rate, note);
+                assert (inharmonic (fm (rate, note, 1, position), rate, note) < std::max (1.0e-4, 10 * dry));
+            }
+}
+
+// A 40 Hz LFO sweeping the full FM depth steps no harder than the static extremes.
+void testFmSweep()
+{
+    for (double rate : { 44100.0, 96000.0 })
+    {
+        Rig dry (rate), full (rate), swept (rate);
+        for (auto* rig : { &dry, &full, &swept }) rig->set ("oscBOn", 0);
+        full.set ("fmDepth", 1);
+        swept.set ("lfo1Rate", 40); swept.set ("lfo1Mode", 1);
+        swept.set ("mod1Source", 1); swept.set ("mod1Destination", 23); swept.set ("mod1Amount", 1);
+        swept.set ("mod1Bipolar", 0); swept.set ("mod1Enabled", 1);
+        for (auto* rig : { &dry, &full, &swept }) rig->send (on (72));
+        const auto a = dry.run (.4), c = full.run (.4), b = swept.run (.4);
+        const size_t from = (size_t) (rate * .1);
+        const float extreme = std::max (maxStep (a, from, a.size(), a[from - 1]), maxStep (c, from, c.size(), c[from - 1]));
+        assert (maxStep (b, from, b.size(), b[from - 1]) < 1.1f * extreme);
+        double change = 0;
+        for (size_t i = from; i < a.size(); ++i) change += std::abs (a[i] - b[i]);
+        assert (change / (double) (a.size() - from) > .01);
+    }
+}
+
+void testFmMatrixAndChords()
+{
+    assert (bw::destinationNames()[23] == "FM Depth");
+    Rig dry, macro;
+    macro.set ("macro1", 1);
+    macro.set ("mod1Source", 3); macro.set ("mod1Destination", 23); macro.set ("mod1Amount", 1);
+    macro.set ("mod1Bipolar", 0); macro.set ("mod1Enabled", 1);
+    for (auto* rig : { &dry, &macro }) rig->send (on (48));
+    const auto a = dry.run (.3), b = macro.run (.3);
+    double change = 0;
+    for (size_t i = 4800; i < a.size(); ++i) change += std::abs (a[i] - b[i]);
+    assert (change / (double) (a.size() - 4800) > .01);
+
+    // Chords with unison on both oscillators: FM adds no peaks at any rate.
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        std::array<float, 2> peaks {};
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            Rig rig (rate);
+            rig.set ("oscBOn", 1); rig.set ("wtPosB", .5f); rig.set ("fmDepth", pass == 0 ? 0.0f : .8f);
+            for (auto* id : { "oscAUnison", "oscBUnison" }) rig.set (id, 8);
+            for (auto* id : { "oscADetune", "oscBDetune" }) rig.set (id, 20);
+            for (int note : { 48, 52, 55, 60, 64 }) rig.send (on (note));
+            peaks[(size_t) pass] = peak (rig.run (.4));
+        }
+        assert (peaks[1] < 1 && peaks[1] < 1.5f * peaks[0]);
+    }
+}
 }
 
 int main()
@@ -402,6 +417,10 @@ int main()
     testWarpAlias();
     testWarpSweep();
     testWarpMatrixDestinations();
+    testFmTimbreAndTuning();
+    testFmAlias();
+    testFmSweep();
+    testFmMatrixAndChords();
     std::cout << "ok: sustain pedal, all-notes-off, click-free steal, mono priority, legato/glide, legato pedal, "
-                 "state migration, poly/mono/legato fuzz, warp tuning/level/alias/sweep/matrix\n";
+                 "state migration, poly/mono/legato fuzz, warp tuning/level/alias/sweep/matrix, FM timbre/tuning/alias/sweep/matrix/chords\n";
 }

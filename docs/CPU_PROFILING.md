@@ -40,3 +40,21 @@ identical benchmark.
 `extreme_warp` is `extreme_no_routes` with both A/B phase warps on; see [VOICES.md](VOICES.md) for its single-run figures (about +27% over `extreme_no_routes`).
 
 This device/host check remains **pending** for the reference run above. Do not treat the offline `over_budget_blocks` value as an observed ASIO dropout count.
+
+### FM and sample profiles (18 October 2026)
+
+Measured with the same machine and settings, after tasks 05–07. Three runs agreed within a few percent; the table shows one of them.
+
+| Profile | 44.1 kHz | 48 kHz | 96 kHz | 96 kHz blocks over deadline |
+| --- | ---: | ---: | ---: | ---: |
+| notes16 | 13% | 14% | 29–32% | 0 |
+| sample16 (16 notes, sample source only, looped) | 19% | 20% | 40% | 0 |
+| extreme_no_routes | 29% | 32–33% | 82–85% | 72 / 750 |
+| extreme_fm (FM depth 0.7) | 39% | 40% | 94% | 170 / 750 |
+| extreme_sample (sample source added) | 40% | 42% | 93% | 163 / 750 |
+| extreme | 49–55% | 55–56% | 124–127% | 654 / 750 |
+
+- **Sample voice:** with interpolation and the loop crossfade, one sample voice costs about 1.4× a one-lane wavetable voice.
+- **Extreme profiles:** FM and the sample source each add about 30% to `extreme_no_routes`. All extreme profiles fail the provisional 70% gate at 96 kHz.
+- **Regression:** `extreme_no_routes` is 10–18% higher, and `extreme` about 35% higher, than the 17 October reference. Tasks 02–07 add per-sample work to every voice (glide, warp and FM smoothing, the steal residual, the sample-source smoothers). This run does not separate the cost of each task; an A/B against commit `5d17e59`–`a49454b` would.
+

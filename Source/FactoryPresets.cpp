@@ -7,7 +7,7 @@ namespace
 // Matrix source and destination indices (see Modulation.h).
 enum Source { lfo1 = 1, lfo2, m1, m2, m3, m4, env1, vel, env2 };
 enum Destination { aPos, aLevel, aPan, aPitch, aDetune, aSpread, bPos, bLevel, bPan, bPitch, bDetune, bSpread,
-                   cutoff, reso, subLevel, noiseLevel, cutoff2, reso2, fxDrive, fxDelay, fxReverb };
+                   cutoff, reso, subLevel, noiseLevel, cutoff2, reso2, fxDrive, fxDelay, fxReverb, aWarp, bWarp, fm };
 // Table indices in WavetableBank.
 enum Table { basic, sineTri, saw, odd, pulse, formant, bells, bend };
 // Division indices in divisionNames(): straight, dotted, triplet.
@@ -355,6 +355,19 @@ const std::vector<FactoryPreset>& factoryPresets()
                 { "lfo1Mode", 1 }, { "lfo2Rate", .05f }, { "lfo2Mode", 1 }, { "reverbSize", 1 }, { "reverbMix", .6f }, { "delayDivision", dHalf },
                 { "delayFeedback", .6f }, { "delayMix", .3f }, { "attack", 3 }, { "sustain", 1 }, { "release", 6 }, { "gain", -5.8f } },
               { { lfo1, aPos, .5f, true }, { lfo2, bPos, .5f, true }, { m2, bLevel, .4f } }, "Stars"),
+        // FM: OSC B is a silent sine modulator; these spectra need the A/B interaction.
+        make ("FM Glass Keys", "KEYS", "Poly FM Electric Velocity", "Sine carrier, octave modulator: a struck tine that mellows as Env 2 lowers the FM depth. Strike adds bite.",
+              { { "oscBOn", 0 }, { "oscBPitch", 12 }, { "fmDepth", .12f }, { "env2Decay", .7f }, { "env2Release", .3f },
+                { "attack", .002f }, { "decay", 1.4f }, { "sustain", .35f }, { "release", .45f }, { "cutoff", 9000 }, { "gain", -9 } },
+              { { env2, fm, .3f }, { vel, fm, .15f }, { m2, fm, .3f } }, "Strike"),
+        make ("FM Iron Bass", "BASS", "Mono FM Glide Punchy", "1:1 FM bass in mono with a short glide; Env 2 punches the depth, Grit adds more.",
+              { { "voiceMode", 1 }, { "glide", .04f }, { "oscBOn", 0 }, { "fmDepth", .2f }, { "env2Decay", .18f }, { "env2Release", .1f },
+                { "attack", .002f }, { "decay", .4f }, { "sustain", .8f }, { "release", .12f }, { "cutoff", 2400 }, { "subOn", 1 }, { "subLevel", .25f }, { "gain", -10 } },
+              { { env2, fm, .35f }, { m2, fm, .35f } }, "Grit"),
+        make ("FM Bell Tower", "PLUCK", "Poly FM Bell Inharmonic", "A 1:3.5 modulator rings inharmonic partials that fade with the note. Metal deepens the FM.",
+              { { "oscBOn", 0 }, { "oscBPitch", 22 }, { "oscBFine", -31 }, { "fmDepth", .1f }, { "env2Decay", 1.6f }, { "env2Release", 1.2f },
+                { "attack", .001f }, { "decay", 2.4f }, { "sustain", 0 }, { "release", 1.6f }, { "reverbMix", .2f }, { "gain", -9 } },
+              { { env2, fm, .25f }, { m2, fm, .3f } }, "Metal"),
         // Atelier: independent macro designs and original embedded harmonic tables.
         atelier ("Atelier - Velvet Sub", "BASS", "Atelier Poly Sub Warm Velocity", "Focused sub with a soft reed edge. Weight adds body; Edge opens harmonics. Play C1-C3.", 0,
             { { "wtPos", .08f }, { "cutoff", 700 }, { "subOn", 1 }, { "subLevel", .18f }, { "subRoute", 2 },

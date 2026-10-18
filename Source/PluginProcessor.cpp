@@ -111,6 +111,13 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
         continuous ((prefix + "Warp").toRawUTF8 (), (name + " Warp").toRawUTF8 (), -1, 1, 0);
     }
     l.add (std::make_unique<P> (juce::ParameterID { "glide", 1 }, "Glide", R (0, 2, 0, 0.4f), 0.0f));
+    continuous ("fmDepth", "FM Depth", 0, 1, 0);
+    toggle ("sampleOn", "Sample On", false);
+    continuous ("sampleLevel", "Sample Level", 0, 1, .5f);
+    continuous ("samplePitch", "Sample Semitones", -24, 24, 0);
+    continuous ("sampleStart", "Sample Start", 0, 1, 0);
+    continuous ("sampleEnd", "Sample End", 0, 1, 1);
+    toggle ("sampleLoop", "Sample Loop", false);
     return l;
 }
 
@@ -126,8 +133,10 @@ void WaveVoice::prepare (double sampleRate, int blockSize)
     residualLength = juce::jmax (1, juce::roundToInt (sampleRate * 0.005));
     residualLeft = 0; lastOut = residual = {};
     for (auto& f : filters) f.reset ();
-    for (auto* smoother : { &cutoff, &resonance, &subAmplitude, &subPitch, &noiseAmplitude, &bend, &subEnabled, &noiseEnabled, &cutoff2, &resonance2, &filter2Enabled })
+    for (auto* smoother : { &cutoff, &resonance, &subAmplitude, &subPitch, &noiseAmplitude, &bend, &subEnabled, &noiseEnabled, &cutoff2, &resonance2, &filter2Enabled, &fmDepth,
+                           &sampleAmplitude, &sampleEnabled, &samplePitch })
         smoother->reset (sampleRate, 0.02);
+    playingSample = fadingSample = nullptr; swapLeft = 0;
     glideOffset.setCurrentAndTargetValue (0); pendingGlide = 0;
     for (size_t i = 0; i < sources.size (); ++i)
     {
@@ -154,6 +163,10 @@ void WaveVoice::updateTargets (bool reset)
     set (cutoff2, clampCutoff (params.cutoff2->load ()));
     set (resonance2, params.reso2->load ());
     set (filter2Enabled, params.filter2On->load () >= .5f ? 1.0f : 0.0f);
+    set (fmDepth, params.fmDepth->load ());
+    set (sampleAmplitude, params.sampleLevel->load ());
+    set (sampleEnabled, params.sampleOn->load () >= .5f ? 1.0f : 0.0f);
+    set (samplePitch, params.samplePitch->load ());
     filters[0].setMode (juce::roundToInt (params.filterType->load ()));
     filters[1].setMode (juce::roundToInt (params.filter2Type->load ()));
     for (size_t i = 0; i < sources.size (); ++i)
@@ -223,6 +236,8 @@ void WaveVoice::startNote (int note, float vel, juce::SynthesiserSound*, int whe
     bend.setCurrentAndTargetValue (bend.getTargetValue ());
     updateTargets (true);
     updateModulation (true);
+    playingSample = params.sample; fadingSample = nullptr; swapLeft = 0;
+    if (playingSample != nullptr) player.reset (playingSample->region (params.sampleStart->load (), params.sampleEnd->load ()));
     for (auto& f : filters) f.reset ();
     cachedCutoff = cutoff.getCurrentValue (); cachedResonance = resonance.getCurrentValue ();
     cachedCutoff2 = cutoff2.getCurrentValue (); cachedResonance2 = resonance2.getCurrentValue ();
@@ -244,8 +259,8 @@ void WaveVoice::glideTo (int note, float seconds)
     glideOffset.reset (getSampleRate (), juce::jmax (0.0f, seconds));
     glideOffset.setCurrentAndTargetValue (seconds > 0 ? from - (float) note : 0.0f);
     glideOffset.setTargetValue (0);
-    // The fundamental moved, so lane and sub frequencies must be recomputed.
-    cachedSubPitch = 10000;
+    // The fundamental moved, so lane, sub and sample frequencies must be recomputed.
+    cachedSubPitch = cachedSampleSemitones = 10000;
     for (auto& source : sources) for (auto& lane : source.lanes) lane.cachedPitch = 10000;
 }
 
@@ -327,7 +342,14 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
     auto routeOf = [] (std::atomic<float>* r) { return (size_t) juce::jlimit (0, 2, juce::roundToInt (r->load ())); };
     const std::array<size_t, 2> sourceRoutes { routeOf (params.oscillators[0].route), routeOf (params.oscillators[1].route) };
     const size_t subRoute = routeOf (params.subRoute), noiseRoute = routeOf (params.noiseRoute);
-    const bool serial = params.filterRouting->load () < .5f;
+    const bool serial = params.filterRouting->load () < .5f, sampleLoop = params.sampleLoop->load () >= .5f;
+    const float regionStart = params.sampleStart->load (), regionEnd = params.sampleEnd->load ();
+    if (params.sample != playingSample && swapLeft == 0) // a second swap waits for the first fade
+    {
+        fadingSample = playingSample; fadingPlayer = player; swapLeft = residualLength;
+        playingSample = params.sample;
+        if (playingSample != nullptr) player.reset (playingSample->region (regionStart, regionEnd));
+    }
     for (int i = 0; i < num; ++i)
     {
         const float envelopeValue = adsr.getNextSample ();
@@ -387,7 +409,11 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         const float pitchBend = bend.getNextValue () + glideOffset.getNextValue ();
         // Buses: Filter 1, Filter 2, Direct.
         std::array<float, 3> busL {}, busR {};
-        for (size_t index = 0; index < sources.size (); ++index)
+        // B renders first: its raw signal (before level and on/off) phase-modulates A, so B can be a silent modulator.
+        const float fmCycles = effective (bw::kFmDestination, fmDepth.getNextValue ());
+        float modulator = 0;
+        double modulatorHz = 0;
+        for (const size_t index : { (size_t) 1, (size_t) 0 })
         {
             auto& source = sources[index]; const int d = (int)index*6;
             const float basePitch = source.pitch.getNextValue ();
@@ -400,6 +426,17 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
             const float warp = effective (bw::kFirstWarpDestination+(int)index, source.warp.getNextValue ()) * source.warpEnabled.getNextValue ();
             // Bending the phase by w raises the top harmonic by up to (1 + |w|), so read a narrower band.
             const float warpWidth = 1 + std::abs (warp);
+            // Phase modulation by B gives carrier harmonic k sidebands out to about k*I + 4 modulator multiples
+            // (Carson's rule plus a -40 dB margin). Cap the index I so the fundamental's sidebands stay below
+            // Nyquist, then read only the harmonics h with h*(f*w + I*fB) <= Nyquist - 4*fB.
+            double fmShift = 0, fmSpread = 0, bandRate = sampleRate;
+            if (index == 0 && fmCycles > 0 && modulatorHz > 0)
+            {
+                if (semitones != source.cachedSemitones) { source.cachedSemitones = semitones; source.hz = fundamental * std::exp2 (semitones / 12.0); }
+                const double twoPi = juce::MathConstants<double>::twoPi;
+                const double fmIndex = std::min (twoPi * fmCycles, (0.5 * sampleRate - source.hz * warpWidth) / modulatorHz - 4);
+                if (fmIndex > 0) { fmShift = fmIndex / twoPi; fmSpread = fmIndex * modulatorHz; bandRate = sampleRate - 8 * modulatorHz; }
+            }
             float left = 0, right = 0;
             for (auto& lane : source.lanes)
             {
@@ -407,7 +444,11 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
                 if (laneGain == 0) continue;
                 const float pitch = semitones + offset*detune*.01f;
                 if (pitch != lane.cachedPitch) { lane.cachedPitch = pitch; lane.frequency = fundamental * std::exp2 (pitch/12.0); lane.cachedWidth = 0; }
-                if (warpWidth != lane.cachedWidth) { lane.cachedWidth = warpWidth; lane.mip = bw::Wavetable::levelFor (lane.frequency * warpWidth, sampleRate); }
+                if (warpWidth != lane.cachedWidth || fmSpread != lane.cachedSpread)
+                {
+                    lane.cachedWidth = warpWidth; lane.cachedSpread = fmSpread;
+                    lane.mip = bw::Wavetable::levelFor (lane.frequency * warpWidth + fmSpread, bandRate);
+                }
                 const float lanePan = juce::jlimit (-1.0f, 1.0f, pan+offset*spread);
                 if (lanePan != lane.cachedPan) { lane.cachedPan = lanePan; const float angle = (lanePan+1)*juce::MathConstants<float>::pi*.25f; lane.leftGain = std::cos (angle)*juce::MathConstants<float>::sqrt2; lane.rightGain = std::sin (angle)*juce::MathConstants<float>::sqrt2; }
                 const float nyquistGain = (float)juce::jlimit (0.0, 1.0, (0.5-lane.frequency/sampleRate)/.025);
@@ -415,7 +456,9 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
                 // Periodic, monotonic phase bend (slope 1 +/- w, a parabolic sine shape): ends and period stay fixed,
                 // so tuning and continuity hold. Polynomial rather than std::sin: this runs per lane per sample.
                 if (warp != 0) { const double u = 2*phase - 1; phase -= .5*warp * u * (1 - std::abs (u)); phase -= std::floor (phase); }
-                const float sample = oscillators[index].readCurrent (phase, position, lane.mip)*amplitude*laneGain*nyquistGain;
+                if (fmShift != 0) { phase += fmShift * modulator; phase -= std::floor (phase); }
+                const float raw = oscillators[index].readCurrent (phase, position, lane.mip)*laneGain*nyquistGain, sample = raw*amplitude;
+                if (index == 1) { modulator += raw; modulatorHz = std::max (modulatorHz, lane.frequency); }
                 lane.phase += lane.frequency/sampleRate; lane.phase -= std::floor (lane.phase);
                 left += sample*lane.leftGain; right += sample*lane.rightGain;
             }
@@ -431,6 +474,27 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         noiseState ^= noiseState << 13; noiseState ^= noiseState >> 17; noiseState ^= noiseState << 5;
         const float noiseLevel = effective (15, noiseAmplitude.getNextValue ()) * noiseEnabled.getNextValue ();
         const float noise = ((float)(noiseState>>8)/8388608.0f-1)*noiseLevel;
+        // The sample source feeds Filter 1. While its level is zero it pauses rather than reading.
+        const float sampleGain = sampleAmplitude.getNextValue () * sampleEnabled.getNextValue ();
+        const float sampleSemitones = samplePitch.getNextValue () + pitchBend;
+        if ((sampleGain != 0 || swapLeft > 0) && (playingSample != nullptr || fadingSample != nullptr))
+        {
+            if (sampleSemitones != cachedSampleSemitones)
+            {
+                cachedSampleSemitones = sampleSemitones;
+                sampleRatio = fundamental / juce::MidiMessage::getMidiNoteInHertz (bw::kSampleRootNote) * std::exp2 (sampleSemitones / 12.0) / sampleRate;
+            }
+            auto play = [&] (bw::SamplePlayer& head, const bw::Sample& source)
+            { return head.next (source, source.region (regionStart, regionEnd), sampleLoop, sampleRatio * source.rate); };
+            float sampled = playingSample != nullptr ? play (player, *playingSample) : 0.0f;
+            if (swapLeft > 0)
+            {
+                const float t = (float) swapLeft / (float) residualLength;
+                sampled = sampled * (1 - t) + (fadingSample != nullptr ? play (fadingPlayer, *fadingSample) * t : 0.0f);
+                if (--swapLeft == 0) fadingSample = nullptr;
+            }
+            busL[0] += sampled * sampleGain; busR[0] += sampled * sampleGain;
+        }
         busL[subRoute] += sub; busR[subRoute] += sub;
         busL[noiseRoute] += noise; busR[noiseRoute] += noise;
         const float envelope = envelopeValue*velocity, filter2Mix = filter2Enabled.getNextValue ();
@@ -455,7 +519,7 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
 //==============================================================================
 WaveProcessor::WaveProcessor ()
     : AudioProcessor (BusesProperties ().withOutput ("Output", juce::AudioChannelSet::stereo (), true)),
-      apvts (*this, nullptr, "STATE", createLayout ())
+      apvts (*this, nullptr, "STATE", createLayout ()), wavetableBank (bw::WavetableBank::shared ())
 {
     auto p = [this] (const char* id) { return apvts.getRawParameterValue (id); };
     params = { p ("cutoff"), p ("reso"), p ("attack"), p ("decay"), p ("sustain"), p ("release"),
@@ -463,7 +527,8 @@ WaveProcessor::WaveProcessor ()
           OscParams { p ("oscBOn"), p ("wtTableB"), p ("wtPosB"), p ("levelB"), p ("oscBPitch"), p ("oscBFine"), p ("oscBPan"), p ("oscBUnison"), p ("oscBDetune"), p ("oscBSpread"), p ("oscBPhase"), p ("oscBRandom"), p ("oscBUser"), p ("oscBRoute"), p ("oscBWarpOn"), p ("oscBWarp") } },
         p ("subOn"), p ("subLevel"), p ("subOctave"), p ("noiseOn"), p ("noiseLevel"),
         p ("filterType"), p ("filter2On"), p ("filter2Type"), p ("cutoff2"), p ("reso2"), p ("filterRouting"), p ("subRoute"), p ("noiseRoute"),
-        p ("env2Attack"), p ("env2Decay"), p ("env2Sustain"), p ("env2Release") };
+        p ("env2Attack"), p ("env2Decay"), p ("env2Sustain"), p ("env2Release"), p ("fmDepth"),
+        p ("sampleOn"), p ("sampleLevel"), p ("samplePitch"), p ("sampleStart"), p ("sampleEnd"), p ("sampleLoop") };
     effectParams = { p ("distOn"), p ("distMode"), p ("distDrive"), p ("distMix"),
         p ("delayOn"), p ("delayTime"), p ("delaySync"), p ("delayDivision"), p ("delayFeedback"), p ("delayPingPong"), p ("delayMix"),
         p ("reverbOn"), p ("reverbSize"), p ("reverbDamping"), p ("reverbWidth"), p ("reverbMix") };
@@ -548,6 +613,7 @@ void WaveProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
         ++modulation.curveGeneration;
     for (size_t i = 0; i < userSlots.size (); ++i)
         params.userTables[i] = userSlots[i].acquire (buffer.getNumSamples ());
+    params.sample = sampleSlot.acquire (buffer.getNumSamples ());
     double bpm = internalBpm->load ();
     double ppq = 0; bool hasPpq = false, playing = true;
     if (auto* hostPlayHead = getPlayHead ())
@@ -571,6 +637,16 @@ void WaveProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     }
     synth.setMode (juce::roundToInt (voiceMode->load ()), glideTime->load ());
     synth.renderNextBlock (buffer, midi, 0, buffer.getNumSamples ());
+    // Once no voice reads an older user table or sample, the replaced ones can be freed.
+    auto allVoices = [this] (auto&& settled)
+    {
+        for (int v = 0; v < synth.getNumVoices (); ++v)
+            if (! settled (*static_cast<WaveVoice*> (synth.getVoice (v)))) return false;
+        return true;
+    };
+    for (size_t i = 0; i < userSlots.size (); ++i)
+        if (allVoices ([i] (const WaveVoice& voice) { return voice.settled (i); })) userSlots[i].settle ();
+    if (allVoices ([] (const WaveVoice& voice) { return voice.sampleSettled (); })) sampleSlot.settle ();
     // Global FX destinations take macro sources only; per-voice sources have no single value here.
     std::array<float, 3> fxOffsets {};
     for (const auto& route : modulation.routes)
@@ -729,6 +805,13 @@ void WaveProcessor::setUserTable (int oscillator, std::shared_ptr<const bw::Wave
     }
     updateHostDisplay (ChangeDetails {}.withNonParameterStateChanged (true));
 }
+bool WaveProcessor::userTableSettled (int oscillator)
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    auto& slot = userSlots[(size_t) juce::jlimit (0, 1, oscillator)];
+    slot.collect ();
+    return slot.idle ();
+}
 std::shared_ptr<const bw::Wavetable> WaveProcessor::userTable (int oscillator) const
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
@@ -738,6 +821,41 @@ juce::String WaveProcessor::userTableName (int oscillator) const
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
     return userTableNames[(size_t) juce::jlimit (0, 1, oscillator)];
+}
+
+juce::String WaveProcessor::loadSample (const juce::File& file)
+{
+    juce::String error;
+    auto loaded = bw::loadSample (file, error);
+    if (loaded == nullptr) return error;
+    publishSample (std::move (loaded), file);
+    return {};
+}
+void WaveProcessor::clearSample () { publishSample (nullptr, {}); }
+void WaveProcessor::publishSample (std::shared_ptr<const bw::Sample> loaded, const juce::File& path)
+{
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        sampleFile = path;
+        sampleSlot.publish (std::move (loaded));
+        sampleRevision.fetch_add (1, std::memory_order_relaxed);
+    }
+    updateHostDisplay (ChangeDetails {}.withNonParameterStateChanged (true));
+}
+std::shared_ptr<const bw::Sample> WaveProcessor::sample () const
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    return sampleSlot.get ();
+}
+juce::File WaveProcessor::samplePath () const
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    return sampleFile;
+}
+bool WaveProcessor::sampleMissing () const
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    return sampleFile != juce::File () && sampleSlot.get () == nullptr;
 }
 
 void WaveProcessor::loadFactoryPreset (int index)
@@ -755,9 +873,11 @@ void WaveProcessor::loadFactoryPreset (int index)
     for (int i = 0; i < 2; ++i) setLfoCurve (i, preset.curve (i));
     for (int i = 0; i < 4; ++i) setMacroName (i, preset.macros[(size_t) i]);
     for (int i = 0; i < 2; ++i) setUserTable (i, preset.tables[(size_t) i], preset.tableNames[(size_t) i]);
+    clearSample ();
 }
 int WaveProcessor::matchingFactoryPreset () const
 {
+    if (samplePath () != juce::File ()) return -1; // factory presets carry no sample
     const auto& parameters = getParameters ();
     std::array<bw::LfoCurve, 2> curves { getLfoCurve (0), getLfoCurve (1) };
     std::array<juce::String, 4> macros { getMacroName (0), getMacroName (1), getMacroName (2), getMacroName (3) };
@@ -818,7 +938,7 @@ bool WaveProcessor::loadPreset (const juce::File& file)
 std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
 {
     auto state = apvts.copyState ();
-    for (auto name : { "MODULATION", "USERTABLES" })
+    for (auto name : { "MODULATION", "USERTABLES", "SAMPLE" })
         if (const auto old = state.getChildWithName (name); old.isValid ()) state.removeChild (old, nullptr);
     state.setProperty ("formatVersion", kStateVersion, nullptr);
     juce::ValueTree extra ("MODULATION"); extra.setProperty ("version", 1, nullptr);
@@ -848,6 +968,12 @@ std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
     }
     state.addChild (extra, -1, nullptr);
     state.addChild (tables, -1, nullptr);
+    if (const auto path = samplePath (); path != juce::File ())
+    {
+        juce::ValueTree reference ("SAMPLE");
+        reference.setProperty ("path", path.getFullPathName (), nullptr);
+        state.addChild (reference, -1, nullptr);
+    }
     return state.createXml ();
 }
 void WaveProcessor::getStateInformation (juce::MemoryBlock& dest)
@@ -906,7 +1032,14 @@ void WaveProcessor::restoreState (const juce::XmlElement& xml)
         }
         setUserTable (i, std::move (table), entry.getProperty ("name").toString ());
     }
-    for (auto name : { "MODULATION", "USERTABLES" })
+    // A missing or unreadable file keeps its reference, so saving again does not lose it.
+    if (const auto path = state.getChildWithName ("SAMPLE").getProperty ("path").toString (); juce::File::isAbsolutePath (path))
+    {
+        juce::String error;
+        publishSample (bw::loadSample (juce::File (path), error), juce::File (path));
+    }
+    else clearSample ();
+    for (auto name : { "MODULATION", "USERTABLES", "SAMPLE" })
         if (const auto child = state.getChildWithName (name); child.isValid ()) state.removeChild (child, nullptr);
     apvts.replaceState (state);
 }
