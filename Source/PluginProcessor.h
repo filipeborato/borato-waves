@@ -10,7 +10,7 @@
 
 struct OscParams
 {
-    std::atomic<float> *on, *table, *position, *level, *pitch, *fine, *pan, *unison, *detune, *spread, *phase, *random, *user, *route;
+    std::atomic<float> *on, *table, *position, *level, *pitch, *fine, *pan, *unison, *detune, *spread, *phase, *random, *user, *route, *warpOn, *warp;
 };
 
 struct SynthParams
@@ -45,8 +45,12 @@ public:
     void pitchWheelMoved (int value) override;
     void controllerMoved (int, int) override {}
     void renderNextBlock (juce::AudioBuffer<float>&, int start, int num) override;
+    // Mono/legato: the next startNote glides from the current pitch; legato changes pitch without retriggering.
+    void setPendingGlide (float seconds) { pendingGlide = seconds; }
+    void legato (int note, float glideSeconds);
 
 private:
+    void glideTo (int note, float seconds);
     float clampCutoff (float hz) const { return juce::jmin (hz, (float) getSampleRate () * 0.45f); }
 
     void updateTargets (bool reset);
@@ -59,12 +63,12 @@ private:
     {
         juce::SmoothedValue<float> gain, offset;
         double phase = 0, frequency = 440;
-        float cachedPitch = 10000, cachedPan = 10000, leftGain = 1, rightGain = 1;
+        float cachedPitch = 10000, cachedPan = 10000, cachedWidth = 0, leftGain = 1, rightGain = 1;
         int mip = 0;
     };
     struct OscState
     {
-        juce::SmoothedValue<float> position, amplitude, pitch, fine, pan, detune, spread, enabled;
+        juce::SmoothedValue<float> position, amplitude, pitch, fine, pan, detune, spread, enabled, warp, warpEnabled;
         std::array<Lane, 8> lanes;
     };
     std::array<OscState, 2> sources;
@@ -97,6 +101,35 @@ private:
     float cachedSubPitch = 10000;
     uint32_t noiseState = 0x12345678u;
     float velocity = 0;
+    // A hard stop (steal) hands its last output to a short linear fade, so the voice never steps.
+    std::array<float, 2> lastOut {}, residual {};
+    // Semitones from the target note, ramping to zero.
+    juce::SmoothedValue<float> glideOffset;
+    int noteNumber = 69;
+    float pendingGlide = 0;
+    int residualLeft = 0, residualLength = 240;
+};
+
+// Poly defers to JUCE. Mono/legato play voice 0 with last-note priority over the keys still down.
+class WaveSynth : public juce::Synthesiser
+{
+public:
+    enum Mode { poly, mono, legato };
+    void setMode (int newMode, float glideSeconds);
+    void noteOn (int channel, int note, float velocity) override;
+    void noteOff (int channel, int note, float velocity, bool allowTailOff) override;
+    void allNotesOff (int channel, bool allowTailOff) override;
+    void handleSustainPedal (int channel, bool isDown) override;
+
+private:
+    void play (int channel, int note);
+    void release (float velocity, bool allowTailOff);
+    void forget (int note);
+    int mode = poly, current = -1, heldCount = 0;
+    float glide = 0;
+    bool gate = false, pedal = false;
+    std::array<int, 128> held {};
+    std::array<float, 128> velocities {};
 };
 
 class WaveProcessor : public juce::AudioProcessor
@@ -178,8 +211,10 @@ private:
     double processingRate = 44100;
     std::array<double, 2> freePhases {};
     SynthParams params;
-    juce::Synthesiser synth;
+    WaveSynth synth;
     juce::SmoothedValue<float> gain;
     std::atomic<float>* gainDb = nullptr;
     std::atomic<float>* internalBpm = nullptr;
+    std::atomic<float>* voiceMode = nullptr;
+    std::atomic<float>* glideTime = nullptr;
 };

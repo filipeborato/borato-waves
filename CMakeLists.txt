@@ -64,3 +64,8 @@ juce_add_console_app(test_atelier)
 target_sources(test_atelier PRIVATE tests/test_atelier.cpp)
 target_include_directories(test_atelier PRIVATE Source)
 target_link_libraries(test_atelier PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)
+
+juce_add_console_app(test_voices)
+target_sources(test_voices PRIVATE tests/test_voices.cpp)
+target_include_directories(test_voices PRIVATE Source)
+target_link_libraries(test_voices PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)

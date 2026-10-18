@@ -59,3 +59,7 @@ See [SOURCES.md](SOURCES.md) for source mixing and state compatibility, [OSCILLA
 ## Factory patch content
 
 `FactoryPreset` supports optional custom LFO curves and immutable embedded tables, loaded through the existing control-thread state paths. The Atelier collection adds twelve original patches to the existing bank; see [PRESET_RESEARCH.md](PRESET_RESEARCH.md) for evidence, sound-design choices and validation commands.
+
+## Voices and warp
+
+`WaveSynth` (in `PluginProcessor.h`) extends JUCE's `Synthesiser` with mono/legato last-note priority; `WaveVoice` owns glide, steal declicking and the A/B phase warp. See [VOICES.md](VOICES.md).

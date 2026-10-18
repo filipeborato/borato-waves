@@ -37,4 +37,6 @@ blocks; document whether the host run reproduces that automation. A manually
 played patch without it is a useful device stress check, but not a numerically
 identical benchmark.
 
+`extreme_warp` is `extreme_no_routes` with both A/B phase warps on; see [VOICES.md](VOICES.md) for its single-run figures (about +27% over `extreme_no_routes`).
+
 This device/host check remains **pending** for the reference run above. Do not treat the offline `over_budget_blocks` value as an observed ASIO dropout count.

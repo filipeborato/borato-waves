@@ -232,14 +232,18 @@ public:
           filterTab1 ("FILTER 1", [this] { selectFilter (0); }), filterTab2 ("FILTER 2", [this] { selectFilter (1); }),
           env2Attack (p.apvts, "env2Attack", "E2 ATTACK", violet), env2Decay (p.apvts, "env2Decay", "E2 DECAY", violet),
           env2Sustain (p.apvts, "env2Sustain", "E2 SUSTAIN", violet), env2Release (p.apvts, "env2Release", "E2 RELEASE", violet),
-          envTab1 ("ENV 1", [this] { selectEnvelope (0); }), envTab2 ("ENV 2", [this] { selectEnvelope (1); }), dragEnv2 ("DRAG ENV 2", 9)
+          envTab1 ("ENV 1", [this] { selectEnvelope (0); }), envTab2 ("ENV 2", [this] { selectEnvelope (1); }), dragEnv2 ("DRAG ENV 2", 9),
+          voiceMode (p.apvts, "voiceMode", "", "Voice mode"), glide (p.apvts, "glide", "GLIDE"),
+          warpOnA (p.apvts, "oscAWarpOn", "WARP"), warpOnB (p.apvts, "oscBWarpOn", "B WARP"),
+          warpA (p.apvts, "oscAWarp", "A WARP"), warpB (p.apvts, "oscBWarp", "B WARP", violet)
     {
         setOpaque (true);
         for (Component* c : std::initializer_list<Component*> { &wt, &env, &filter, &lfo, &wtPos, &level, &cutoff, &reso,
              &attack, &decay, &sustain, &release, &gain, &piano, &meter, &preset, &previous, &next, &flat, &stack,
              &fftView, &tableSelector, &tablePrevious, &tableNext, &octaveDown, &octaveUp,
              &wtB, &wtPosB, &levelB, &pitchA, &fineA, &panA, &pitchB, &fineB, &panB, &subLevel, &subOctave, &noiseLevel,
-             &onA, &onB, &subOn, &noiseOn, &flatB, &stackB, &fftB, &selectorB, &previousB, &nextB })
+             &onA, &onB, &subOn, &noiseOn, &flatB, &stackB, &fftB, &selectorB, &previousB, &nextB,
+             &voiceMode, &glide, &warpOnA, &warpOnB, &warpA, &warpB })
             addAndMakeVisible (c);
         for (int oscillator = 0; oscillator < 2; ++oscillator)
         {
@@ -321,6 +325,7 @@ public:
         preset.setBounds (406, 25, 356, 36);
         previous.setBounds (366, 25, 32, 36); next.setBounds (770, 25, 32, 36);
         gain.setBounds (1040, 7, 88, 77); meter.setBounds (1140, 8, 58, 75);
+        voiceMode.setBounds (846, 28, 104, 28); glide.setBounds (956, 7, 80, 77);
         for (int i = 0; i < (int) tabs.size(); ++i) tabs[(size_t) i]->setBounds (20 + i * 106, 94, 98, 31);
         tableSelector.setBounds (34, 177, 278, 27);
         flat.setBounds (322, 178, 38, 25); stack.setBounds (366, 178, 38, 25); fftView.setBounds (410, 178, 44, 25);
@@ -337,7 +342,9 @@ public:
         previousB.setBounds (714, 489, 96, 25); nextB.setBounds (816, 489, 98, 25);
         for (int oscillator = 0; oscillator < 2; ++oscillator)
             for (int i = 0; i < 5; ++i)
-                unisonDials[(size_t) (oscillator * 5 + i)]->setBounds (34 + oscillator * 460 + i * 85, 404, 80, 79);
+                unisonDials[(size_t) (oscillator * 5 + i)]->setBounds (34 + oscillator * 460 + i * 71, 404, 68, 79);
+        warpA.setBounds (34 + 5 * 71, 404, 68, 79); warpB.setBounds (494 + 5 * 71, 404, 68, 79);
+        warpOnA.setBounds (180, 151, 82, 23); warpOnB.setBounds (630, 151, 92, 23);
         filterTab1.setBounds (954, 178, 122, 25); filterTab2.setBounds (1084, 178, 122, 25);
         filter.setBounds (954, 210, 252, 150);
         filterType.setBounds (954, 366, 160, 24); filter2Type.setBounds (954, 366, 160, 24); filter2On.setBounds (1120, 366, 86, 24);
@@ -384,9 +391,7 @@ public:
         label (g, "borato", { 82, 18, 155, 32 }, 29, text, Justification::centredLeft, true);
         label (g, "W A V E   /   WAVETABLE SYNTH", { 84, 52, 242, 18 }, 9, muted);
         label (g, "FACTORY / " + String (currentPatch >= 0 ? bw::factoryPresets()[(size_t) currentPatch].category : "USER"), { 406, 9, 356, 13 }, 8, muted);
-        label (g, "01", { 846, 25, 50, 28 }, 23, mint);
-        label (g, "VOICE ENGINE", { 889, 26, 117, 15 }, 9, muted);
-        label (g, "16-note polyphony", { 889, 44, 130, 17 }, 11, text);
+        label (g, "VOICE ENGINE", { 846, 10, 104, 15 }, 9, muted);
         badge (g, "BORATO WAVE  /  0.1", { 1060, 99, 160, 22 }, muted);
         label (g, page == 0 ? "SOUND STARTS HERE." : page == 1 ? "SHAPE THE SPACE." : page == 2 ? "MAKE CONNECTIONS." : "THE INSTRUMENT, AT A GLANCE.",
                { 532, 98, 480, 24 }, 10, faint, Justification::centredRight);
@@ -472,7 +477,7 @@ private:
         label (g, "An instrument made to evolve.", { 48, 193, 1120, 40 }, 29, text);
         const StringArray titles { "VOICE ENGINE", "WAVETABLE", "INTERFACE" };
         const StringArray values { "16 voices", "8 tables", "100% vector" };
-        const StringArray details { "Polyphonic / pitch bend +/-2 st", "Dual oscillator / sub / white noise", "Custom controls / scalable drawing" };
+        const StringArray details { "Poly, mono or legato / glide / bend +/-2 st", "Dual oscillator / sub / white noise", "Custom controls / scalable drawing" };
         for (int i = 0; i < 3; ++i)
         {
             Rectangle<int> r (48 + i * 386, 261, 362, 132);
@@ -496,7 +501,8 @@ private:
         for (Component* c : std::initializer_list<Component*> { &wt, &env, &filter, &lfo, &wtPos, &level, &cutoff, &reso,
              &attack, &decay, &sustain, &release, &flat, &stack, &fftView, &tableSelector, &tablePrevious, &tableNext,
              &wtB, &wtPosB, &levelB, &pitchA, &fineA, &panA, &pitchB, &fineB, &panB, &subLevel, &subOctave, &noiseLevel,
-             &onA, &onB, &subOn, &noiseOn, &flatB, &stackB, &fftB, &selectorB, &previousB, &nextB }) c->setVisible (page == 0);
+             &onA, &onB, &subOn, &noiseOn, &flatB, &stackB, &fftB, &selectorB, &previousB, &nextB,
+             &warpOnA, &warpOnB, &warpA, &warpB }) c->setVisible (page == 0);
         for (auto& fx : fxButtons) fx->setVisible (page == 1);
         for (auto& dial : unisonDials) dial->setVisible (page == 0);
         matrix.setVisible (page == 2);
@@ -765,6 +771,10 @@ private:
     Dial env2Attack, env2Decay, env2Sustain, env2Release;
     Action envTab1, envTab2;
     SourceHandle dragEnv2;
+    ParameterChoice voiceMode;
+    Dial glide;
+    ParameterToggle warpOnA, warpOnB;
+    Dial warpA, warpB;
     const StringArray fxNames { "01    DISTORTION", "02    CHORUS", "03    DELAY", "04    REVERB", "05    EQUALIZER", "06    COMPRESSOR" };
     std::unique_ptr<FileChooser> chooser;
     std::unique_ptr<ParameterAttachment> tableAttachment, attachmentB;
