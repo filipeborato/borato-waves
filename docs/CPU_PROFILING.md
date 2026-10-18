@@ -24,4 +24,17 @@ The isolated comparisons show the cost of more notes (`light` → `notes16`), mo
 
 In both Borato Wave Standalone and REAPER with the Borato Wave VST3, select the same physical audio device, ASIO driver, 128-sample buffer and sample rate. Record driver, device, OS, CPU, host version and plug-in build. Set A/B, unison, matrix routes and effects to match a benchmark profile, then hold the stated note count for at least 30 seconds using a reproducible MIDI clip or input. Repeat at 44.1, 48 and 96 kHz. In REAPER record its real-time CPU/performance meter and any underrun indication; in Standalone listen or record loopback for clicks and note loss. Log each run as `date | app | device/driver | rate | buffer | profile | notes | CPU | underruns/clicks | observations`.
 
+For a close host reproduction, start from a fresh default state. Set attack/decay
+to 1 ms, sustain to 1, cutoff to 18 kHz, `level` to 0.5 and output gain to
+−30 dB. Set A/B detune to 50 and spread to 1; enable B only for `layered`,
+`extreme_no_routes`, `extreme` and `extreme_fx`. Use the note count and A/B unison
+shown by the benchmark output, with MIDI notes ascending from 48. For each of
+the first N routes, where N is the profile's route count, assign route `i`
+source choice `(i % 8) + 1`, destination choice `i - 1`, depth 0.5 and bipolar
+on. For `extreme_fx`, enable distortion/delay/reverb with mixes 0.5/0.3/0.3.
+The offline harness also changes both tables, Macro 1 and B pitch every 13
+blocks; document whether the host run reproduces that automation. A manually
+played patch without it is a useful device stress check, but not a numerically
+identical benchmark.
+
 This device/host check remains **pending** for the reference run above. Do not treat the offline `over_budget_blocks` value as an observed ASIO dropout count.
