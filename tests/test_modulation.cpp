@@ -467,15 +467,91 @@ void stress (WaveProcessor& p, bool benchmark)
                                  << seconds * rate / (blocks * blockSize) * 100 << "% single-core budget\n";
     }
 }
+
+void benchmarkProfiles()
+{
+    struct Profile { const char* name; int notes, unison, routes; bool effects; };
+    constexpr Profile profiles[] {
+        { "light", 1, 1, 0, false },
+        { "layered", 4, 2, 4, false },
+        { "extreme", 16, 8, 16, false },
+        { "extreme_fx", 16, 8, 16, true }
+    };
+    constexpr int blockSize = 128;
+    for (const auto& profile : profiles)
+        for (double rate : { 44100.0, 48000.0, 96000.0 })
+        {
+            WaveProcessor p;
+            initialise (p);
+            set (p, "oscBOn", profile.notes == 1 ? 0.0f : 1.0f);
+            set (p, "oscAUnison", (float) profile.unison);
+            set (p, "oscBUnison", (float) profile.unison);
+            set (p, "oscADetune", 50); set (p, "oscBDetune", 50);
+            set (p, "oscASpread", 1); set (p, "oscBSpread", 1);
+            set (p, "gain", -30);
+            for (int i = 1; i <= profile.routes; ++i)
+                route (p, i, i % 8 + 1, i - 1, .5f, true);
+            if (profile.effects)
+            {
+                set (p, "distOn", 1); set (p, "distMix", .5f);
+                set (p, "delayOn", 1); set (p, "delayMix", .3f);
+                set (p, "reverbOn", 1); set (p, "reverbMix", .3f);
+            }
+            p.prepareToPlay (rate, blockSize);
+            juce::AudioBuffer<float> audio (2, blockSize);
+            juce::MidiBuffer midi;
+            const int blocks = (int) rate / blockSize;
+            const double deadline = blockSize / rate;
+            double total = 0, worst = 0;
+            float peak = 0;
+            int overBudget = 0;
+            for (int block = 0; block < blocks; ++block)
+            {
+                midi.clear();
+                if (block == 0)
+                    for (int note = 48; note < 48 + profile.notes; ++note)
+                        midi.addEvent (juce::MidiMessage::noteOn (1, note, .7f), 0);
+                if (block % 13 == 0)
+                {
+                    set (p, "wtTable", (float) (block % 8));
+                    set (p, "wtTableB", (float) ((block + 3) % 8));
+                    set (p, "macro1", (float) (block % 2));
+                    set (p, "oscBPitch", block % 2 ? -24.0f : 24.0f);
+                }
+                const auto start = std::chrono::steady_clock::now();
+                p.processBlock (audio, midi);
+                const double elapsed = std::chrono::duration<double> (std::chrono::steady_clock::now() - start).count();
+                total += elapsed;
+                worst = std::max (worst, elapsed);
+                if (elapsed > deadline) ++overBudget;
+                for (int ch = 0; ch < 2; ++ch)
+                    for (int sample = 0; sample < blockSize; ++sample)
+                    {
+                        const float value = audio.getSample (ch, sample);
+                        if (! std::isfinite (value)) std::abort();
+                        peak = std::max (peak, std::abs (value));
+                    }
+            }
+            if (peak <= 1.0e-6f) std::abort();
+            const double audioTime = blocks * deadline;
+            std::cout << "benchmark profile=" << profile.name << " rate=" << rate
+                      << " block=" << blockSize << " notes=" << profile.notes
+                      << " unison=" << profile.unison << " routes=" << profile.routes
+                      << " effects=" << profile.effects << " process_s=" << total
+                      << " audio_s=" << audioTime << " budget_pct=" << total / audioTime * 100
+                      << " worst_block_pct=" << worst / deadline * 100
+                      << " over_budget_blocks=" << overBudget << "/" << blocks << '\n';
+        }
+}
 }
 
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     const bool benchmark = argc > 1 && juce::String (argv[1]) == "--benchmark";
+    if (benchmark) { benchmarkProfiles(); return 0; }
     WaveProcessor processor;
     initialise (processor);
-    if (benchmark) { stress (processor, true); return 0; }
     testCurves(); testTableFade (processor.wavetableBank);
     testMatrix (processor); testLfo (processor); testLiveCurves (processor); testUnison (processor); testState (processor);
     stress (processor, false);

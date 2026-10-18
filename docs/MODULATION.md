@@ -30,7 +30,9 @@ Host parameter changes are read at render-block boundaries, while MIDI events us
 
 Run Debug `test_wavetable`, `test_sources`, `test_modulation` and `test_interface`. The latter accepts an absolute snapshot directory. The modulation suite checks curve validity and concurrent publication, live curve edits, polarity/sum/limits, tempo/transport/retrigger, block-size independence, tuning, stereo/mono, count transitions, persistence and legacy migration. Stress covers sixteen notes at 8/44.1/48/96/192 kHz.
 
-Release `test_modulation.exe --benchmark` measures the current machine with 128-sample buffers, sixteen held notes, A/B at eight lanes, sixteen routes and live automation. Results are offline CPU measurements, not ASIO streaming/latency guarantees. Hardware listening and DAW automation remain manual validation.
+The original Release `test_modulation.exe --benchmark` measured 128-sample blocks, sixteen held notes, A/B at eight lanes, sixteen routes and live automation. Those results are offline CPU measurements, not ASIO streaming/latency guarantees. Hardware listening and DAW automation remain manual validation.
+
+The current benchmark also reports light, layered and effects-enabled profiles; see [CPU_PROFILING.md](CPU_PROFILING.md) for its process-only timing method, reference results and device/host procedure. The historical result below used whole-loop timing and must not be compared directly to the new process-only percentages.
 
 Measured on AMD Ryzen 7 5700X, Windows x64, Release/LTO, 2026-10-17 (one approximately one-second audio run per rate):
 
