@@ -225,6 +225,7 @@ void WaveVoice::startNote (int note, float vel, juce::SynthesiserSound*, int whe
     glideTo (note, pendingGlide);
     pendingGlide = 0;
     velocity = vel;
+    released = false;
     notePhase = {};
     modulation.latestVoice.store (voiceId, std::memory_order_relaxed);
     cachedSubPitch = 10000;
@@ -272,7 +273,7 @@ void WaveVoice::legato (int note, float glideSeconds)
 
 void WaveVoice::stopNote (float, bool allowTailOff)
 {
-    if (allowTailOff) { adsr.noteOff (); env2.noteOff (); }
+    if (allowTailOff) { adsr.noteOff (); env2.noteOff (); released = true; }
     else
     {
         const float fade = (float) residualLeft / (float) residualLength;
@@ -332,8 +333,11 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         for (int ch = 0; ch < juce::jmin (2, out.getNumChannels ()); ++ch)
             out.addSample (ch, start+i, residual[(size_t) ch] * (float) residualLeft / (float) residualLength);
     if (! isVoiceActive ()) return;
-    adsr.setParameters ({ params.attack->load (), params.decay->load (), params.sustain->load (), params.release->load () });
-    env2.setParameters ({ params.env2Attack->load (), params.env2Decay->load (), params.env2Sustain->load (), params.env2Release->load () });
+    if (! released)
+    {
+        adsr.setParameters ({ params.attack->load (), params.decay->load (), params.sustain->load (), params.release->load () });
+        env2.setParameters ({ params.env2Attack->load (), params.env2Decay->load (), params.env2Sustain->load (), params.env2Release->load () });
+    }
     updateTargets (false);
     updateModulation (false);
     const double sampleRate = getSampleRate ();

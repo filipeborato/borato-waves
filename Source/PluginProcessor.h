@@ -109,6 +109,9 @@ private:
     float cachedSubPitch = 10000;
     uint32_t noiseState = 0x12345678u;
     float velocity = 0;
+    // juce::ADSR::setParameters recomputes the release rate from the sustain level, not from the level the
+    // note was released at: so after note-off the envelopes keep the parameters they were released with.
+    bool released = false;
     // A hard stop (steal) hands its last output to a short linear fade, so the voice never steps.
     std::array<float, 2> lastOut {}, residual {};
     // Semitones from the target note, ramping to zero.

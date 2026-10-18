@@ -28,6 +28,25 @@ void testSustainPedal()
     assert (silent (rig.run (.2), 4800));
 }
 
+// A note released while still decaying fades from its current level over the release time, whatever the
+// sustain: no endless tail at a low sustain, no cut at zero sustain.
+void testReleaseFromDecay()
+{
+    for (float sustain : { 0.0f, .05f, .3f })
+    {
+        Rig rig;
+        rig.set ("decay", 1); rig.set ("sustain", sustain); rig.set ("release", .1f);
+        rig.send (on (60));
+        const auto held = rig.run (.1); // still decaying, well above the sustain level
+        rig.send (off (60));
+        const auto released = rig.run (.4);
+        assert (rms (released, 0, 96) > .5 * rms (held, held.size() - 96, held.size())); // not cut
+        const float steady = maxStep (held, held.size() - 480, held.size(), held[held.size() - 481]);
+        assert (maxStep (released, 0, 480, held.back()) < 1.5f * steady);                 // no click
+        assert (silent (released, (size_t) (48000 * .15)));                              // over in ~0.1 s
+    }
+}
+
 void testAllNotesOff()
 {
     Rig rig;
@@ -405,6 +424,7 @@ int main()
 #endif
     juce::ScopedJuceInitialiser_GUI init;
     testSustainPedal();
+    testReleaseFromDecay();
     testAllNotesOff();
     testStealIsContinuous();
     testModeDefaultsAndMigration();
@@ -421,6 +441,6 @@ int main()
     testFmAlias();
     testFmSweep();
     testFmMatrixAndChords();
-    std::cout << "ok: sustain pedal, all-notes-off, click-free steal, mono priority, legato/glide, legato pedal, "
+    std::cout << "ok: sustain pedal, release from decay, all-notes-off, click-free steal, mono priority, legato/glide, legato pedal, "
                  "state migration, poly/mono/legato fuzz, warp tuning/level/alias/sweep/matrix, FM timbre/tuning/alias/sweep/matrix/chords\n";
 }
