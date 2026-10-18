@@ -427,7 +427,7 @@ void testState (WaveProcessor& p)
     assert (p.getLfoCurve (0).valid());
 }
 
-void stress (WaveProcessor& p, bool benchmark)
+void stress (WaveProcessor& p)
 {
     set (p, "oscBOn", 1); set (p, "oscAUnison", 8); set (p, "oscBUnison", 8);
     set (p, "oscADetune", 50); set (p, "oscBDetune", 50);
@@ -436,11 +436,10 @@ void stress (WaveProcessor& p, bool benchmark)
     for (double rate : { 8000.0, 44100.0, 48000.0, 96000.0, 192000.0 })
     {
         constexpr int blockSize = 128;
-        const int blocks = benchmark ? (int) rate / blockSize : 80;
+        const int blocks = 80;
         set (p, "oscAUnison", 8);
         p.prepareToPlay (rate, blockSize);
         juce::AudioBuffer<float> audio (2, blockSize); juce::MidiBuffer midi;
-        const auto start = std::chrono::steady_clock::now();
         for (int block = 0; block < blocks; ++block)
         {
             midi.clear();
@@ -450,7 +449,7 @@ void stress (WaveProcessor& p, bool benchmark)
             if (block % 13 == 0)
             {
                 set (p, "wtTable", (float) (block % 8)); set (p, "wtTableB", (float) ((block + 3) % 8));
-                if (! benchmark) set (p, "oscAUnison", (float) ((block / 13) % 8 + 1));
+                set (p, "oscAUnison", (float) ((block / 13) % 8 + 1));
                 set (p, "macro1", (float) (block % 2)); set (p, "oscBPitch", block % 2 ? -24.0f : 24.0f);
             }
             p.processBlock (audio, midi);
@@ -461,21 +460,20 @@ void stress (WaveProcessor& p, bool benchmark)
                     if (! std::isfinite (value) || std::abs (value) > 16) std::abort();
                 }
         }
-        const double seconds = std::chrono::duration<double> (std::chrono::steady_clock::now() - start).count();
-        if (benchmark) std::cout << "benchmark " << rate << " Hz: " << seconds << " s wall / "
-                                 << blocks * blockSize / rate << " s audio, "
-                                 << seconds * rate / (blocks * blockSize) * 100 << "% single-core budget\n";
     }
 }
 
 void benchmarkProfiles()
 {
-    struct Profile { const char* name; int notes, unison, routes; bool effects; };
+    struct Profile { const char* name; int notes, unison, routes; bool oscB, effects; };
     constexpr Profile profiles[] {
-        { "light", 1, 1, 0, false },
-        { "layered", 4, 2, 4, false },
-        { "extreme", 16, 8, 16, false },
-        { "extreme_fx", 16, 8, 16, true }
+        { "light", 1, 1, 0, false, false },
+        { "notes16", 16, 1, 0, false, false },
+        { "unison8", 1, 8, 0, false, false },
+        { "layered", 4, 2, 4, true, false },
+        { "extreme_no_routes", 16, 8, 0, true, false },
+        { "extreme", 16, 8, 16, true, false },
+        { "extreme_fx", 16, 8, 16, true, true }
     };
     constexpr int blockSize = 128;
     for (const auto& profile : profiles)
@@ -483,7 +481,7 @@ void benchmarkProfiles()
         {
             WaveProcessor p;
             initialise (p);
-            set (p, "oscBOn", profile.notes == 1 ? 0.0f : 1.0f);
+            set (p, "oscBOn", profile.oscB ? 1.0f : 0.0f);
             set (p, "oscAUnison", (float) profile.unison);
             set (p, "oscBUnison", (float) profile.unison);
             set (p, "oscADetune", 50); set (p, "oscBDetune", 50);
@@ -528,7 +526,7 @@ void benchmarkProfiles()
                     for (int sample = 0; sample < blockSize; ++sample)
                     {
                         const float value = audio.getSample (ch, sample);
-                        if (! std::isfinite (value)) std::abort();
+                        if (! std::isfinite (value) || std::abs (value) > 16) std::abort();
                         peak = std::max (peak, std::abs (value));
                     }
             }
@@ -536,7 +534,8 @@ void benchmarkProfiles()
             const double audioTime = blocks * deadline;
             std::cout << "benchmark profile=" << profile.name << " rate=" << rate
                       << " block=" << blockSize << " notes=" << profile.notes
-                      << " unison=" << profile.unison << " routes=" << profile.routes
+                      << " unison=" << profile.unison << " osc_b=" << profile.oscB
+                      << " routes=" << profile.routes
                       << " effects=" << profile.effects << " process_s=" << total
                       << " audio_s=" << audioTime << " budget_pct=" << total / audioTime * 100
                       << " worst_block_pct=" << worst / deadline * 100
@@ -554,7 +553,7 @@ int main (int argc, char** argv)
     initialise (processor);
     testCurves(); testTableFade (processor.wavetableBank);
     testMatrix (processor); testLfo (processor); testLiveCurves (processor); testUnison (processor); testState (processor);
-    stress (processor, false);
+    stress (processor);
     std::cout << "ok: curves, table-fade timing, matrix polarity/sum/clamp, live edits, LFO timing/block partitions, "
                  "unison tuning/stereo/mono, state migration, 16-note stress at 8-192 kHz\n";
 }
