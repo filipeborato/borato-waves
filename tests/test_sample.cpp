@@ -122,6 +122,8 @@ void testSwapDuringNotes()
     Rig rig;
     sampleOnly (rig);
     rig.set ("sampleStart", .3131f); // the new sample starts mid-cycle
+    // One undo step, so the history keeps only the samples before and after it.
+    const WaveProcessor::ScopedEdit swaps (rig.processor);
     assert (rig.processor.loadSample (first).isEmpty());
     std::weak_ptr<const bw::Sample> old = rig.processor.sample();
     rig.send (on (60));

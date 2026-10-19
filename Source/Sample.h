@@ -16,8 +16,7 @@ struct Sample
         const int n = (int) std::floor (position);
         const float t = (float) (position - n);
         auto at = [&] (int i) { return data[(size_t) juce::jlimit (0, last, i)]; };
-        const float y0 = at (n - 1), y1 = at (n), y2 = at (n + 1), y3 = at (n + 2);
-        return y1 + 0.5f * t * (y2 - y0 + t * (2 * y0 - 5 * y1 + 4 * y2 - y3 + t * (3 * (y1 - y2) + y3 - y0)));
+        return catmullRom (at (n - 1), at (n), at (n + 1), at (n + 2), t);
     }
     // Normalised start/end (either order) to frames, at least kMinSampleRegion apart.
     std::pair<double, double> region (float start, float end) const noexcept;

@@ -22,7 +22,7 @@ they are implemented.
 | Value readouts | `XferParamDisplay`, `DraggableParamDisplay` (drag a number to edit) | Custom `Dial` formatted readout with drag, wheel and arrow-key input |
 | Lists / browser | `CDataBrowser`, `PresetDataBrowserView`, `PresetLocationTreeView`, `CSearchTextEdit` | Custom `WavetableBrowser` / `SearchField` + `borato_preset_search` matching |
 | Modulation drag | `ModSourceView`, per-source `kUIParam…Drag` (LFO1Drag…Macro8Drag) | `DragAndDropContainer` + `DragAndDropTarget` on knobs |
-| Undo | `UndoController` | `juce::UndoManager` passed to the APVTS |
+| Undo | `WaveProcessor::beginEdit/endEdit/undo/redo` | Snapshots of parameters, curves, macro names, user tables and sample per gesture; host automation is not recorded |
 | Preset store | SQLite `System\presets.db` (Presets/Tags/Locations/UserData) | `borato_preset_search` (in-memory; SQLite only if needed) |
 
 ## Build order (what to clone feature-wise, in our own code)

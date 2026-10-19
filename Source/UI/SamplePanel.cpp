@@ -96,6 +96,7 @@ void SamplePanel::choose()
     {
         const auto file = fc.getResult();
         if (file == File()) return;
+        const WaveProcessor::ScopedEdit edit (processor, "SAMPLE");
         status = processor.loadSample (file).toUpperCase();
         if (status.isEmpty())
             if (auto* on = processor.apvts.getParameter ("sampleOn"); on->getValue() < .5f)

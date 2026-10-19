@@ -118,6 +118,10 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     continuous ("sampleStart", "Sample Start", 0, 1, 0);
     continuous ("sampleEnd", "Sample End", 0, 1, 1);
     toggle ("sampleLoop", "Sample Loop", false);
+    toggle ("chorusOn", "Chorus On", false);
+    l.add (std::make_unique<P> (juce::ParameterID { "chorusRate", 1 }, "Chorus Rate", R (0.05f, 5, 0, 0.5f), 0.6f));
+    continuous ("chorusDepth", "Chorus Depth", 0, 1, .5f);
+    continuous ("chorusMix", "Chorus Mix", 0, 1, .5f);
     return l;
 }
 
@@ -535,7 +539,8 @@ WaveProcessor::WaveProcessor ()
         p ("sampleOn"), p ("sampleLevel"), p ("samplePitch"), p ("sampleStart"), p ("sampleEnd"), p ("sampleLoop") };
     effectParams = { p ("distOn"), p ("distMode"), p ("distDrive"), p ("distMix"),
         p ("delayOn"), p ("delayTime"), p ("delaySync"), p ("delayDivision"), p ("delayFeedback"), p ("delayPingPong"), p ("delayMix"),
-        p ("reverbOn"), p ("reverbSize"), p ("reverbDamping"), p ("reverbWidth"), p ("reverbMix") };
+        p ("reverbOn"), p ("reverbSize"), p ("reverbDamping"), p ("reverbWidth"), p ("reverbMix"),
+        p ("chorusOn"), p ("chorusRate"), p ("chorusDepth"), p ("chorusMix") };
     gainDb = p ("gain");
     internalBpm = p ("internalBpm");
     voiceMode = p ("voiceMode");
@@ -578,6 +583,8 @@ WaveProcessor::WaveProcessor ()
                 normalised.push_back (found != plain.end () ? ranged->convertTo0to1 (found->second) : ranged->getDefaultValue ());
             }
     }
+    for (auto* parameter : getParameters ())
+        parameter->addListener (this);
     synth.setMinimumRenderingSubdivisionSize (1);
     synth.addSound (new WaveSound ());
     for (int i = 0; i < 16; ++i)
@@ -756,6 +763,7 @@ bw::LfoCurve WaveProcessor::getLfoCurve (int index) const
 }
 void WaveProcessor::setLfoCurve (int index, const bw::LfoCurve& curve)
 {
+    const ScopedEdit edit (*this);
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
         savedCurves[(size_t) juce::jlimit (0, 1, index)] = curve.valid () ? curve : bw::LfoCurve::factory (0);
@@ -771,6 +779,7 @@ juce::String WaveProcessor::getMacroName (int index) const
 }
 void WaveProcessor::setMacroName (int index, const juce::String& name)
 {
+    const ScopedEdit edit (*this);
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
         index = juce::jlimit (0, 3, index);
@@ -792,14 +801,26 @@ juce::String WaveProcessor::importWavetable (int oscillator, const juce::File& f
     juce::String error;
     const auto cycles = bw::loadCycles (file, error);
     if (cycles.empty ()) return error;
+    publishCycles (oscillator, cycles, file.getFileNameWithoutExtension ());
+    return {};
+}
+juce::String WaveProcessor::importTuned (int oscillator, const bw::TunedSource& source, double period, const juce::String& name)
+{
+    const auto cycles = bw::cyclesFromPeriod (source.mono, period);
+    if (cycles.empty ()) return "The period is longer than the audio";
+    publishCycles (oscillator, cycles, name);
+    return {};
+}
+void WaveProcessor::publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name)
+{
     // ponytail: built on the calling thread (~tens of ms for 256 frames); move to a worker if imports stall the UI.
     auto table = std::make_shared<bw::Wavetable> ();
     table->setFrames (cycles);
-    setUserTable (oscillator, std::move (table), file.getFileNameWithoutExtension ());
-    return {};
+    setUserTable (oscillator, std::move (table), name);
 }
 void WaveProcessor::setUserTable (int oscillator, std::shared_ptr<const bw::Wavetable> table, const juce::String& name)
 {
+    const ScopedEdit edit (*this);
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
         const auto index = (size_t) juce::jlimit (0, 1, oscillator);
@@ -838,6 +859,7 @@ juce::String WaveProcessor::loadSample (const juce::File& file)
 void WaveProcessor::clearSample () { publishSample (nullptr, {}); }
 void WaveProcessor::publishSample (std::shared_ptr<const bw::Sample> loaded, const juce::File& path)
 {
+    const ScopedEdit edit (*this);
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
         sampleFile = path;
@@ -866,6 +888,7 @@ void WaveProcessor::loadFactoryPreset (int index)
 {
     index = juce::jlimit (0, (int) factoryNormalised.size () - 1, index);
     const auto& preset = bw::factoryPresets ()[(size_t) index];
+    const ScopedEdit edit (*this, "PRESET " + juce::String (preset.name).toUpperCase ());
     const auto& values = factoryNormalised[(size_t) index];
     const auto& parameters = getParameters ();
     for (int i = 0; i < parameters.size (); ++i)
@@ -879,6 +902,16 @@ void WaveProcessor::loadFactoryPreset (int index)
     for (int i = 0; i < 2; ++i) setUserTable (i, preset.tables[(size_t) i], preset.tableNames[(size_t) i]);
     clearSample ();
 }
+static bool sameCurve (const bw::LfoCurve& a, const bw::LfoCurve& b)
+{
+    if (a.count != b.count) return false;
+    for (int i = 0; i < a.count; ++i)
+    {
+        const auto& p = a.points[(size_t) i]; const auto& q = b.points[(size_t) i];
+        if (std::abs (p.x - q.x) > 1.0e-5f || std::abs (p.y - q.y) > 1.0e-5f || std::abs (p.curve - q.curve) > 1.0e-5f) return false;
+    }
+    return true;
+}
 int WaveProcessor::matchingFactoryPreset () const
 {
     if (samplePath () != juce::File ()) return -1; // factory presets carry no sample
@@ -886,16 +919,6 @@ int WaveProcessor::matchingFactoryPreset () const
     std::array<bw::LfoCurve, 2> curves { getLfoCurve (0), getLfoCurve (1) };
     std::array<juce::String, 4> macros { getMacroName (0), getMacroName (1), getMacroName (2), getMacroName (3) };
     std::array<std::shared_ptr<const bw::Wavetable>, 2> tables { userTable (0), userTable (1) };
-    const auto sameCurve = [] (const bw::LfoCurve& a, const bw::LfoCurve& b)
-    {
-        if (a.count != b.count) return false;
-        for (int i = 0; i < a.count; ++i)
-        {
-            const auto& p = a.points[(size_t) i]; const auto& q = b.points[(size_t) i];
-            if (std::abs (p.x - q.x) > 1.0e-5f || std::abs (p.y - q.y) > 1.0e-5f || std::abs (p.curve - q.curve) > 1.0e-5f) return false;
-        }
-        return true;
-    };
     for (size_t n = 0; n < factoryNormalised.size (); ++n)
     {
         const auto& preset = bw::factoryPresets ()[n];
@@ -935,8 +958,121 @@ bool WaveProcessor::loadPreset (const juce::File& file)
     const auto xml = juce::parseXML (file);
     if (xml == nullptr || ! xml->hasTagName (apvts.state.getType ().toString ())
         || xml->getIntAttribute ("formatVersion", 1) > kStateVersion) return false;
+    const ScopedEdit edit (*this, "PRESET " + file.getFileNameWithoutExtension ().toUpperCase ());
+    std::fill (touched.begin (), touched.end (), true); // the state replaces every parameter, without gestures
     restoreState (*xml);
     return true;
+}
+
+void WaveProcessor::parameterGestureChanged (int index, bool starting)
+{
+    if (! starting) return endEdit ();
+    beginEdit ();
+    if (! replaying) touched[(size_t) index] = true;
+}
+void WaveProcessor::beginEdit (const juce::String& name)
+{
+    if (replaying || editDepth++ > 0) return;
+    editStart = capture ();
+    touched.assign ((size_t) getParameters ().size (), false);
+    editName = name;
+}
+void WaveProcessor::endEdit ()
+{
+    if (replaying || editDepth == 0 || --editDepth > 0) return;
+    Step step { std::move (editStart), capture (), std::vector<bool> (touched.size ()), std::move (editName) };
+    const auto& before = step.before;
+    const auto& after = step.after;
+    juce::StringArray changes;
+    const auto& parameters = getParameters ();
+    for (size_t i = 0; i < touched.size (); ++i)
+        if (touched[i] && before.values[i] != after.values[i])
+        {
+            step.parameters[i] = true;
+            changes.add (parameters[(int) i]->getName (64).toUpperCase ());
+        }
+    for (int l = 0; l < 2; ++l)
+        if (! sameCurve (before.curves[(size_t) l], after.curves[(size_t) l])) changes.add ("LFO " + juce::String (l + 1) + " SHAPE");
+    if (before.macros != after.macros) changes.add ("MACRO NAME");
+    for (size_t t = 0; t < 2; ++t)
+        if (before.tables[t] != after.tables[t] || before.tableNames[t] != after.tableNames[t]) changes.add (t == 0 ? "OSC A TABLE" : "OSC B TABLE");
+    if (before.sample != after.sample || before.samplePath != after.samplePath) changes.add ("SAMPLE");
+    if (changes.isEmpty ()) return;
+    if (step.name.isEmpty ()) step.name = changes.size () == 1 ? changes[0] : "EDIT";
+    // Wheel ticks and arrow steps are a gesture each: on the same control within half a second, they extend the last step.
+    const auto now = juce::Time::getMillisecondCounter ();
+    if (historyIndex == (int) history.size () && historyIndex > 0 && now - lastStepTime < 500
+        && history.back ().name == step.name && history.back ().parameters == step.parameters && changes.size () == 1)
+    {
+        history.back ().after = std::move (step.after);
+        lastStepTime = now;
+        return;
+    }
+    lastStepTime = now;
+    history.resize ((size_t) historyIndex);
+    history.push_back (std::move (step));
+    const auto bytes = [this]
+    {
+        size_t total = 0; // the tables and samples each step introduced
+        for (const auto& s : history)
+        {
+            for (size_t t = 0; t < 2; ++t)
+                if (s.after.tables[t] != nullptr && s.after.tables[t] != s.before.tables[t]) total += s.after.tables[t]->data.size () * sizeof (float);
+            if (s.after.sample != nullptr && s.after.sample != s.before.sample) total += s.after.sample->data.size () * sizeof (float);
+        }
+        return total;
+    };
+    while (history.size () > 1 && (history.size () > kHistorySteps || bytes () > kHistoryBytes))
+        history.erase (history.begin ());
+    historyIndex = (int) history.size ();
+}
+bool WaveProcessor::undo ()
+{
+    if (editDepth > 0 || ! canUndo ()) return false;
+    const auto& step = history[(size_t) --historyIndex];
+    restore (step.before, step.parameters);
+    return true;
+}
+bool WaveProcessor::redo ()
+{
+    if (editDepth > 0 || ! canRedo ()) return false;
+    const auto& step = history[(size_t) historyIndex++];
+    restore (step.after, step.parameters);
+    return true;
+}
+WaveProcessor::Snapshot WaveProcessor::capture () const
+{
+    Snapshot s;
+    for (auto* parameter : getParameters ()) s.values.push_back (parameter->getValue ());
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    s.curves = savedCurves;
+    s.macros = macroNames;
+    s.tableNames = userTableNames;
+    for (size_t t = 0; t < 2; ++t) s.tables[t] = userSlots[t].get ();
+    s.sample = sampleSlot.get ();
+    s.samplePath = sampleFile;
+    return s;
+}
+// Through the same setters as an edit, so the editor, host and audio thread follow.
+void WaveProcessor::restore (const Snapshot& s, const std::vector<bool>& parameters)
+{
+    const juce::ScopedValueSetter<bool> quiet (replaying, true);
+    const auto& all = getParameters ();
+    for (int i = 0; i < all.size (); ++i)
+        if (parameters[(size_t) i] && all[i]->getValue () != s.values[(size_t) i])
+        {
+            all[i]->beginChangeGesture ();
+            all[i]->setValueNotifyingHost (s.values[(size_t) i]);
+            all[i]->endChangeGesture ();
+        }
+    for (int l = 0; l < 2; ++l)
+        if (! sameCurve (getLfoCurve (l), s.curves[(size_t) l])) setLfoCurve (l, s.curves[(size_t) l]);
+    for (int m = 0; m < 4; ++m)
+        if (getMacroName (m) != s.macros[(size_t) m]) setMacroName (m, s.macros[(size_t) m]);
+    for (int t = 0; t < 2; ++t)
+        if (userTable (t) != s.tables[(size_t) t] || userTableName (t) != s.tableNames[(size_t) t])
+            setUserTable (t, s.tables[(size_t) t], s.tableNames[(size_t) t]);
+    if (sample () != s.sample || samplePath () != s.samplePath) publishSample (s.sample, s.samplePath);
 }
 
 std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
@@ -1050,7 +1186,14 @@ void WaveProcessor::restoreState (const juce::XmlElement& xml)
 void WaveProcessor::setStateInformation (const void* data, int size)
 {
     if (auto xml = getXmlFromBinary (data, size); xml && xml->hasTagName (apvts.state.getType ()))
-        restoreState (*xml);
+    {
+        {
+            const juce::ScopedValueSetter<bool> quiet (replaying, true);
+            restoreState (*xml);
+        }
+        history.clear (); // a new project or patch from the host
+        historyIndex = 0;
+    }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter () { return new WaveProcessor (); }

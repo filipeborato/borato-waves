@@ -9,6 +9,7 @@ struct EffectParams
     std::atomic<float> *distOn, *distMode, *distDrive, *distMix;
     std::atomic<float> *delayOn, *delayTime, *delaySync, *delayDivision, *delayFeedback, *delayPingPong, *delayMix;
     std::atomic<float> *reverbOn, *reverbSize, *reverbDamping, *reverbWidth, *reverbMix;
+    std::atomic<float> *chorusOn, *chorusRate, *chorusDepth, *chorusMix;
 };
 
 inline juce::StringArray distortionModes() { return { "Soft", "Hard", "Fold" }; }
@@ -21,12 +22,14 @@ inline float shape (int mode, float x, float drive) noexcept
     return std::tanh (x * drive) / std::tanh (drive);
 }
 
-// Fixed order: distortion > delay > reverb. Each stage crossfades in and out over 20 ms;
+// Fixed order: distortion > chorus > delay > reverb. Each stage crossfades in and out over 20 ms;
 // a fully bypassed stage does no work and leaves the signal untouched.
 class Effects
 {
 public:
     static constexpr double kMaxDelaySeconds = 4.0;
+    // Chorus taps sweep kChorusCentre +/- depth * kChorusSweep seconds.
+    static constexpr double kChorusCentre = 0.010, kChorusSweep = 0.004;
 
     void prepare (double sampleRate, int maxBlock)
     {
@@ -37,9 +40,12 @@ public:
         delay.setMaximumDelayInSamples ((int) std::ceil (sampleRate * kMaxDelaySeconds) + 1);
         delay.prepare ({ sampleRate, (juce::uint32) blockLimit, 2 });
         reverb.setSampleRate (sampleRate);
-        for (auto* s : { &distortion, &echo, &space }) { s->active.reset (sampleRate, 0.02); s->active.setCurrentAndTargetValue (0); s->running = false; }
+        chorusLine.setMaximumDelayInSamples ((int) std::ceil (sampleRate * (kChorusCentre + kChorusSweep)) + 4);
+        chorusLine.prepare ({ sampleRate, (juce::uint32) blockLimit, 2 });
+        for (auto* s : { &distortion, &chorus, &echo, &space }) { s->active.reset (sampleRate, 0.02); s->active.setCurrentAndTargetValue (0); s->running = false; }
         drive.reset (sampleRate, 0.02); distMix.reset (sampleRate, 0.02);
         delaySamples.reset (sampleRate, 0.08); feedback.reset (sampleRate, 0.02); delayMix.reset (sampleRate, 0.02);
+        chorusDepth.reset (sampleRate, 0.05); chorusMix.reset (sampleRate, 0.02);
         reset();
     }
 
@@ -48,6 +54,8 @@ public:
         oversampler.reset();
         delay.reset();
         reverb.reset();
+        chorusLine.reset();
+        chorusPhase = 0;
     }
 
     // offsets: normalised modulation for drive, delay mix and reverb mix.
@@ -64,6 +72,9 @@ public:
         delaySamples.setTargetValue ((float) juce::jlimit (1.0, rate * kMaxDelaySeconds, seconds * rate));
         feedback.setTargetValue (juce::jlimit (0.0f, 0.95f, p.delayFeedback->load()));
         delayMix.setTargetValue (offset (1, p.delayMix->load(), 0, 1));
+        chorusDepth.setTargetValue (p.chorusDepth->load());
+        chorusMix.setTargetValue (p.chorusMix->load());
+        chorusIncrement = p.chorusRate->load() / rate;
         const float mix = offset (2, p.reverbMix->load(), 0, 1);
         juce::Reverb::Parameters settings;
         settings.roomSize = p.reverbSize->load(); settings.damping = p.reverbDamping->load();
@@ -76,6 +87,7 @@ public:
             const int count = juce::jmin (blockLimit, buffer.getNumSamples() - start);
             juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), (size_t) channels, (size_t) start, (size_t) count);
             stage (distortion, p.distOn, block, [&] { distort (block, juce::roundToInt (p.distMode->load())); }, [this] { oversampler.reset(); });
+            stage (chorus, p.chorusOn, block, [&] { ensemble (block); }, [this] { chorusLine.reset(); });
             stage (echo, p.delayOn, block, [&] { echoes (block, p.delayPingPong->load() >= .5f); }, [this] { delay.reset(); });
             stage (space, p.reverbOn, block, [&]
             {
@@ -146,14 +158,41 @@ private:
         }
     }
 
-    double rate = 44100;
+    // Two taps per side, half a sweep apart; the right side runs a quarter sweep behind the left.
+    void ensemble (juce::dsp::AudioBlock<float>& block)
+    {
+        const int channels = (int) block.getNumChannels();
+        for (size_t i = 0; i < block.getNumSamples(); ++i)
+        {
+            const float sweep = chorusDepth.getNextValue() * (float) (kChorusSweep * rate), wet = chorusMix.getNextValue();
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                auto* io = block.getChannelPointer ((size_t) ch);
+                chorusLine.pushSample (ch, io[i]);
+                float taps = 0;
+                for (int tap = 0; tap < 2; ++tap)
+                {
+                    const double phase = chorusPhase + 0.5 * tap + 0.25 * ch;
+                    const float lfo = (float) std::sin (juce::MathConstants<double>::twoPi * phase);
+                    taps += chorusLine.popSample (ch, (float) (kChorusCentre * rate) + sweep * lfo, tap == 1);
+                }
+                // Uncorrelated taps sum to the input's power; correlated ones (low notes) to +3 dB.
+                io[i] += wet * (juce::MathConstants<float>::sqrt2 * 0.5f * taps - io[i]);
+            }
+            chorusPhase += chorusIncrement;
+            chorusPhase -= std::floor (chorusPhase);
+        }
+    }
+
+    double rate = 44100, chorusPhase = 0, chorusIncrement = 0;
     int blockLimit = 512;
     juce::AudioBuffer<float> dry;
-    Stage distortion, echo, space;
+    Stage distortion, chorus, echo, space;
     juce::dsp::Oversampling<float> oversampler { 2, 1, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, false };
-    juce::SmoothedValue<float> drive, distMix, feedback, delayMix;
+    juce::SmoothedValue<float> drive, distMix, feedback, delayMix, chorusDepth, chorusMix;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> delaySamples;
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delay;
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> chorusLine;
     juce::Reverb reverb;
 };
 } // namespace bw

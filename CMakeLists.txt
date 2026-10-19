@@ -17,7 +17,7 @@ juce_add_plugin(BoratoWave
 
 target_sources(BoratoWave PRIVATE Source/PluginProcessor.cpp Source/PluginEditor.cpp
     Source/UI/Controls.cpp Source/UI/Displays.cpp Source/UI/WavetableBrowser.cpp Source/UI/ModulationUI.cpp
-    Source/UI/TableEditor.cpp Source/UI/SamplePanel.cpp
+    Source/UI/TableEditor.cpp Source/UI/SamplePanel.cpp Source/UI/ImportDialog.cpp
     Source/Library/borato_preset_search.cpp Source/FactoryPresets.cpp)
 target_compile_definitions(BoratoWave PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 
@@ -80,3 +80,13 @@ juce_add_console_app(test_table_editor)
 target_sources(test_table_editor PRIVATE tests/test_table_editor.cpp)
 target_include_directories(test_table_editor PRIVATE Source)
 target_link_libraries(test_table_editor PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)
+
+juce_add_console_app(test_history)
+target_sources(test_history PRIVATE tests/test_history.cpp)
+target_include_directories(test_history PRIVATE Source)
+target_link_libraries(test_history PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)
+
+juce_add_console_app(test_tuned_import)
+target_sources(test_tuned_import PRIVATE tests/test_tuned_import.cpp)
+target_include_directories(test_tuned_import PRIVATE Source)
+target_link_libraries(test_tuned_import PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)

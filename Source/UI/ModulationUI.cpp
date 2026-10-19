@@ -95,6 +95,8 @@ public:
     }
     void mouseDown (const juce::MouseEvent& e) override
     {
+        // A drag, or a double click's added point, is one undo step.
+        if (! editing) { processor.beginEdit ("LFO " + juce::String (index + 1) + " SHAPE"); editing = true; }
         grabKeyboardFocus(); auto c = processor.getLfoCurve (index); selected = -1; segment = -1;
         for (int j = 0; j < c.count; ++j)
             if (point (c.points[(size_t) j]).getDistanceFrom (e.position) < 10) { selected = j; break; }
@@ -125,6 +127,9 @@ public:
             c.points[(size_t) segment].curve = juce::jlimit (-1.0f, 1.0f, startCurve - e.getDistanceFromDragStartY() / 80.0f);
         processor.setLfoCurve (index, c); repaint();
     }
+    ~CurveEditor() override { finishEdit(); }
+    void mouseUp (const juce::MouseEvent&) override { finishEdit(); }
+    void finishEdit() { if (editing) { editing = false; processor.endEdit(); } }
     void mouseDoubleClick (const juce::MouseEvent& e) override
     {
         auto c = processor.getLfoCurve (index); if (c.count >= 32) return;
@@ -169,6 +174,7 @@ private:
     WaveProcessor& processor;
     int index, selected = -1, segment = -1;
     float startCurve = 0;
+    bool editing = false;
 };
 class MacroName : public juce::Component, private juce::Timer
 {

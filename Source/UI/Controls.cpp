@@ -54,7 +54,7 @@ String Dial::valueText() const
     if (id.endsWith ("Unison")) return String (plainValue, 0) + " voices";
     if (id.endsWith ("Detune")) return String (plainValue, 1) + " ct";
     if (id.endsWith ("Phase")) return String (plainValue, 0) + " deg";
-    if (id.startsWith ("lfo") && id.endsWith ("Rate")) return String (plainValue, 2) + " Hz";
+    if (id.endsWith ("Rate")) return String (plainValue, 2) + " Hz";
     if (id == "internalBpm") return String (plainValue, 1) + " BPM";
     if (id.endsWith ("Pitch")) return String (plainValue, 1) + " st";
     if (id.endsWith ("Fine")) return String (plainValue, 1) + " ct";

@@ -151,7 +151,7 @@ private:
     std::array<float, 128> velocities {};
 };
 
-class WaveProcessor : public juce::AudioProcessor
+class WaveProcessor : public juce::AudioProcessor, private juce::AudioProcessorParameter::Listener
 {
 public:
     WaveProcessor ();
@@ -197,6 +197,8 @@ public:
 
     // User wavetables: decode/build on the calling (non-audio) thread, then publish immutably.
     juce::String importWavetable (int oscillator, const juce::File& file);
+    // One cycle per period of the analysed sound; the period may differ from the detected one (octave fixes).
+    juce::String importTuned (int oscillator, const bw::TunedSource& source, double period, const juce::String& name);
     void setUserTable (int oscillator, std::shared_ptr<const bw::Wavetable> table, const juce::String& name);
     std::shared_ptr<const bw::Wavetable> userTable (int oscillator) const;
     // True once no replaced table of this oscillator is still waiting for the audio thread to let it go.
@@ -225,14 +227,59 @@ public:
     bool savePreset (const juce::File& file);
     bool loadPreset (const juce::File& file);
 
+    // Undo history, message thread only (a host restoring state from another thread races with editor edits). A parameter gesture is one step; everything between the outermost
+    // beginEdit and endEdit (gestures included) is one step. Host automation and host state restores are not
+    // steps, and undo never reverts a parameter the step's gestures did not touch.
+    void beginEdit (const juce::String& name = {});
+    void endEdit ();
+    struct ScopedEdit
+    {
+        explicit ScopedEdit (WaveProcessor& p, const juce::String& name = {}) : processor (p) { processor.beginEdit (name); }
+        ~ScopedEdit () { processor.endEdit (); }
+        WaveProcessor& processor;
+    };
+    // False while an edit is open or nothing is left to undo / redo.
+    bool undo ();
+    bool redo ();
+    bool canUndo () const { return historyIndex > 0; }
+    bool canRedo () const { return historyIndex < (int) history.size (); }
+    juce::String undoName () const { return canUndo () ? history[(size_t) historyIndex - 1].name : juce::String (); }
+    juce::String redoName () const { return canRedo () ? history[(size_t) historyIndex].name : juce::String (); }
+
 
 private:
+    void parameterValueChanged (int, float) override {}
+    void parameterGestureChanged (int index, bool starting) override;
+    struct Snapshot
+    {
+        std::vector<float> values; // normalised, in getParameters() order
+        bw::CurveExchange::Curves curves;
+        std::array<juce::String, 4> macros;
+        std::array<std::shared_ptr<const bw::Wavetable>, 2> tables;
+        std::array<juce::String, 2> tableNames;
+        std::shared_ptr<const bw::Sample> sample;
+        juce::File samplePath;
+    };
+    struct Step { Snapshot before, after; std::vector<bool> parameters; juce::String name; };
+    Snapshot capture () const;
+    void restore (const Snapshot&, const std::vector<bool>& parameters);
+    // ponytail: step and memory caps bound the tables and samples history keeps alive; spill them to disk if 256 MB is too few.
+    static constexpr size_t kHistorySteps = 100, kHistoryBytes = (size_t) 256 << 20;
+    std::vector<Step> history;
+    Snapshot editStart;
+    std::vector<bool> touched;
+    juce::String editName;
+    int historyIndex = 0, editDepth = 0;
+    juce::uint32 lastStepTime = 0;
+    bool replaying = false;
+
     std::unique_ptr<juce::XmlElement> createStateXml ();
     void restoreState (const juce::XmlElement& xml);
     mutable std::mutex extraStateMutex;
     std::array<bw::UserTableSlot, 2> userSlots;
     std::vector<std::vector<float>> factoryNormalised; // per preset, in getParameters() order
     std::array<juce::String, 2> userTableNames;
+    void publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name);
     void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path);
     bw::PublishSlot<bw::Sample> sampleSlot;
     juce::File sampleFile;

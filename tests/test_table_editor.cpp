@@ -137,6 +137,8 @@ void testLiveEdits()
     const auto start = rig.run (.1);
     const double level = rms (start, start.size() / 2, start.size());
     std::weak_ptr<const bw::Wavetable> early;
+    // One stroke is one undo step, so the history keeps only the tables before and after it.
+    const WaveProcessor::ScopedEdit stroke (rig.processor);
     for (int step = 0; step < 60; ++step)
     {
         edit.setHarmonic (step % 2, 1 + step % 8, (float) (1 + step % 4) / 4); // never empties a frame

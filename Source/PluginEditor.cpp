@@ -5,6 +5,7 @@
 #include "UI/ModulationUI.h"
 #include "UI/TableEditor.h"
 #include "UI/SamplePanel.h"
+#include "UI/ImportDialog.h"
 
 using namespace juce;
 using namespace bw::ui;
@@ -223,8 +224,10 @@ public:
           delayTime (p.apvts, "delayTime", "TIME", coral), delayFeedback (p.apvts, "delayFeedback", "FEEDBACK", coral), delayMix (p.apvts, "delayMix", "DELAY MIX", coral),
           reverbSize (p.apvts, "reverbSize", "SIZE", coral), reverbDamping (p.apvts, "reverbDamping", "DAMPING", coral),
           reverbWidth (p.apvts, "reverbWidth", "WIDTH", coral), reverbMix (p.apvts, "reverbMix", "REVERB MIX", coral),
+          chorusRate (p.apvts, "chorusRate", "RATE", coral), chorusDepth (p.apvts, "chorusDepth", "DEPTH", coral), chorusMix (p.apvts, "chorusMix", "CHORUS MIX", coral),
           filter2On (p.apvts, "filter2On", "F2"), distOn (p.apvts, "distOn", "DISTORTION"), delayOn (p.apvts, "delayOn", "DELAY"),
           delaySync (p.apvts, "delaySync", "SYNC"), delayPingPong (p.apvts, "delayPingPong", "PING-PONG"), reverbOn (p.apvts, "reverbOn", "REVERB"),
+          chorusOn (p.apvts, "chorusOn", "CHORUS"),
           filterType (p.apvts, "filterType", "", "Filter 1 type"), filter2Type (p.apvts, "filter2Type", "", "Filter 2 type"),
           filterRouting (p.apvts, "filterRouting", "ROUTING", "Filter routing"),
           routeA (p.apvts, "oscARoute", "A >", "Osc A route"), routeB (p.apvts, "oscBRoute", "B >", "Osc B route"),
@@ -238,7 +241,8 @@ public:
           voiceMode (p.apvts, "voiceMode", "", "Voice mode"), glide (p.apvts, "glide", "GLIDE"),
           warpOnA (p.apvts, "oscAWarpOn", "WARP"), warpOnB (p.apvts, "oscBWarpOn", "B WARP"),
           warpA (p.apvts, "oscAWarp", "A WARP"), warpB (p.apvts, "oscBWarp", "B WARP", violet), fmDepth (p.apvts, "fmDepth", "FM FROM B"),
-          tableEditor (p), samplePanel (p)
+          tableEditor (p), samplePanel (p),
+          importDialog ([this] (bool tuned, double period) { finishImport (tuned, period); }, [this] { setOverlay (nullptr); importDialog.show ({}, {}, {}); })
     {
         setOpaque (true);
         for (Component* c : std::initializer_list<Component*> { &wt, &env, &filter, &lfo, &wtPos, &level, &cutoff, &reso,
@@ -261,7 +265,7 @@ public:
         }
         for (Component* c : std::initializer_list<Component*> { &cutoff2, &reso2, &distDrive, &distMix, &delayTime, &delayFeedback, &delayMix,
              &reverbSize, &reverbDamping, &reverbWidth, &reverbMix, &filter2On, &distOn, &delayOn, &delaySync, &delayPingPong, &reverbOn,
-             &filterType, &filter2Type, &filterRouting, &routeA, &routeB, &routeSub, &routeNoise, &distMode, &delayDivision,
+             &chorusOn, &chorusRate, &chorusDepth, &chorusMix, &filterType, &filter2Type, &filterRouting, &routeA, &routeB, &routeSub, &routeNoise, &distMode, &delayDivision,
              &importA, &importB, &filterTab1, &filterTab2, &env2Attack, &env2Decay, &env2Sustain, &env2Release, &envTab1, &envTab2, &dragEnv2 })
             addChildComponent (c);
         addChildComponent (matrix);
@@ -287,6 +291,8 @@ public:
             addAndMakeVisible (*tabs.back());
         }
         addAndMakeVisible (about);
+        addAndMakeVisible (undoButton);
+        addAndMakeVisible (redoButton);
         for (int i = 0; i < fxNames.size(); ++i)
         {
             fxButtons.push_back (std::make_unique<Action> (fxNames[i], [this, i]
@@ -301,6 +307,7 @@ public:
         fxButtons.front()->setSelected (true);
         addChildComponent (browser);
         addChildComponent (tableBrowser);
+        addChildComponent (importDialog);
         tableAttachment = std::make_unique<ParameterAttachment> (*p.apvts.getParameter ("wtTable"), [this] (float value)
         {
             // The callback can run before APVTS updates its raw atomic value.
@@ -335,6 +342,7 @@ public:
         voiceMode.setBounds (846, 28, 104, 28); glide.setBounds (956, 7, 80, 77);
         for (int i = 0; i < (int) tabs.size(); ++i) tabs[(size_t) i]->setBounds (20 + i * 106, 94, 98, 31);
         about.setBounds (1060, 96, 160, 28);
+        undoButton.setBounds (566, 96, 80, 28); redoButton.setBounds (652, 96, 80, 28);
         tableSelector.setBounds (34, 177, 278, 27);
         flat.setBounds (322, 178, 38, 25); stack.setBounds (366, 178, 38, 25); fftView.setBounds (410, 178, 44, 25);
         tablePrevious.setBounds (264, 489, 88, 25); tableNext.setBounds (360, 489, 88, 25);
@@ -361,9 +369,9 @@ public:
         routeA.setBounds (270, 151, 106, 23); routeB.setBounds (730, 151, 106, 23);
         importA.setBounds (34, 489, 104, 25); importB.setBounds (494, 489, 104, 25);
         routeSub.setBounds (954, 622, 86, 22); routeNoise.setBounds (954, 706, 86, 22);
-        for (auto* toggle : { &distOn, &delayOn, &reverbOn }) toggle->setBounds (1036, 203, 150, 30);
+        for (auto* toggle : { &distOn, &chorusOn, &delayOn, &reverbOn }) toggle->setBounds (1036, 203, 150, 30);
         auto row = [] (std::initializer_list<Component*> dials) { int x = 346; for (auto* d : dials) { d->setBounds (x, 478, 110, 92); x += 140; } };
-        row ({ &distDrive, &distMix }); row ({ &delayTime, &delayFeedback, &delayMix }); row ({ &reverbSize, &reverbDamping, &reverbWidth, &reverbMix });
+        row ({ &distDrive, &distMix }); row ({ &chorusRate, &chorusDepth, &chorusMix }); row ({ &delayTime, &delayFeedback, &delayMix }); row ({ &reverbSize, &reverbDamping, &reverbWidth, &reverbMix });
         distMode.setBounds (346, 600, 170, 30);
         delaySync.setBounds (346, 600, 120, 30); delayDivision.setBounds (476, 600, 170, 30); delayPingPong.setBounds (656, 600, 150, 30);
         subOn.setBounds (954, 569, 86, 24); noiseOn.setBounds (954, 653, 86, 24);
@@ -385,6 +393,7 @@ public:
         for (int i = 0; i < (int) fxButtons.size(); ++i) fxButtons[(size_t) i]->setBounds (38, 239 + i * 54, 242, 42);
         browser.setBounds (getLocalBounds());
         tableBrowser.setBounds (getLocalBounds());
+        importDialog.setBounds (getLocalBounds());
     }
 
     void paint (Graphics& g) override
@@ -403,7 +412,7 @@ public:
         label (g, "VOICE ENGINE", { 846, 10, 104, 15 }, 9, muted);
 
         const StringArray captions { "SOUND STARTS HERE.", "SHAPE THE SPACE.", "MAKE CONNECTIONS.", "THE INSTRUMENT, AT A GLANCE.", "DRAW YOUR OWN TABLES.", "PLAY ANY RECORDING." };
-        label (g, captions[page], { 560, 98, 490, 24 }, 10, faint, Justification::centredRight);
+        label (g, captions[page], { 740, 98, 310, 24 }, 10, faint, Justification::centredRight);
         if (page == 0) paintSynth (g);
         if (page == 1) paintEffects (g);
 
@@ -436,11 +445,11 @@ private:
     }
     void paintEffects (Graphics& g)
     {
-        const bool live = selectedFx == 0 || selectedFx == 2 || selectedFx == 3;
-        section (g, { 20, 144, 278, 654 }, "EFFECT RACK", "3 LIVE", coral);
+        const bool live = selectedFx <= 3;
+        section (g, { 20, 144, 278, 654 }, "EFFECT RACK", "4 LIVE", coral);
         label (g, "Six ways to shape a sound.", { 38, 193, 242, 26 }, 14, muted);
-        label (g, "DIST > DELAY > REVERB / FIXED ORDER", { 38, 590, 242, 18 }, 9, coral);
-        label (g, "CHORUS, EQ, COMP: DESIGN PREVIEW", { 38, 610, 242, 18 }, 9, muted);
+        label (g, "DIST > CHORUS > DELAY > REVERB", { 38, 590, 242, 18 }, 9, coral);
+        label (g, "FIXED ORDER / EQ, COMP: DESIGN PREVIEW", { 38, 610, 242, 18 }, 9, muted);
         section (g, { 310, 144, 910, 654 }, "EFFECT DESIGN", "LIVE", coral, ! live);
         const StringArray names { "Distortion", "Chorus", "Delay", "Reverb", "Equalizer", "Compressor" };
         const StringArray descriptions { "Harmonics with a little more character.", "A wider horizon for a single voice.", "A conversation between sound and time.",
@@ -460,7 +469,7 @@ private:
                 const float x = t * 2 - 1, mix = raw ("distMix");
                 y = x + mix * (bw::shape (roundToInt (raw ("distMode")), x, Decibels::decibelsToGain (raw ("distDrive"))) - x);
             }
-            else if (selectedFx == 1) y = std::sin (t * 20) * .65f;
+            else if (selectedFx == 1) y = sweep (t, 0); // left taps' delay over two LFO cycles
             else if (selectedFx == 2) y = std::sin (t * 65) * std::exp (-t * 3);
             else if (selectedFx == 3) y = std::sin (t * 180) * std::sin (t * 71) * std::exp (-t * 3);
             else if (selectedFx == 4) { const float offset = (t - .6f) * 8; y = .7f * std::exp (-offset * offset) - .3f; }
@@ -469,6 +478,18 @@ private:
             if (i == 0) path.startNewSubPath (point); else path.lineTo (point);
         }
         curve (g, path, coral);
+        if (selectedFx == 1)
+        {
+            Path right;
+            for (int i = 0; i <= 300; ++i)
+            {
+                const float t = i / 300.0f;
+                const Point<float> point (366 + t * 800, 379 - sweep (t, .25f) * 59);
+                if (i == 0) right.startNewSubPath (point); else right.lineTo (point);
+            }
+            curve (g, right, violet);
+            label (g, "DELAY SWEEP  /  LEFT  /  RIGHT A QUARTER CYCLE BEHIND", { 366, 440, 800, 16 }, 9, muted);
+        }
         const std::array<StringArray, 6> parameters {{ { "DRIVE", "TONE", "MIX" }, { "RATE", "DEPTH", "MIX" }, { "TIME", "FEEDBACK", "MIX" },
                                                      { "SIZE", "DECAY", "MIX" }, { "FREQUENCY", "GAIN", "WIDTH" }, { "THRESHOLD", "RATIO", "MAKEUP" } }};
         if (live)
@@ -480,6 +501,7 @@ private:
         badge (g, "DESIGN PREVIEW", { 346, 598, 140, 26 }, coral);
         label (g, "This processor will be connected in a future version.", { 504, 598, 682, 26 }, 12, muted);
     }
+    float sweep (float t, float offset) const { return raw ("chorusDepth") * std::sin (MathConstants<float>::twoPi * (2 * t + offset)); }
     void paintGlobal (Graphics& g)
     {
         section (g, { 20, 144, 1200, 654 }, "ABOUT", "0.1", mint);
@@ -534,6 +556,7 @@ private:
         env.setEnvelopeIndex (envelopePage);
         for (auto* c : List { &filter2Type, &filter2On, &cutoff2, &reso2 }) c->setVisible (synth && filterPage == 1);
         for (auto* c : List { &distOn, &distMode, &distDrive, &distMix }) c->setVisible (fx && selectedFx == 0);
+        for (auto* c : List { &chorusOn, &chorusRate, &chorusDepth, &chorusMix }) c->setVisible (fx && selectedFx == 1);
         for (auto* c : List { &delayOn, &delaySync, &delayDivision, &delayPingPong, &delayTime, &delayFeedback, &delayMix }) c->setVisible (fx && selectedFx == 2);
         for (auto* c : List { &reverbOn, &reverbSize, &reverbDamping, &reverbWidth, &reverbMix }) c->setVisible (fx && selectedFx == 3);
         filterTab1.setSelected (filterPage == 0); filterTab2.setSelected (filterPage == 1);
@@ -565,12 +588,29 @@ private:
         {
             const auto file = fc.getResult();
             if (file == File()) return;
-            const auto error = processor.importWavetable (b, file);
-            if (error.isNotEmpty()) { showStatus (error.toUpperCase()); return; }
-            setParameter (b ? "oscBUser" : "oscAUser", 1);
-            showStatus ("IMPORTED " + file.getFileName().toUpperCase() + " / " + String (processor.userTable (b)->numFrames) + " FRAMES");
-            timerCallback(); repaint();
+            // Nothing to offer for a file neither import can read.
+            if (bw::openAudio (file) == nullptr) { showStatus ("UNSUPPORTED OR UNREADABLE AUDIO FILE"); return; }
+            String error;
+            auto source = bw::loadTunedSource (file, error);
+            importOscillator = b; importFile = file;
+            importDialog.show (file.getFileNameWithoutExtension(), std::move (source), error);
+            setOverlay (&importDialog);
+            importDialog.toFront (true);
         });
+    }
+    void finishImport (bool tuned, double period)
+    {
+        setOverlay (nullptr);
+        const auto analysed = importDialog.source();
+        importDialog.show ({}, {}, {}); // free the analysed audio
+        const auto name = importFile.getFileNameWithoutExtension();
+        const WaveProcessor::ScopedEdit edit (processor, "IMPORT " + name.toUpperCase());
+        const auto error = tuned ? processor.importTuned (importOscillator, analysed, period, name) : processor.importWavetable (importOscillator, importFile);
+        if (error.isNotEmpty()) { showStatus (error.toUpperCase()); return; }
+        setParameter (importOscillator ? "oscBUser" : "oscAUser", 1);
+        showStatus ("IMPORTED " + importFile.getFileName().toUpperCase() + " / " + String (processor.userTable (importOscillator)->numFrames)
+                    + (tuned ? " TUNED CYCLES / " + String (analysed.sampleRate / period, 1) + " HZ" : " FRAMES"));
+        timerCallback(); repaint();
     }
     static Array<borato::PresetInfo> userPresets()
     {
@@ -635,6 +675,7 @@ private:
         for (size_t i = 0; i < bw::destinationIds().size(); ++i)
             if (target == bw::destinationIds()[i]) destination = (int) i;
         if (destination < 0) return;
+        const WaveProcessor::ScopedEdit edit (processor, "ROUTE");
         for (int i = 1; i <= 16; ++i)
         {
             const String prefix = "mod" + String (i);
@@ -661,6 +702,7 @@ private:
     void changeTable (int index, bool b = false)
     {
         // Choosing a factory table leaves the imported one loaded but unused.
+        const WaveProcessor::ScopedEdit edit (processor, b ? "OSC B TABLE" : "OSC A TABLE");
         if (raw (b ? "oscBUser" : "oscAUser") >= .5f) setParameter (b ? "oscBUser" : "oscAUser", 0);
         (b ? attachmentB : tableAttachment)->setValueAsCompleteGesture ((float) index);
         timerCallback();
@@ -703,12 +745,27 @@ private:
         for (auto* child : getChildren()) child->setEnabled (overlay == nullptr || child == overlay);
         browser.setVisible (overlay == &browser);
         tableBrowser.setVisible (overlay == &tableBrowser);
+        importDialog.setVisible (overlay == &importDialog);
     }
     bool keyPressed (const KeyPress& k) override
     {
         if (k == KeyPress::escapeKey && browser.isVisible()) { showBrowser (false); return true; }
         if (k == KeyPress::escapeKey && tableBrowser.isVisible()) { showTableBrowser (false); return true; }
+        if (k == KeyPress::escapeKey && importDialog.isVisible()) { setOverlay (nullptr); return true; }
+        const auto letter = CharacterFunctions::toUpperCase ((juce_wchar) k.getKeyCode());
+        if (k.getModifiers().isCommandDown() && (letter == 'Z' || letter == 'Y'))
+        {
+            step (letter == 'Y' || k.getModifiers().isShiftDown());
+            return true;
+        }
         return false;
+    }
+    void step (bool forward)
+    {
+        const auto name = forward ? processor.redoName() : processor.undoName();
+        if (! (forward ? processor.redo() : processor.undo())) return;
+        showStatus ((forward ? "REDO  /  " : "UNDO  /  ") + name);
+        timerCallback(); repaint();
     }
     void timerCallback() override
     {
@@ -742,12 +799,14 @@ private:
                 if (page == 0) repaint (20, 480, 920, 36);
             }
         }
-        const std::array<const char*, 6> fxEnables { "distOn", nullptr, "delayOn", "reverbOn", nullptr, nullptr };
+        const std::array<const char*, 6> fxEnables { "distOn", "chorusOn", "delayOn", "reverbOn", nullptr, nullptr };
         for (size_t i = 0; i < fxEnables.size(); ++i)
             if (fxEnables[i] != nullptr)
                 if (const auto caption = fxNames[(int) i] + (raw (fxEnables[i]) >= .5f ? "   ON" : ""); fxButtons[i]->getText() != caption)
                     fxButtons[i]->setText (caption);
-        if (page == 1 && selectedFx == 0) repaint (346, 296, 840, 166);
+        if (page == 1 && selectedFx <= 1) repaint (346, 296, 840, 166);
+        undoButton.setAlpha (processor.canUndo() ? 1.0f : .4f);
+        redoButton.setAlpha (processor.canRedo() ? 1.0f : .4f);
         if (statusUntil != 0 && Time::getMillisecondCounter() > statusUntil)
         { status = "READY / DRAG A SOURCE ONTO A DIAL TO MODULATE"; statusUntil = 0; repaint (0, 914, designWidth, 26); }
         const int match = processor.matchingFactoryPreset();
@@ -772,14 +831,16 @@ private:
     std::vector<std::unique_ptr<Action>> tabs, fxButtons;
     static constexpr std::array<int, 5> tabPages { 0, 1, 2, 4, 5 };
     Action about { "ABOUT  0.1", [this] { selectPage (page == 3 ? 0 : 3); } };
+    Action undoButton { "UNDO", [this] { step (false); } }, redoButton { "REDO", [this] { step (true); } };
     std::vector<std::unique_ptr<Dial>> unisonDials;
     std::vector<Dial*> modulationDials;
     String status = "READY";
     uint32 statusUntil = 0;
     Browser browser;
     WavetableBrowser tableBrowser;
-    Dial cutoff2, reso2, distDrive, distMix, delayTime, delayFeedback, delayMix, reverbSize, reverbDamping, reverbWidth, reverbMix;
-    ParameterToggle filter2On, distOn, delayOn, delaySync, delayPingPong, reverbOn;
+    Dial cutoff2, reso2, distDrive, distMix, delayTime, delayFeedback, delayMix, reverbSize, reverbDamping, reverbWidth, reverbMix,
+         chorusRate, chorusDepth, chorusMix;
+    ParameterToggle filter2On, distOn, delayOn, delaySync, delayPingPong, reverbOn, chorusOn;
     ParameterChoice filterType, filter2Type, filterRouting, routeA, routeB, routeSub, routeNoise, distMode, delayDivision;
     Action importA, importB, filterTab1, filterTab2;
     Dial env2Attack, env2Decay, env2Sustain, env2Release;
@@ -791,6 +852,9 @@ private:
     Dial warpA, warpB, fmDepth;
     TableEditor tableEditor;
     SamplePanel samplePanel;
+    ImportDialog importDialog;
+    File importFile;
+    int importOscillator = 0;
     const StringArray fxNames { "01    DISTORTION", "02    CHORUS", "03    DELAY", "04    REVERB", "05    EQUALIZER", "06    COMPRESSOR" };
     std::unique_ptr<FileChooser> chooser;
     std::unique_ptr<ParameterAttachment> tableAttachment, attachmentB;

@@ -58,3 +58,16 @@ Measured with the same machine and settings, after tasks 05–07. Three runs agr
 - **Extreme profiles:** FM and the sample source each add about 30% to `extreme_no_routes`. All extreme profiles fail the provisional 70% gate at 96 kHz.
 - **Regression:** `extreme_no_routes` is 10–18% higher, and `extreme` about 35% higher, than the 17 October reference. Tasks 02–07 add per-sample work to every voice (glide, warp and FM smoothing, the steal residual, the sample-source smoothers). This run does not separate the cost of each task; an A/B against commit `5d17e59`–`a49454b` would.
 
+
+### Chorus profiles (18 October 2026)
+
+`layered_chorus` and `extreme_fx_chorus` are `layered` and `extreme_fx` with the chorus on (defaults: 0.6 Hz, depth 0.5, mix 0.5). One run, same machine and settings:
+
+| Profile | 44.1 kHz | 48 kHz | 96 kHz | 96 kHz blocks over deadline |
+| --- | ---: | ---: | ---: | ---: |
+| layered | 4.2% | 4.6% | 9.6% | 0 |
+| layered_chorus | 4.6% | 4.9% | 10.8% | 0 |
+| extreme_fx | 44.2% | 48.2% | 105.0% | 471 / 750 |
+| extreme_fx_chorus | 44.9% | 49.3% | 109.1% | 520 / 750 |
+
+The chorus is a global stage, so its cost does not grow with notes: about 0.4–1 point of budget at 44.1/48 kHz and 1–4 at 96 kHz. Output level with it on (mix 0.5): −2.2 dB on a broadband saw, −0.3 dB on a four-voice unison pad (`test_effects`).

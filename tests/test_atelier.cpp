@@ -193,7 +193,9 @@ int main (int argc, char** argv)
     }
     assert (checked == 12);
     // Reject malformed embedded audio before FFT; never feed NaN/Inf into playback.
-    p.loadFactoryPreset ((int) presets.size () - 1);
+    int lastAtelier = (int) presets.size () - 1;
+    while (! String (presets[(size_t) lastAtelier].name).startsWith ("Atelier")) --lastAtelier;
+    p.loadFactoryPreset (lastAtelier);
     MemoryBlock state;
     p.getStateInformation (state);
     auto xml = AudioProcessor::getXmlFromBinary (state.getData (), (int) state.getSize ());

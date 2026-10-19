@@ -431,6 +431,12 @@ const std::vector<FactoryPreset>& factoryPresets()
               { "env2Decay", .18f }, { "lfo1Sync", 1 }, { "lfo1Division", dEighth }, { "delayOn", 1 }, { "delayPingPong", 1 }, { "delayMix", .18f }, { "reverbOn", 1 }, { "reverbMix", .08f } },
             { { env2, aPos, .55f }, { lfo1, aPan, .12f, true }, { vel, cutoff, .1f }, { m1, aPos, .2f }, { m2, reso, .1f }, { m3, fxDelay, .15f }, { m4, fxReverb, .14f } },
             { "Pixel", "Focus", "Scatter", "Dew" }, contour ({ { 0,.5f,0 }, { .2f,.1f,.6f }, { .55f,.9f,-.6f }, { .85f,.3f,0 }, { 1,.5f,0 } })),
+        // Appended so earlier factory indices stay stable. Chorus: two swept taps a side widen one detuned pair.
+        make ("Chorus Silk Pad", "PAD", "Poly Chorus Wide Warm", "A soft saw pair widened by the stereo chorus. Shimmer brightens the table.",
+              { { "wtTable", saw }, { "wtPos", .3f }, { "oscAUnison", 2 }, { "oscADetune", 6 }, { "cutoff", 2800 }, { "attack", .5f }, { "decay", 1 },
+                { "sustain", .8f }, { "release", 1.4f }, { "chorusOn", 1 }, { "chorusRate", .45f }, { "chorusDepth", .6f }, { "chorusMix", .5f },
+                { "reverbMix", .15f }, { "gain", -9 } },
+              { { m2, aPos, .4f } }, "Shimmer"),
     };
     return presets;
 }

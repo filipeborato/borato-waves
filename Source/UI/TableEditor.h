@@ -11,6 +11,7 @@ class TableEditor : public juce::Component, private juce::Timer
 {
 public:
     explicit TableEditor (WaveProcessor&);
+    ~TableEditor() override { if (drag != Drag::none) processor.endEdit(); } // a stroke cut short
     void paint (juce::Graphics&) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent&) override;

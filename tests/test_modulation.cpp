@@ -465,19 +465,21 @@ void stress (WaveProcessor& p)
 
 void benchmarkProfiles()
 {
-    struct Profile { const char* name; int notes, unison, routes; bool oscB, effects, warp = false, fm = false, sample = false; };
+    struct Profile { const char* name; int notes, unison, routes; bool oscB, effects, warp = false, fm = false, sample = false, chorus = false; };
     constexpr Profile profiles[] {
         { "light", 1, 1, 0, false, false },
         { "notes16", 16, 1, 0, false, false },
         { "unison8", 1, 8, 0, false, false },
         { "layered", 4, 2, 4, true, false },
+        { "layered_chorus", 4, 2, 4, true, false, false, false, false, true },
         { "extreme_no_routes", 16, 8, 0, true, false },
         { "extreme_warp", 16, 8, 0, true, false, true },
         { "extreme_fm", 16, 8, 0, true, false, false, true },
         { "sample16", 16, 1, 0, false, false, false, false, true },
         { "extreme_sample", 16, 8, 0, true, false, false, false, true },
         { "extreme", 16, 8, 16, true, false },
-        { "extreme_fx", 16, 8, 16, true, true }
+        { "extreme_fx", 16, 8, 16, true, true },
+        { "extreme_fx_chorus", 16, 8, 16, true, true, false, false, false, true }
     };
     constexpr int blockSize = 128;
     // A 2 s looped recording for the sample profiles.
@@ -503,6 +505,7 @@ void benchmarkProfiles()
             set (p, "gain", -30);
             if (profile.warp) { set (p, "oscAWarpOn", 1); set (p, "oscBWarpOn", 1); set (p, "oscAWarp", .7f); set (p, "oscBWarp", -.7f); }
             if (profile.fm) set (p, "fmDepth", .7f);
+            if (profile.chorus) set (p, "chorusOn", 1);
             if (profile.sample)
             {
                 if (p.loadSample (recording).isNotEmpty()) std::abort();
@@ -558,7 +561,7 @@ void benchmarkProfiles()
                       << " block=" << blockSize << " notes=" << profile.notes
                       << " unison=" << profile.unison << " osc_b=" << profile.oscB
                       << " routes=" << profile.routes
-                      << " effects=" << profile.effects << " warp=" << profile.warp << " fm=" << profile.fm << " sample=" << profile.sample << " process_s=" << total
+                      << " effects=" << profile.effects << " warp=" << profile.warp << " fm=" << profile.fm << " sample=" << profile.sample << " chorus=" << profile.chorus << " process_s=" << total
                       << " audio_s=" << audioTime << " budget_pct=" << total / audioTime * 100
                       << " worst_block_pct=" << worst / deadline * 100
                       << " over_budget_blocks=" << overBudget << "/" << blocks << '\n';

@@ -62,14 +62,21 @@ static void testFilterResponse()
     assert (bw::VoiceFilter::magnitude (bw::VoiceFilter::low24, 4000, 1000, .707, 48000) < .5 * bw::VoiceFilter::magnitude (bw::VoiceFilter::low12, 4000, 1000, .707, 48000));
 }
 
-static void testEffects()
+static bw::EffectParams effectParams (WaveProcessor& p)
 {
-    WaveProcessor p;
-    bw::EffectParams params { p.apvts.getRawParameterValue ("distOn"), p.apvts.getRawParameterValue ("distMode"), p.apvts.getRawParameterValue ("distDrive"), p.apvts.getRawParameterValue ("distMix"),
+    return { p.apvts.getRawParameterValue ("distOn"), p.apvts.getRawParameterValue ("distMode"), p.apvts.getRawParameterValue ("distDrive"), p.apvts.getRawParameterValue ("distMix"),
         p.apvts.getRawParameterValue ("delayOn"), p.apvts.getRawParameterValue ("delayTime"), p.apvts.getRawParameterValue ("delaySync"), p.apvts.getRawParameterValue ("delayDivision"),
         p.apvts.getRawParameterValue ("delayFeedback"), p.apvts.getRawParameterValue ("delayPingPong"), p.apvts.getRawParameterValue ("delayMix"),
         p.apvts.getRawParameterValue ("reverbOn"), p.apvts.getRawParameterValue ("reverbSize"), p.apvts.getRawParameterValue ("reverbDamping"),
-        p.apvts.getRawParameterValue ("reverbWidth"), p.apvts.getRawParameterValue ("reverbMix") };
+        p.apvts.getRawParameterValue ("reverbWidth"), p.apvts.getRawParameterValue ("reverbMix"),
+        p.apvts.getRawParameterValue ("chorusOn"), p.apvts.getRawParameterValue ("chorusRate"), p.apvts.getRawParameterValue ("chorusDepth"),
+        p.apvts.getRawParameterValue ("chorusMix") };
+}
+
+static void testEffects()
+{
+    WaveProcessor p;
+    const auto params = effectParams (p);
     for (int mode = 0; mode < 3; ++mode)
         for (float drive : { 1.0f, 4.0f, 63.0f })
         {
@@ -140,6 +147,93 @@ static void testEffects()
         if (b < 10) early += e; if (b >= 190) late += e;
     }
     assert (early > 1.0e-3 && late < early * .5);
+}
+
+static void testChorus()
+{
+    WaveProcessor p;
+    const auto params = effectParams (p);
+    bw::Effects fx;
+    fx.prepare (48000, 256);
+    AudioBuffer<float> buffer (2, 256);
+    int clock = 0;
+    // The same 220 Hz sine (smooth: any step is a click) or saw (broadband, for level) on both sides.
+    bool useSaw = false;
+    auto saw = [&]
+    {
+        for (int i = 0; i < 256; ++i)
+        {
+            const double phase = std::fmod ((clock + i) * 220.0 / 48000, 1.0);
+            for (int ch = 0; ch < 2; ++ch) buffer.setSample (ch, i, .4f * (float) (useSaw ? phase * 2 - 1 : std::sin (juce::MathConstants<double>::twoPi * phase)));
+        }
+        clock += 256;
+    };
+    std::array<std::vector<float>, 2> out;
+    auto run = [&] (int blocks, bool input = true)
+    {
+        for (int b = 0; b < blocks; ++b)
+        {
+            if (input) saw(); else buffer.clear();
+            fx.process (buffer, params, 120);
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) { assert (std::isfinite (buffer.getSample (ch, i))); out[(size_t) ch].push_back (buffer.getSample (ch, i)); }
+        }
+    };
+    auto steps = [&] (size_t from)
+    {
+        float worst = 0;
+        for (size_t i = from + 1; i < out[0].size(); ++i) worst = jmax (worst, std::abs (out[0][i] - out[0][i - 1]));
+        return worst;
+    };
+    run (20);
+    const float drySteps = steps (0);
+    set (p, "chorusOn", 1); set (p, "chorusDepth", 1); set (p, "chorusMix", .5f); set (p, "chorusRate", 1.5f);
+    const size_t fadeIn = out[0].size();
+    run (40);
+    assert (steps (fadeIn) < drySteps * 1.5f);
+    useSaw = true;
+    run (20);
+    // Identical inputs leave as two different sides.
+    double l = 0, r = 0, lr = 0;
+    for (size_t i = out[0].size() - 9600; i < out[0].size(); ++i) { l += out[0][i] * out[0][i]; r += out[1][i] * out[1][i]; lr += out[0][i] * out[1][i]; }
+    assert (lr / std::sqrt (l * r) < .97);
+    // Level stays within 3 dB of the dry signal.
+    const double sawDb = Decibels::gainToDecibels (std::sqrt (l / 9600) / (.4 / std::sqrt (3.0)));
+    std::printf ("chorus level change: saw %+.2f dB", sawDb);
+    assert (std::abs (sawDb) < 3);
+    // Automating every control each block stays finite and step-free.
+    useSaw = false;
+    run (5);
+    Random random (7);
+    const size_t automated = out[0].size();
+    for (int b = 0; b < 100; ++b)
+    {
+        set (p, "chorusRate", .05f + 4.95f * random.nextFloat()); set (p, "chorusDepth", random.nextFloat()); set (p, "chorusMix", random.nextFloat());
+        run (1);
+    }
+    assert (steps (automated) < drySteps * 1.5f);
+    // The tail ends within the longest tap.
+    run (3, false);
+    const size_t tail = out[0].size();
+    run (4, false);
+    for (size_t i = tail; i < out[0].size(); ++i) assert (out[0][i] == 0 && out[1][i] == 0);
+    // Off: fades out, then the signal passes bit-identical.
+    run (5);
+    set (p, "chorusOn", 0);
+    const size_t fadeOut = out[0].size();
+    run (10);
+    assert (steps (fadeOut) < drySteps * 1.5f);
+    saw(); AudioBuffer<float> copy (buffer); fx.process (buffer, params, 120);
+    for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) assert (buffer.getSample (ch, i) == copy.getSample (ch, i));
+
+    // On a unison pad through the processor, the output level stays within 3 dB with the chorus on.
+    WaveProcessor pad;
+    set (pad, "wtTable", 2); set (pad, "oscAUnison", 4); set (pad, "oscADetune", 15); set (pad, "gain", -12);
+    const double without = energy (render (pad, 80)[0], 4096);
+    set (pad, "chorusOn", 1);
+    const double with = energy (render (pad, 80)[0], 4096);
+    const double padDb = Decibels::gainToDecibels (std::sqrt (with / without));
+    std::printf (", unison pad %+.2f dB\n", padDb);
+    assert (std::abs (padDb) < 3);
 }
 
 static void testRouting()
@@ -287,9 +381,10 @@ int main()
     ScopedJuceInitialiser_GUI juce;
     testFilterResponse();
     testEffects();
+    testChorus();
     testRouting();
     testWavetableImport();
     testTableLifetime();
     testPresetFiles();
-    std::puts ("ok: filter response, distortion/delay/reverb, routing, WAV import, table lifetime, preset files");
+    std::puts ("ok: filter response, distortion/chorus/delay/reverb, routing, WAV import, table lifetime, preset files");
 }

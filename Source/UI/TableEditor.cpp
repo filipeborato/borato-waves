@@ -85,12 +85,19 @@ void TableEditor::stroke (const MouseEvent& e, bool start)
     }
     if (drag != Drag::none) repaint();
 }
-void TableEditor::mouseDown (const MouseEvent& e) { stroke (e, true); }
+// A stroke, live publishes included, is one undo step.
+void TableEditor::mouseDown (const MouseEvent& e)
+{
+    stroke (e, true);
+    if (drag != Drag::none) processor.beginEdit (drag == Drag::wave ? "TABLE DRAWING" : "HARMONICS");
+}
 void TableEditor::mouseDrag (const MouseEvent& e) { stroke (e, false); }
 void TableEditor::mouseUp (const MouseEvent&)
 {
-    if (drag != Drag::none && edit.changed()) publish();
+    if (drag == Drag::none) return;
+    if (edit.changed()) publish();
     drag = Drag::none;
+    processor.endEdit();
 }
 
 const Wavetable& TableEditor::sourceTable() const
@@ -145,6 +152,7 @@ void TableEditor::reloadIfReplaced()
 
 void TableEditor::publish()
 {
+    const WaveProcessor::ScopedEdit step (processor, "TABLE EDIT");
     auto table = edit.build();
     source = table.get();
     processor.setUserTable (oscillator, std::move (table), name);
