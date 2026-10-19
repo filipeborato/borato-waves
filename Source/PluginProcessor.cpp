@@ -122,6 +122,18 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     l.add (std::make_unique<P> (juce::ParameterID { "chorusRate", 1 }, "Chorus Rate", R (0.05f, 5, 0, 0.5f), 0.6f));
     continuous ("chorusDepth", "Chorus Depth", 0, 1, .5f);
     continuous ("chorusMix", "Chorus Mix", 0, 1, .5f);
+    toggle ("eqOn", "EQ On", false);
+    continuous ("eqLow", "EQ Low", -18, 18, 0);
+    l.add (std::make_unique<P> (juce::ParameterID { "eqFreq", 1 }, "EQ Frequency", R (40, 16000, 0, 0.25f), 1000.0f));
+    continuous ("eqGain", "EQ Gain", -18, 18, 0);
+    l.add (std::make_unique<P> (juce::ParameterID { "eqQ", 1 }, "EQ Q", R (0.3f, 8, 0, 0.4f), 1.0f));
+    continuous ("eqHigh", "EQ High", -18, 18, 0);
+    toggle ("compOn", "Compressor On", false);
+    continuous ("compThreshold", "Comp Threshold", -48, 0, -18);
+    l.add (std::make_unique<P> (juce::ParameterID { "compRatio", 1 }, "Comp Ratio", R (1, 20, 0, 0.4f), 4.0f));
+    l.add (std::make_unique<P> (juce::ParameterID { "compAttack", 1 }, "Comp Attack", R (0.1f, 100, 0, 0.3f), 10.0f));
+    l.add (std::make_unique<P> (juce::ParameterID { "compRelease", 1 }, "Comp Release", R (10, 1000, 0, 0.4f), 150.0f));
+    continuous ("compMakeup", "Comp Makeup", 0, 24, 0);
     return l;
 }
 
@@ -540,7 +552,9 @@ WaveProcessor::WaveProcessor ()
     effectParams = { p ("distOn"), p ("distMode"), p ("distDrive"), p ("distMix"),
         p ("delayOn"), p ("delayTime"), p ("delaySync"), p ("delayDivision"), p ("delayFeedback"), p ("delayPingPong"), p ("delayMix"),
         p ("reverbOn"), p ("reverbSize"), p ("reverbDamping"), p ("reverbWidth"), p ("reverbMix"),
-        p ("chorusOn"), p ("chorusRate"), p ("chorusDepth"), p ("chorusMix") };
+        p ("chorusOn"), p ("chorusRate"), p ("chorusDepth"), p ("chorusMix"),
+        p ("eqOn"), p ("eqLow"), p ("eqFreq"), p ("eqGain"), p ("eqQ"), p ("eqHigh"),
+        p ("compOn"), p ("compThreshold"), p ("compRatio"), p ("compAttack"), p ("compRelease"), p ("compMakeup") };
     gainDb = p ("gain");
     internalBpm = p ("internalBpm");
     voiceMode = p ("voiceMode");

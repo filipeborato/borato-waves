@@ -46,7 +46,14 @@ Dial::~Dial() { endDrag(); }
 String Dial::valueText() const
 {
     if (id == "cutoff" || id == "cutoff2") return plainValue >= 1000 ? String (plainValue / 1000.0f, 2) + " kHz" : String (plainValue, 0) + " Hz";
-    if (id == "gain" || id == "distDrive") return String (plainValue, 1) + " dB";
+    if (id == "gain" || id == "distDrive" || id.startsWith ("eq") || id == "compThreshold" || id == "compMakeup")
+    {
+        if (id == "eqFreq") return plainValue >= 1000 ? String (plainValue / 1000.0f, 2) + " kHz" : String (plainValue, 0) + " Hz";
+        if (id == "eqQ") return String (plainValue, 2) + " Q";
+        return String (plainValue, 1) + " dB";
+    }
+    if (id == "compRatio") return String (plainValue, 1) + " : 1";
+    if (id == "compAttack" || id == "compRelease") return String (plainValue, plainValue < 10 ? 1 : 0) + " ms";
     if (id == "delayTime") return String (plainValue, 0) + " ms";
     if (id == "attack" || id == "decay" || id == "release" || id == "glide")
         return plainValue < 1 ? String (plainValue * 1000, 0) + " ms" : String (plainValue, 2) + " s";

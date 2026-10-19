@@ -298,6 +298,19 @@ int main (int argc, char** argv)
         assert (tab != nullptr && tab->keyPressed (KeyPress (KeyPress::returnKey)));
         if (argc > 1)
             snapshot (editor, File (String (argv[1])), String (title).toLowerCase());
+        if (String (title) != "EFFECTS") continue;
+        // EQ and compressor pages show their live controls.
+        for (const char* fx : { "05    EQUALIZER", "06    COMPRESSOR" })
+        {
+            auto* button = findControl (editor, fx);
+            assert (button != nullptr && button->keyPressed (KeyPress (KeyPress::returnKey)));
+            const bool eq = String (fx).contains ("EQ");
+            auto* toggle = findControl (editor, eq ? "EQUALIZER enable" : "COMPRESSOR enable");
+            auto* dial = findControl (editor, eq ? "FREQUENCY" : "THRESHOLD");
+            assert (toggle != nullptr && toggle->isVisible() && dial != nullptr && dial->isVisible());
+            if (argc > 1) snapshot (editor, File (String (argv[1])), eq ? "effects-eq" : "effects-compressor");
+        }
+        findControl (editor, "01    DISTORTION")->keyPressed (KeyPress (KeyPress::returnKey));
     }
     findControl (editor, "SYNTH")->keyPressed (KeyPress (KeyPress::returnKey));
     auto* patch = findControl (editor, "Glass current    /    PLUCK");

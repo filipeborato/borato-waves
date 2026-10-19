@@ -33,7 +33,7 @@ Each step is playable before the next starts.
 2. **Sources done:** 2nd osc + sub + noise, independent pitch/pan, MIDI bend. Wavetable import (`.wav`, 2048-sample frames) remains pending.
 3. **Modulation done:** 2 editable LFOs, 16 matrix routes, 4 macros, drag-to-modulate; A/B unison up to 8 lanes. Additional envelopes remain pending.
 4. Filter types (ladder, comb, formant…) + filter response display.
-5. FX rack: distortion, chorus, delay, reverb, EQ, compressor, reorderable.
+5. **FX rack done** in fixed order (distortion > chorus > delay > reverb > EQ > compressor), 20 ms crossfaded bypass. Reordering remains pending.
 6. Preset browser (wire `borato_preset_search`), undo.
 7. Granular / sample / spectral oscillators, arp / clip player.
 

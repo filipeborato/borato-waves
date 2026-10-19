@@ -71,3 +71,16 @@ Measured with the same machine and settings, after tasks 05–07. Three runs agr
 | extreme_fx_chorus | 44.9% | 49.3% | 109.1% | 520 / 750 |
 
 The chorus is a global stage, so its cost does not grow with notes: about 0.4–1 point of budget at 44.1/48 kHz and 1–4 at 96 kHz. Output level with it on (mix 0.5): −2.2 dB on a broadband saw, −0.3 dB on a four-voice unison pad (`test_effects`).
+
+### EQ and compressor profiles (19 October 2026)
+
+`layered_eq_comp` and `extreme_fx_eq_comp` add the EQ (bell +4 dB) and compressor (defaults: −18 dB, 4:1, 10/150 ms) to `layered` and `extreme_fx`. One run, same machine and settings:
+
+| Profile | 44.1 kHz | 48 kHz | 96 kHz | 96 kHz blocks over deadline |
+| --- | ---: | ---: | ---: | ---: |
+| layered | 4.0% | 4.4% | 9.7% | 0 |
+| layered_eq_comp | 4.3% | 4.9% | 10.4% | 0 |
+| extreme_fx | 43.5% | 46.9% | 100.7% | 391 / 750 |
+| extreme_fx_eq_comp | 42.9% | 47.2% | 103.4% | 448 / 750 |
+
+Both are global stages: under one point of budget at 44.1/48 kHz, within run-to-run noise on the heavy profile. While an EQ setting glides the coefficients are recomputed every sample (zipper-free at ±18 dB shelves), so automation costs more than a settled EQ. Level (`test_effects`): an EQ of +3/−4/+5 dB on a unison pad moves level +0.3 dB; the compressor at −24 dB, 4:1 on a pluck lowers peaks 2.6 dB and loudness 8.0 dB with a 10 ms attack, and peaks 14.3 dB with 0.1 ms. It has no automatic makeup and never raises a sample above its input without MAKEUP.

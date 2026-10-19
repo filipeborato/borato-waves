@@ -188,6 +188,7 @@ public:
     juce::MidiKeyboardState keyboardState;
     // Audio publishes block peaks; the UI owns display ballistics.
     std::array<std::atomic<float>, 2> outputPeak {};
+    float compressorReduction() const { return effects.gainReduction.load (std::memory_order_relaxed); }
     std::array<std::atomic<float>, 2> lfoDisplayPhase {};
     std::atomic<unsigned> curveRevision { 0 };
     bw::LfoCurve getLfoCurve (int index) const;

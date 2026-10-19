@@ -13,21 +13,12 @@ using namespace bw::ui;
 namespace
 {
 constexpr int designWidth = 1240, designHeight = 940;
-void section (Graphics& g, Rectangle<int> r, const String& name, const String& subtitle, Colour colour, bool preview = false)
+void section (Graphics& g, Rectangle<int> r, const String& name, const String& subtitle, Colour colour)
 {
     surface (g, r);
     g.setColour (colour); g.fillRoundedRectangle ((float) r.getX() + 14, (float) r.getY() + 16, 4, 13, 2);
     label (g, name, { r.getX() + 27, r.getY() + 10, r.getWidth() - 125, 24 }, 13, text, Justification::centredLeft, true);
-    if (preview) badge (g, "PREVIEW", { r.getRight() - 86, r.getY() + 13, 72, 20 }, muted);
-    else badge (g, subtitle, { r.getRight() - 86, r.getY() + 13, 72, 20 }, colour);
-}
-void ghostDial (Graphics& g, Point<float> c, const String& name, Colour tint = faint)
-{
-    Path arc; arc.addCentredArc (c.x, c.y, 18, 18, 0, -2.4f, 2.4f, true);
-    g.setColour (border); g.strokePath (arc, PathStrokeType (2));
-    g.setColour (inset); g.fillEllipse (c.x - 13, c.y - 13, 26, 26);
-    g.setColour (tint); g.drawLine (c.x, c.y - 7, c.x, c.y - 11, 1.5f);
-    label (g, name, { (int) c.x - 42, (int) c.y + 28, 84, 18 }, 9, tint, Justification::centred);
+    badge (g, subtitle, { r.getRight() - 86, r.getY() + 13, 72, 20 }, colour);
 }
 
 class Browser : public Component
@@ -228,6 +219,12 @@ public:
           filter2On (p.apvts, "filter2On", "F2"), distOn (p.apvts, "distOn", "DISTORTION"), delayOn (p.apvts, "delayOn", "DELAY"),
           delaySync (p.apvts, "delaySync", "SYNC"), delayPingPong (p.apvts, "delayPingPong", "PING-PONG"), reverbOn (p.apvts, "reverbOn", "REVERB"),
           chorusOn (p.apvts, "chorusOn", "CHORUS"),
+          eqLow (p.apvts, "eqLow", "LOW", coral), eqFreq (p.apvts, "eqFreq", "FREQUENCY", coral), eqGain (p.apvts, "eqGain", "GAIN", coral),
+          eqQ (p.apvts, "eqQ", "Q", coral), eqHigh (p.apvts, "eqHigh", "HIGH", coral),
+          compThreshold (p.apvts, "compThreshold", "THRESHOLD", coral), compRatio (p.apvts, "compRatio", "RATIO", coral),
+          compAttack (p.apvts, "compAttack", "ATTACK", coral), compRelease (p.apvts, "compRelease", "RELEASE", coral),
+          compMakeup (p.apvts, "compMakeup", "MAKEUP", coral),
+          eqOn (p.apvts, "eqOn", "EQUALIZER"), compOn (p.apvts, "compOn", "COMPRESSOR"),
           filterType (p.apvts, "filterType", "", "Filter 1 type"), filter2Type (p.apvts, "filter2Type", "", "Filter 2 type"),
           filterRouting (p.apvts, "filterRouting", "ROUTING", "Filter routing"),
           routeA (p.apvts, "oscARoute", "A >", "Osc A route"), routeB (p.apvts, "oscBRoute", "B >", "Osc B route"),
@@ -265,7 +262,8 @@ public:
         }
         for (Component* c : std::initializer_list<Component*> { &cutoff2, &reso2, &distDrive, &distMix, &delayTime, &delayFeedback, &delayMix,
              &reverbSize, &reverbDamping, &reverbWidth, &reverbMix, &filter2On, &distOn, &delayOn, &delaySync, &delayPingPong, &reverbOn,
-             &chorusOn, &chorusRate, &chorusDepth, &chorusMix, &filterType, &filter2Type, &filterRouting, &routeA, &routeB, &routeSub, &routeNoise, &distMode, &delayDivision,
+             &chorusOn, &chorusRate, &chorusDepth, &chorusMix, &eqOn, &eqLow, &eqFreq, &eqGain, &eqQ, &eqHigh,
+             &compOn, &compThreshold, &compRatio, &compAttack, &compRelease, &compMakeup, &filterType, &filter2Type, &filterRouting, &routeA, &routeB, &routeSub, &routeNoise, &distMode, &delayDivision,
              &importA, &importB, &filterTab1, &filterTab2, &env2Attack, &env2Decay, &env2Sustain, &env2Release, &envTab1, &envTab2, &dragEnv2 })
             addChildComponent (c);
         addChildComponent (matrix);
@@ -369,9 +367,10 @@ public:
         routeA.setBounds (270, 151, 106, 23); routeB.setBounds (730, 151, 106, 23);
         importA.setBounds (34, 489, 104, 25); importB.setBounds (494, 489, 104, 25);
         routeSub.setBounds (954, 622, 86, 22); routeNoise.setBounds (954, 706, 86, 22);
-        for (auto* toggle : { &distOn, &chorusOn, &delayOn, &reverbOn }) toggle->setBounds (1036, 203, 150, 30);
+        for (auto* toggle : { &distOn, &chorusOn, &delayOn, &reverbOn, &eqOn, &compOn }) toggle->setBounds (1036, 203, 150, 30);
         auto row = [] (std::initializer_list<Component*> dials) { int x = 346; for (auto* d : dials) { d->setBounds (x, 478, 110, 92); x += 140; } };
         row ({ &distDrive, &distMix }); row ({ &chorusRate, &chorusDepth, &chorusMix }); row ({ &delayTime, &delayFeedback, &delayMix }); row ({ &reverbSize, &reverbDamping, &reverbWidth, &reverbMix });
+        row ({ &eqLow, &eqFreq, &eqGain, &eqQ, &eqHigh }); row ({ &compThreshold, &compRatio, &compAttack, &compRelease, &compMakeup });
         distMode.setBounds (346, 600, 170, 30);
         delaySync.setBounds (346, 600, 120, 30); delayDivision.setBounds (476, 600, 170, 30); delayPingPong.setBounds (656, 600, 150, 30);
         subOn.setBounds (954, 569, 86, 24); noiseOn.setBounds (954, 653, 86, 24);
@@ -445,12 +444,11 @@ private:
     }
     void paintEffects (Graphics& g)
     {
-        const bool live = selectedFx <= 3;
-        section (g, { 20, 144, 278, 654 }, "EFFECT RACK", "4 LIVE", coral);
+        section (g, { 20, 144, 278, 654 }, "EFFECT RACK", "6 LIVE", coral);
         label (g, "Six ways to shape a sound.", { 38, 193, 242, 26 }, 14, muted);
-        label (g, "DIST > CHORUS > DELAY > REVERB", { 38, 590, 242, 18 }, 9, coral);
-        label (g, "FIXED ORDER / EQ, COMP: DESIGN PREVIEW", { 38, 610, 242, 18 }, 9, muted);
-        section (g, { 310, 144, 910, 654 }, "EFFECT DESIGN", "LIVE", coral, ! live);
+        label (g, "DIST > CHORUS > DELAY > REVERB > EQ > COMP", { 38, 590, 242, 18 }, 9, coral);
+        label (g, "FIXED ORDER", { 38, 610, 242, 18 }, 9, muted);
+        section (g, { 310, 144, 910, 654 }, "EFFECT DESIGN", "LIVE", coral);
         const StringArray names { "Distortion", "Chorus", "Delay", "Reverb", "Equalizer", "Compressor" };
         const StringArray descriptions { "Harmonics with a little more character.", "A wider horizon for a single voice.", "A conversation between sound and time.",
                                          "Give every note a place to live.", "Sculpt the balance of your sound.", "Shape the movement of dynamics." };
@@ -472,8 +470,12 @@ private:
             else if (selectedFx == 1) y = sweep (t, 0); // left taps' delay over two LFO cycles
             else if (selectedFx == 2) y = std::sin (t * 65) * std::exp (-t * 3);
             else if (selectedFx == 3) y = std::sin (t * 180) * std::sin (t * 71) * std::exp (-t * 3);
-            else if (selectedFx == 4) { const float offset = (t - .6f) * 8; y = .7f * std::exp (-offset * offset) - .3f; }
-            else y = t < .5f ? (t * 2 - 1) : (t - .5f) * .6f;
+            else if (selectedFx == 4)
+            {
+                const double rate = processor.getSampleRate() > 0 ? processor.getSampleRate() : 48000;
+                y = jlimit (-1.0f, 1.0f, (float) Decibels::gainToDecibels (eqSettings().magnitude (20 * std::pow (1000.0, t), rate)) / kEqGraphDb);
+            }
+            else y = transfer (t);
             Point<float> point (366 + t * 800, 379 - y * 59);
             if (i == 0) path.startNewSubPath (point); else path.lineTo (point);
         }
@@ -490,16 +492,39 @@ private:
             curve (g, right, violet);
             label (g, "DELAY SWEEP  /  LEFT  /  RIGHT A QUARTER CYCLE BEHIND", { 366, 440, 800, 16 }, 9, muted);
         }
-        const std::array<StringArray, 6> parameters {{ { "DRIVE", "TONE", "MIX" }, { "RATE", "DEPTH", "MIX" }, { "TIME", "FEEDBACK", "MIX" },
-                                                     { "SIZE", "DECAY", "MIX" }, { "FREQUENCY", "GAIN", "WIDTH" }, { "THRESHOLD", "RATIO", "MAKEUP" } }};
-        if (live)
+        if (selectedFx == 4)
+            label (g, "20 Hz - 20 kHz  /  +/-" + String (roundToInt (kEqGraphDb)) + " dB  /  LOW SHELF 200 Hz, BELL, HIGH SHELF 5 kHz", { 366, 440, 800, 16 }, 9, muted);
+        if (selectedFx == 5)
         {
-            label (g, "20 ms SAFE BYPASS  /  TAILS CONTINUE AFTER NOTE OFF", { 346, 660, 820, 20 }, 10, muted);
-            return;
+            // The input level that reaches the current reduction, and the reduction itself.
+            const float reduction = processor.compressorReduction();
+            if (reduction < -.05f)
+            {
+                const float t = (reductionInput (reduction) + 60) / 60;
+                g.setColour (text); g.fillEllipse (366 + 800 * t - 4, 379 - transfer (t) * 59 - 4, 8, 8);
+            }
+            label (g, "IN -60 > 0 dB  /  OUT  /  GAIN REDUCTION " + String (reduction, 1) + " dB", { 366, 440, 760, 16 }, 9, muted);
         }
-        for (int i = 0; i < 3; ++i) ghostDial (g, { 487.0f + i * 278, 519 }, parameters[(size_t) selectedFx][i]);
-        badge (g, "DESIGN PREVIEW", { 346, 598, 140, 26 }, coral);
-        label (g, "This processor will be connected in a future version.", { 504, 598, 682, 26 }, 12, muted);
+        label (g, "20 ms SAFE BYPASS  /  TAILS CONTINUE AFTER NOTE OFF", { 346, 660, 820, 20 }, 10, muted);
+    }
+    static constexpr float kEqGraphDb = 18;
+    bw::EqSettings eqSettings() const { return { raw ("eqLow"), raw ("eqFreq"), raw ("eqGain"), raw ("eqQ"), raw ("eqHigh") }; }
+    // Compressor output level, -60..0 dB in, mapped to -1..1 (makeup included).
+    float transfer (float t) const
+    {
+        const float in = -60 + 60 * t, out = in + bw::compressorGain (in, raw ("compThreshold"), raw ("compRatio")) + raw ("compMakeup");
+        return jlimit (-1.0f, 1.0f, (out + 30) / 30);
+    }
+    // The steady input level whose static reduction equals the metered one, for the dot on the curve.
+    float reductionInput (float reduction) const
+    {
+        float lo = -60, hi = 0;
+        for (int i = 0; i < 30; ++i)
+        {
+            const float mid = (lo + hi) / 2;
+            (bw::compressorGain (mid, raw ("compThreshold"), raw ("compRatio")) > reduction ? lo : hi) = mid;
+        }
+        return lo;
     }
     float sweep (float t, float offset) const { return raw ("chorusDepth") * std::sin (MathConstants<float>::twoPi * (2 * t + offset)); }
     void paintGlobal (Graphics& g)
@@ -559,6 +584,8 @@ private:
         for (auto* c : List { &chorusOn, &chorusRate, &chorusDepth, &chorusMix }) c->setVisible (fx && selectedFx == 1);
         for (auto* c : List { &delayOn, &delaySync, &delayDivision, &delayPingPong, &delayTime, &delayFeedback, &delayMix }) c->setVisible (fx && selectedFx == 2);
         for (auto* c : List { &reverbOn, &reverbSize, &reverbDamping, &reverbWidth, &reverbMix }) c->setVisible (fx && selectedFx == 3);
+        for (auto* c : List { &eqOn, &eqLow, &eqFreq, &eqGain, &eqQ, &eqHigh }) c->setVisible (fx && selectedFx == 4);
+        for (auto* c : List { &compOn, &compThreshold, &compRatio, &compAttack, &compRelease, &compMakeup }) c->setVisible (fx && selectedFx == 5);
         filterTab1.setSelected (filterPage == 0); filterTab2.setSelected (filterPage == 1);
         filter.setFilterIndex (filterPage);
     }
@@ -799,12 +826,11 @@ private:
                 if (page == 0) repaint (20, 480, 920, 36);
             }
         }
-        const std::array<const char*, 6> fxEnables { "distOn", "chorusOn", "delayOn", "reverbOn", nullptr, nullptr };
+        const std::array<const char*, 6> fxEnables { "distOn", "chorusOn", "delayOn", "reverbOn", "eqOn", "compOn" };
         for (size_t i = 0; i < fxEnables.size(); ++i)
-            if (fxEnables[i] != nullptr)
-                if (const auto caption = fxNames[(int) i] + (raw (fxEnables[i]) >= .5f ? "   ON" : ""); fxButtons[i]->getText() != caption)
-                    fxButtons[i]->setText (caption);
-        if (page == 1 && selectedFx <= 1) repaint (346, 296, 840, 166);
+            if (const auto caption = fxNames[(int) i] + (raw (fxEnables[i]) >= .5f ? "   ON" : ""); fxButtons[i]->getText() != caption)
+                fxButtons[i]->setText (caption);
+        if (page == 1 && (selectedFx <= 1 || selectedFx >= 4)) repaint (346, 296, 840, 166);
         undoButton.setAlpha (processor.canUndo() ? 1.0f : .4f);
         redoButton.setAlpha (processor.canRedo() ? 1.0f : .4f);
         if (statusUntil != 0 && Time::getMillisecondCounter() > statusUntil)
@@ -839,8 +865,8 @@ private:
     Browser browser;
     WavetableBrowser tableBrowser;
     Dial cutoff2, reso2, distDrive, distMix, delayTime, delayFeedback, delayMix, reverbSize, reverbDamping, reverbWidth, reverbMix,
-         chorusRate, chorusDepth, chorusMix;
-    ParameterToggle filter2On, distOn, delayOn, delaySync, delayPingPong, reverbOn, chorusOn;
+         chorusRate, chorusDepth, chorusMix, eqLow, eqFreq, eqGain, eqQ, eqHigh, compThreshold, compRatio, compAttack, compRelease, compMakeup;
+    ParameterToggle filter2On, distOn, delayOn, delaySync, delayPingPong, reverbOn, chorusOn, eqOn, compOn;
     ParameterChoice filterType, filter2Type, filterRouting, routeA, routeB, routeSub, routeNoise, distMode, delayDivision;
     Action importA, importB, filterTab1, filterTab2;
     Dial env2Attack, env2Decay, env2Sustain, env2Release;

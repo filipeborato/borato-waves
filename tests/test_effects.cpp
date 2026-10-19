@@ -70,7 +70,11 @@ static bw::EffectParams effectParams (WaveProcessor& p)
         p.apvts.getRawParameterValue ("reverbOn"), p.apvts.getRawParameterValue ("reverbSize"), p.apvts.getRawParameterValue ("reverbDamping"),
         p.apvts.getRawParameterValue ("reverbWidth"), p.apvts.getRawParameterValue ("reverbMix"),
         p.apvts.getRawParameterValue ("chorusOn"), p.apvts.getRawParameterValue ("chorusRate"), p.apvts.getRawParameterValue ("chorusDepth"),
-        p.apvts.getRawParameterValue ("chorusMix") };
+        p.apvts.getRawParameterValue ("chorusMix"),
+        p.apvts.getRawParameterValue ("eqOn"), p.apvts.getRawParameterValue ("eqLow"), p.apvts.getRawParameterValue ("eqFreq"),
+        p.apvts.getRawParameterValue ("eqGain"), p.apvts.getRawParameterValue ("eqQ"), p.apvts.getRawParameterValue ("eqHigh"),
+        p.apvts.getRawParameterValue ("compOn"), p.apvts.getRawParameterValue ("compThreshold"), p.apvts.getRawParameterValue ("compRatio"),
+        p.apvts.getRawParameterValue ("compAttack"), p.apvts.getRawParameterValue ("compRelease"), p.apvts.getRawParameterValue ("compMakeup") };
 }
 
 static void testEffects()
@@ -236,6 +240,233 @@ static void testChorus()
     assert (std::abs (padDb) < 3);
 }
 
+// Renders a 220 Hz sine through fx in 256-sample blocks, calling automate before each block.
+struct Bench
+{
+    WaveProcessor p;
+    bw::EffectParams params = effectParams (p);
+    bw::Effects fx;
+    std::array<std::vector<float>, 2> in, out;
+    int clock = 0;
+    float amplitude = .4f;
+    Bench() { fx.prepare (48000, 256); }
+    void run (int blocks, std::function<void()> automate = {})
+    {
+        AudioBuffer<float> buffer (2, 256);
+        for (int b = 0; b < blocks; ++b)
+        {
+            if (automate) automate();
+            for (int i = 0; i < 256; ++i)
+                for (int ch = 0; ch < 2; ++ch)
+                    buffer.setSample (ch, i, amplitude * (float) std::sin (juce::MathConstants<double>::twoPi * 220 * (clock + i) / 48000));
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) in[(size_t) ch].push_back (buffer.getSample (ch, i));
+            fx.process (buffer, params, 120);
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) { assert (std::isfinite (buffer.getSample (ch, i))); out[(size_t) ch].push_back (buffer.getSample (ch, i)); }
+            clock += 256;
+        }
+    }
+    float steps (size_t from) const
+    {
+        float worst = 0;
+        for (size_t i = jmax ((size_t) 1, from); i < out[0].size(); ++i) worst = jmax (worst, std::abs (out[0][i] - out[0][i - 1]));
+        return worst;
+    }
+    float peak (size_t from) const { float m = 0; for (size_t i = from; i < out[0].size(); ++i) m = jmax (m, std::abs (out[0][i])); return m; }
+    // Worst second difference over the peak level, in units of a pure 220 Hz sine's (w^2).
+    // A smoothly changing sine stays near 1; a step of s adds about s / peak.
+    float curvature (size_t from) const
+    {
+        const double w = juce::MathConstants<double>::twoPi * 220 / 48000;
+        float worst = 0;
+        for (size_t i = jmax ((size_t) 2, from); i < out[0].size(); ++i)
+            worst = jmax (worst, std::abs (out[0][i] - 2 * out[0][i - 1] + out[0][i - 2]));
+        return (float) (worst / (peak (from) * w * w));
+    }
+};
+
+// Same controls and sound after save/reopen as host state and as a preset file.
+static void testRestores (const std::function<void (WaveProcessor&)>& configure)
+{
+    WaveProcessor original, host, library;
+    set (original, "wtTable", 2); set (original, "gain", -12);
+    configure (original);
+    const auto reference = render (original, 30)[0];
+    MemoryBlock state; original.getStateInformation (state);
+    host.setStateInformation (state.getData(), (int) state.getSize());
+    const auto file = File::getSpecialLocation (File::tempDirectory).getChildFile ("borato-fx-restore.bwpreset");
+    assert (original.savePreset (file) && library.loadPreset (file));
+    file.deleteFile();
+    for (auto* reopened : { &host, &library })
+    {
+        for (auto* parameter : original.getParameters())
+            assert (reopened->getParameters()[parameter->getParameterIndex()]->getValue() == parameter->getValue());
+        const auto replay = render (*reopened, 30)[0];
+        for (size_t i = 0; i < replay.size(); ++i) assert (std::abs (replay[i] - reference[i]) < 1.0e-5f);
+    }
+}
+
+// Curvature bound for click-free output. The zipper of a 16-sample EQ refresh (a 1.16 step at a 6.5 peak) is about 200.
+constexpr float kClickFree = 3;
+
+static void testEqualizer()
+{
+    // Independent anchors: flat is flat, the bell peaks at its gain, shelves reach theirs far from the corner.
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        assert (std::abs (bw::EqSettings{}.magnitude (1234, rate) - 1) < 1.0e-9);
+        const bw::EqSettings bell { 0, 2000, 9, 2, 0 }, shelves { -12, 1000, 0, 1, 7 };
+        assert (std::abs (Decibels::gainToDecibels (bell.magnitude (2000, rate)) - 9) < .01);
+        assert (std::abs (Decibels::gainToDecibels (shelves.magnitude (20, rate)) + 12) < .3);
+        assert (std::abs (Decibels::gainToDecibels (shelves.magnitude (18000, rate)) - 7) < .3);
+        assert (std::abs (Decibels::gainToDecibels (shelves.magnitude (1000, rate))) < 1.5);
+        // Measured sine gains match the response, at the extremes too.
+        for (const auto& s : { bell, shelves, bw::EqSettings { 18, 40, -18, .3f, -18 }, bw::EqSettings { -18, 16000, 18, 8, 18 } })
+        {
+            auto bands = s.bands (rate);
+            for (double hz : { 50.0, 440.0, 2000.0, 9000.0 })
+            {
+                std::array<std::array<double, 2>, 3> state {};
+                const int length = (int) rate / 2;
+                double inEnergy = 0, outEnergy = 0;
+                for (int i = 0; i < length; ++i)
+                {
+                    const float x = (float) std::sin (juce::MathConstants<double>::twoPi * hz * i / rate);
+                    float y = x;
+                    for (size_t b = 0; b < 3; ++b) y = bands[b].process (state[b][0], state[b][1], y);
+                    assert (std::isfinite (y));
+                    if (i >= length / 2) { inEnergy += (double) x * x; outEnergy += (double) y * y; }
+                }
+                const double measured = std::sqrt (outEnergy / inEnergy), predicted = s.magnitude (hz, rate);
+                assert (std::abs (measured - predicted) < .01 * predicted + 1.0e-4);
+            }
+        }
+    }
+
+    Bench b;
+    b.run (10);
+    const float drySteps = b.steps (0);
+    // The steepest steady sound the EQ can make from this sine: everything boosted around it.
+    set (b.p, "eqOn", 1); set (b.p, "eqLow", 18); set (b.p, "eqFreq", 220); set (b.p, "eqGain", 18); set (b.p, "eqQ", .3f); set (b.p, "eqHigh", 18);
+    b.run (20);
+    const float boosted = b.steps (b.out[0].size() - 2560);
+    assert (boosted > drySteps * 4);
+    // Jumps and random automation glide without clicks.
+    Random random (11);
+    const size_t automated = b.out[0].size();
+    b.run (200, [&]
+    {
+        set (b.p, "eqLow", -18 + 36 * random.nextFloat()); set (b.p, "eqGain", -18 + 36 * random.nextFloat()); set (b.p, "eqHigh", -18 + 36 * random.nextFloat());
+        set (b.p, "eqFreq", 40 * std::pow (400.0f, random.nextFloat())); set (b.p, "eqQ", .3f + 7.7f * random.nextFloat());
+    });
+    std::printf ("eq automation curvature %.2f (pure sine 1)\n", b.curvature (automated));
+    assert (b.steps (automated) < boosted * 1.2f && b.curvature (automated) < kClickFree);
+    // Fades out, then passes bit-identical.
+    set (b.p, "eqOn", 0);
+    const size_t fadeOut = b.out[0].size();
+    b.run (10);
+    assert (b.curvature (fadeOut) < kClickFree);
+    const size_t off = b.out[0].size();
+    b.run (2);
+    for (size_t i = off; i < b.out[0].size(); ++i) assert (b.out[0][i] == b.in[0][i] && b.out[1][i] == b.in[1][i]);
+
+    // On a pad: level change, and after matching level the EQ still changes the tone.
+    WaveProcessor pad;
+    set (pad, "wtTable", 2); set (pad, "oscAUnison", 4); set (pad, "oscADetune", 15); set (pad, "gain", -12);
+    const auto dry = render (pad, 80)[0];
+    set (pad, "eqOn", 1); set (pad, "eqLow", 3); set (pad, "eqFreq", 800); set (pad, "eqGain", -4); set (pad, "eqHigh", 5);
+    const auto wet = render (pad, 80)[0];
+    const double match = std::sqrt (energy (dry, 4096) / energy (wet, 4096));
+    double residual = 0;
+    for (size_t i = 4096; i < dry.size(); ++i) residual += std::pow (wet[i] * match - dry[i], 2);
+    std::printf ("eq on a pad: level %+.2f dB, level-matched difference %.1f dB below the signal\n",
+                 Decibels::gainToDecibels (1 / match), -Decibels::gainToDecibels (std::sqrt (residual / energy (dry, 4096))));
+    assert (residual > .01 * energy (dry, 4096));
+
+    testRestores ([] (WaveProcessor& p) { set (p, "eqOn", 1); set (p, "eqLow", -6); set (p, "eqFreq", 2500); set (p, "eqGain", 9); set (p, "eqQ", 3); set (p, "eqHigh", -9); });
+}
+
+static void testCompressor()
+{
+    // Static curve: no change under the knee, threshold + over / ratio above it.
+    assert (bw::compressorGain (-30, -18, 4) == 0);
+    assert (std::abs (bw::compressorGain (2, -18, 4) + 15) < 1.0e-5f);
+    assert (bw::compressorGain (0, -18, 1) == 0 && std::abs (bw::compressorGain (-18, -18, 4) + .5625f) < 1.0e-5f); // knee middle: 3/4 * 3 * 3 / 12
+
+    // Attack and release follow their time constants at every rate: 63 % of the way after one of each.
+    WaveProcessor p;
+    const auto params = effectParams (p);
+    set (p, "compOn", 1); set (p, "compThreshold", -18); set (p, "compRatio", 4); set (p, "compAttack", 10); set (p, "compRelease", 100);
+    for (int rate : { 44100, 48000, 96000 })
+    {
+        const int length = rate / 10, attack = rate / 100; // 100 ms blocks; 10 ms attack
+        bw::Effects fx;
+        fx.prepare (rate, length);
+        AudioBuffer<float> level (2, length);
+        auto hold = [&] (float value) { for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < length; ++i) level.setSample (ch, i, value); fx.process (level, params, 120); };
+        hold (0);
+        hold (1); // 0 dB: settles towards -13.5 dB
+        assert (std::abs (Decibels::gainToDecibels (level.getSample (0, attack - 1)) + 13.5f * (1 - std::exp (-1.0f))) < .1f);
+        assert (std::abs (Decibels::gainToDecibels (level.getSample (1, length - 1)) + 13.5f) < .1f);
+        assert (std::abs (fx.gainReduction.load() + 13.5f) < .1f);
+        hold (.01f); // -40 dB: released back towards 0 dB
+        assert (std::abs (Decibels::gainToDecibels (level.getSample (0, length - 1) / .01f) + 13.5f * std::exp (-1.0f)) < .1f);
+    }
+
+    // A steady sine settles at its predicted level, and the output never exceeds the input.
+    Bench b;
+    b.run (10);
+    const float drySteps = b.steps (0);
+    set (b.p, "compOn", 1); set (b.p, "compThreshold", -18); set (b.p, "compRatio", 4); set (b.p, "compAttack", 5); set (b.p, "compRelease", 150);
+    b.run (60);
+    const float expected = .4f * Decibels::decibelsToGain (bw::compressorGain (Decibels::gainToDecibels (.4f), -18, 4));
+    // Within 1 dB: the detector releases a little between the sine's peaks (+0.5 dB here).
+    assert (std::abs (Decibels::gainToDecibels (b.peak (b.out[0].size() - 4800) / expected)) < 1);
+    for (size_t i = 0; i < b.out[0].size(); ++i) assert (std::abs (b.out[0][i]) <= std::abs (b.in[0][i]) + 1.0e-6f);
+    // Automating every control (attack from 2 ms, makeup up to +6 dB) stays click-free.
+    Random random (5);
+    const size_t automated = b.out[0].size();
+    b.run (200, [&]
+    {
+        set (b.p, "compThreshold", -48 * random.nextFloat()); set (b.p, "compRatio", 1 + 19 * random.nextFloat());
+        set (b.p, "compAttack", 2 + 98 * random.nextFloat()); set (b.p, "compRelease", 10 + 990 * random.nextFloat());
+        set (b.p, "compMakeup", 6 * random.nextFloat());
+    });
+    std::printf ("compressor automation curvature %.2f (pure sine 1)\n", b.curvature (automated));
+    assert (b.steps (automated) < drySteps * 2 * 1.2f && b.curvature (automated) < kClickFree);
+    // Fades out, then passes bit-identical.
+    set (b.p, "compMakeup", 0); set (b.p, "compOn", 0);
+    const size_t fadeOut = b.out[0].size();
+    b.run (10);
+    assert (b.curvature (fadeOut) < kClickFree);
+    const size_t off = b.out[0].size();
+    b.run (2);
+    for (size_t i = off; i < b.out[0].size(); ++i) assert (b.out[0][i] == b.in[0][i]);
+
+    // Plucks through the processor: lower peaks and loudness, no added level without makeup.
+    WaveProcessor pluck;
+    set (pluck, "wtTable", 2); set (pluck, "decay", .15f); set (pluck, "sustain", .2f); set (pluck, "gain", -3);
+    auto measure = [&pluck]
+    {
+        const auto out = render (pluck, 80)[0];
+        float peak = 0; for (auto x : out) peak = jmax (peak, std::abs (x));
+        return std::pair { Decibels::gainToDecibels (peak), Decibels::gainToDecibels ((float) std::sqrt (energy (out) / (double) out.size())) };
+    };
+    const auto [dryPeak, dryRms] = measure();
+    set (pluck, "compOn", 1); set (pluck, "compThreshold", -24); set (pluck, "compRatio", 4);
+    const auto [wetPeak, wetRms] = measure();
+    // A 10 ms attack lets the pluck's transient through; a 0.1 ms one catches it.
+    set (pluck, "compAttack", .1f);
+    const auto [fastPeak, fastRms] = measure();
+    std::printf ("compressor on a pluck: 10 ms attack peak %+.2f dB, loudness %+.2f dB; 0.1 ms attack peak %+.2f dB, loudness %+.2f dB\n",
+                 wetPeak - dryPeak, wetRms - dryRms, fastPeak - dryPeak, fastRms - dryRms);
+    assert (wetPeak <= dryPeak + .01f && wetRms < dryRms && fastPeak < wetPeak - 3);
+
+    testRestores ([] (WaveProcessor& p)
+    {
+        set (p, "compOn", 1); set (p, "compThreshold", -30); set (p, "compRatio", 8); set (p, "compAttack", 2); set (p, "compRelease", 300); set (p, "compMakeup", 6);
+    });
+}
+
 static void testRouting()
 {
     WaveProcessor p;
@@ -382,9 +613,11 @@ int main()
     testFilterResponse();
     testEffects();
     testChorus();
+    testEqualizer();
+    testCompressor();
     testRouting();
     testWavetableImport();
     testTableLifetime();
     testPresetFiles();
-    std::puts ("ok: filter response, distortion/chorus/delay/reverb, routing, WAV import, table lifetime, preset files");
+    std::puts ("ok: filter response, distortion/chorus/delay/reverb/eq/compressor, routing, WAV import, table lifetime, preset files");
 }
