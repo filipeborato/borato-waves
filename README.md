@@ -1,51 +1,51 @@
 # Borato Waves
 
-Sintetizador wavetable desenvolvido em C++20 com JUCE, disponivel como plugin **VST3** e aplicativo **Standalone**.
+A wavetable synthesizer built with C++20 and JUCE, available as a **VST3** plugin and a **Standalone** application.
 
-## Recursos
+## Features
 
-- Osciladores wavetable, suboscilador e ruido, com unison, FM e modelagem de onda.
-- Reproducao de samples, editor de wavetables e importacao de audio.
-- Envelopes, LFOs, matriz de modulacao e macros.
-- Filtros e efeitos, incluindo chorus, equalizador e compressor.
-- Banco de presets de fabrica e salvamento de presets do usuario.
-- Entrada MIDI e suporte ASIO no Standalone para Windows.
+- Wavetable oscillators, sub oscillator, and noise, with unison, FM, and wave shaping.
+- Sample playback, a wavetable editor, and audio import.
+- Envelopes, LFOs, a modulation matrix, and macros.
+- Filters and effects, including chorus, EQ, and compression.
+- Factory presets and user preset saving.
+- MIDI input and ASIO support in the Windows Standalone application.
 
-## Compilar
+## Building
 
-Requisitos: CMake 3.22 ou superior, compilador C++20 e ferramentas de desenvolvimento da plataforma. No Windows, use um ambiente de desenvolvimento do Visual Studio.
+Requires CMake 3.22 or later, a C++20 compiler, and development tools for your platform. On Windows, use a Visual Studio development environment.
 
-O comando abaixo baixa a revisao fixada do JUCE 9.0.4:
+The following commands download the pinned JUCE 9.0.4 revision:
 
 ```sh
 cmake -S . -B build -DBORATOWAVE_FETCH_JUCE=ON -DBORATOWAVE_BUILD_TESTS=OFF
 cmake --build build --config Release --target BoratoWave_VST3 BoratoWave_Standalone --parallel 2
 ```
 
-Os binarios ficam em `build/BoratoWave_artefacts/Release/`. Para Linux, dependencias, testes Debug e uso de um checkout local do JUCE, consulte [BUILDING.md](BUILDING.md).
+Binaries are generated in `build/BoratoWave_artefacts/Release/`. For Linux setup, dependencies, Debug tests, and using a local JUCE checkout, see [BUILDING.md](BUILDING.md).
 
-## Instalar e usar
+## Installation and usage
 
-Copie o bundle completo `Borato Waves.vst3` para a pasta de plugins da plataforma:
+Copy the complete `Borato Waves.vst3` bundle to your platform's plugin directory:
 
-| Plataforma | Pasta VST3 |
+| Platform | VST3 directory |
 |---|---|
 | Windows | `C:\Program Files\Common Files\VST3\` |
 | macOS | `~/Library/Audio/Plug-Ins/VST3/` |
 | Linux | `~/.vst3/` |
 
-Atualize a lista de plugins na DAW e carregue Borato Waves em uma pista de instrumento MIDI. No Standalone, configure os dispositivos de audio e MIDI antes de tocar.
+Rescan plugins in your DAW and load Borato Waves on a MIDI instrument track. In the Standalone application, configure your audio and MIDI devices before playing.
 
-## Compilacao automatica
+## Automated builds
 
-- **Pull requests para main/master:** compilacao VST3 no Ubuntu.
-- **Tags de versao `v*`:** VST3 e Standalone para Windows x64, Linux x64, macOS Apple Silicon e Intel, mais testes Debug no Ubuntu.
-- Os pacotes e checksums sao reunidos em uma release em rascunho somente depois das verificacoes.
+- **Pull requests to main/master:** VST3 compilation on Ubuntu.
+- **Version tags matching `v*`:** VST3 and Standalone builds for Windows x64, Linux x64, macOS Apple Silicon, and macOS Intel, plus Debug tests on Ubuntu.
+- Packages and checksums are collected in a draft release only after validation succeeds.
 
-A tag deve corresponder a versao declarada no CMake. Veja o procedimento em [BUILDING.md](BUILDING.md).
+The tag must match the version declared in CMake. See [BUILDING.md](BUILDING.md) for the release procedure.
 
-## Estado do projeto
+## Project status
 
-Projeto em desenvolvimento. Os pacotes Windows nao possuem assinatura comercial; os pacotes macOS usam assinatura ad hoc, sem notarizacao. A validacao em DAWs e dispositivos de audio reais complementa os testes automatizados.
+Under active development. Windows packages are not commercially signed; macOS packages are ad-hoc signed but not notarized. Testing in real DAWs and with physical audio devices complements the automated tests.
 
-Os motores completos de multisamples, sintese granular e ressintese espectral ainda nao fazem parte desta entrega.
+Complete multisample, granular synthesis, and spectral resynthesis engines are not included in this release.
