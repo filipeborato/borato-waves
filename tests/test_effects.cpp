@@ -574,7 +574,10 @@ static void testTableLifetime()
     slot.acquire (100000);       // switches; this block is not rendered yet
     slot.collect();
     assert (! watch.expired());
-    slot.acquire (256);          // the 100000-sample block is now rendered
+    slot.acquire (256);          // elapsed samples alone do not acknowledge voice completion
+    slot.collect();
+    assert (! watch.expired());
+    slot.settle();               // every voice has released the retired table
     slot.collect();
     assert (watch.expired());
 }

@@ -1144,20 +1144,25 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
 
             const size_t channels = reader->numChannels >= 2 ? 2u : 1u;
             const size_t reservationBytes = (size_t) reader->lengthInSamples * channels * sizeof (float);
+            juce::String error;
             {
                 std::lock_guard<std::mutex> lock (processor.extraStateMutex);
                 if (processor.isRequestCancelledLocked (requestId))
+                    error = "Sample load cancelled";
+                else
                 {
-                    processor.completeSampleLoad (requestId, nullptr, file, "Sample load cancelled");
-                    return jobHasFinished;
+                    processor.collectAssetsLocked ();
+                    if (processor.nonEvictableAssetBytesLocked () + reservationBytes > WaveProcessor::kHistoryBytes)
+                        error = "Sample exceeds 256 MB memory budget";
+                    else
+                        processor.pendingSampleJobBytes += reservationBytes;
                 }
-                processor.collectAssetsLocked ();
-                if (processor.nonEvictableAssetBytesLocked () + reservationBytes > WaveProcessor::kHistoryBytes)
-                {
-                    processor.completeSampleLoad (requestId, nullptr, file, "Sample exceeds 256 MB memory budget");
-                    return jobHasFinished;
-                }
-                processor.pendingSampleJobBytes += reservationBytes;
+            }
+            // Completion takes extraStateMutex itself, so report failures after releasing it.
+            if (error.isNotEmpty ())
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, error);
+                return jobHasFinished;
             }
 
             struct ScopedReservation
@@ -1171,7 +1176,6 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
                 }
             };
 
-            juce::String error;
             std::shared_ptr<const bw::Sample> loaded;
             {
                 const ScopedReservation reservation { processor, reservationBytes };
@@ -1382,7 +1386,7 @@ int WaveProcessor::matchingFactoryPreset () const
 
 juce::File WaveProcessor::presetDirectory ()
 {
-    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("Borato").getChildFile ("Borato Wave").getChildFile ("Presets");
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("Borato").getChildFile ("Borato Waves").getChildFile ("Presets");
 }
 bool WaveProcessor::savePreset (const juce::File& file)
 {

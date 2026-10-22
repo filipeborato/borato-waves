@@ -1,6 +1,7 @@
 #pragma once
 #include "Wavetable.h"
 #include <juce_audio_formats/juce_audio_formats.h>
+#include <algorithm>
 #include <memory>
 
 namespace bw
@@ -20,7 +21,7 @@ inline int clmFrameSize (const juce::File& file)
         if (id == (int) juce::ByteOrder::littleEndianInt ("clm "))
         {
             juce::MemoryBlock text;
-            in.readIntoMemoryBlock (text, (juce::pointer_sized_int) juce::jmin<juce::int64> (size, 64));
+            in.readIntoMemoryBlock (text, (juce::pointer_sized_int) std::min<juce::int64> (size, 64));
             const auto s = text.toString();
             return s.startsWith ("<!>") ? s.substring (3).getIntValue() : 0;
         }
@@ -68,7 +69,7 @@ inline std::unique_ptr<juce::AudioFormatReader> openAudio (const juce::File& fil
 // Mono mixdown of the first `limit` samples.
 inline std::vector<float> readMono (juce::AudioFormatReader& reader, juce::int64 limit)
 {
-    const int length = (int) juce::jmax<juce::int64> (0, juce::jmin (reader.lengthInSamples, limit));
+    const int length = (int) std::max<juce::int64> (0, juce::jmin (reader.lengthInSamples, limit));
     juce::AudioBuffer<float> buffer ((int) reader.numChannels, juce::jmax (1, length));
     buffer.clear();
     reader.read (&buffer, 0, length, 0, true, true);
