@@ -323,11 +323,11 @@ int main (int argc, char** argv)
     if (argc > 1) snapshot (editor, File (String (argv[1])), "browser");
     patch->keyPressed (KeyPress (KeyPress::returnKey));
     assert (position->isEnabled());
-    assert (std::abs (processor.apvts.getRawParameterValue ("cutoff")->load() - 6500) < .1f);
-    assert (std::abs (position->normalised() - .42f) < .0001f);
+    assert (std::abs (processor.apvts.getRawParameterValue ("cutoff")->load() - 5200) < .1f);
+    assert (std::abs (position->normalised() - .32f) < .0001f);
     // The arrows walk every factory preset and wrap back to the same one.
     for (size_t i = 0; i < bw::factoryPresets().size(); ++i) findControl (editor, ">")->keyPressed (KeyPress (KeyPress::returnKey));
-    assert (std::abs (position->normalised() - .42f) < .0001f);
+    assert (std::abs (position->normalised() - .32f) < .0001f);
     // Search and category filters narrow the library; the arrows follow the filtered list.
     browserButton->keyPressed (KeyPress (KeyPress::returnKey));
     auto* presetSearch = dynamic_cast<bw::ui::SearchField*> (findControl (editor, "Search presets"));
@@ -346,7 +346,7 @@ int main (int argc, char** argv)
     browserButton->keyPressed (KeyPress (KeyPress::returnKey));
     findControl (editor, "Category ALL")->keyPressed (KeyPress (KeyPress::returnKey));
     findControl (editor, "Glass current    /    PLUCK")->keyPressed (KeyPress (KeyPress::returnKey));
-    assert (std::abs (position->normalised() - .42f) < .0001f);
+    assert (std::abs (position->normalised() - .32f) < .0001f);
     assert (processor.selectedTable() == 6);
     assert (dynamic_cast<bw::ui::Action*> (findControl (editor, "Choose wavetable"))->getText() == "Spectral Bells");
     auto* tableButton = findControl (editor, "Choose wavetable");

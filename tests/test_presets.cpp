@@ -50,10 +50,43 @@ Render play (WaveProcessor& p)
         }
     r.rms = std::sqrt (sum / count);
     r.brightness = std::sqrt (diff / jmax (1.0e-20, sum)); // rises with high-frequency content
-    r.tail = r.audio.getRMSLevel (0, total - at (0.25), at (0.25));
+    for (int ch = 0; ch < 2; ++ch)
+        r.tail = jmax (r.tail, (double) r.audio.getRMSLevel (ch, total - at (0.25), at (0.25)));
     return r;
 }
 double db (double gain) { return Decibels::gainToDecibels (gain, -120.0); }
+
+bool checkPerformance (int index, double sampleRate, float velocity, float macro)
+{
+    WaveProcessor p;
+    p.loadFactoryPreset (index);
+    for (int m = 1; m <= 4; ++m)
+        p.apvts.getParameter ("macro" + String (m))->setValueNotifyingHost (macro);
+    p.prepareToPlay (sampleRate, block);
+    AudioBuffer<float> buffer (2, block);
+    double energy = 0, peak = 0;
+    const int total = (int) (sampleRate * 3);
+    for (int start = 0; start < total; start += block)
+    {
+        MidiBuffer midi;
+        if (start == 0)
+            for (int note : { 36, 60, 67 }) midi.addEvent (MidiMessage::noteOn (1, note, velocity), 0);
+        p.processBlock (buffer, midi);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int s = 0; s < block; ++s)
+            {
+                const double x = buffer.getSample (ch, s);
+                assert (std::isfinite (x));
+                energy += x * x;
+                peak = jmax (peak, std::abs (x));
+            }
+    }
+    // Closed tone macros and soft velocities can intentionally be very quiet.
+    if (peak >= .98 || energy <= 1.0e-10)
+        std::printf ("PERFORMANCE FAIL: %s rate=%.0f velocity=%.2f macros=%.1f peak=%.5f energy=%.8g\n",
+                     bw::factoryPresets()[(size_t) index].name, sampleRate, velocity, macro, peak, energy);
+    return peak < .98 && energy > 1.0e-10;
+}
 
 void writeWav (const File& file, const AudioBuffer<float>& audio)
 {
@@ -82,20 +115,63 @@ int main (int argc, char** argv)
     const auto& presets = bw::factoryPresets();
     assert (presets.size() >= 45);
     WaveProcessor p;
+    StringArray names;
     std::printf ("%-22s %-6s %8s %8s %8s %8s\n", "preset", "cat", "peak dB", "rms dB", "bright", "tail dB");
     bool ok = true;
     for (int i = 0; i < (int) presets.size(); ++i)
     {
+        const auto& preset = presets[(size_t) i];
+        assert (String (preset.name).isNotEmpty() && ! names.contains (preset.name));
+        names.add (preset.name);
+        assert (String (preset.category).isNotEmpty() && String (preset.tags).isNotEmpty() && String (preset.description).isNotEmpty());
+        assert (preset.routes.size() <= 16 && preset.curve (0).valid() && preset.curve (1).valid());
+        for (const auto& value : preset.values)
+        {
+            const auto* parameter = p.apvts.getParameter (value.id);
+            assert (parameter != nullptr && std::isfinite (value.value));
+            const auto range = parameter->getNormalisableRange();
+            assert (value.value >= range.start && value.value <= range.end);
+        }
+        for (const auto& route : preset.routes)
+        {
+            assert (route.source > 0 && route.source < bw::kSources);
+            assert (route.destination >= 0 && route.destination < bw::kDestinations);
+            assert (std::isfinite (route.amount) && std::abs (route.amount) <= 1);
+            if (route.destination >= bw::kFirstGlobalDestination && route.destination < bw::kFirstGlobalDestination + bw::kGlobalDestinations)
+                assert (route.source >= 3 && route.source <= 6);
+        }
+        for (int m = 0; m < 4; ++m)
+        {
+            assert (String (preset.macros[(size_t) m]).isNotEmpty());
+            bool routed = false;
+            for (const auto& route : preset.routes) routed |= route.source == m + 3 && route.amount != 0;
+            if (String (preset.category) != "INIT") assert (routed);
+        }
         p.loadFactoryPreset (i);
         // Every preset is reachable and distinct: the state matches exactly this preset.
         assert (p.matchingFactoryPreset() == i);
+        MemoryBlock saved;
+        p.getStateInformation (saved);
+        WaveProcessor restored;
+        restored.setStateInformation (saved.getData(), (int) saved.getSize());
+        assert (restored.matchingFactoryPreset() == i);
         const auto r = play (p);
         const bool loud = db (r.rms) > -36 && db (r.rms) < -10, safe = r.peak < .98, quiet = db (r.tail) < -60;
         std::printf ("%-22s %-6s %8.1f %8.1f %8.3f %8.1f %s\n", presets[(size_t) i].name, presets[(size_t) i].category,
                      db (r.peak), db (r.rms), r.brightness, db (r.tail), loud && safe && quiet ? "" : "<-- FAIL");
         ok = ok && loud && safe && quiet;
         if (out != File())
+        {
             writeWav (out.getChildFile (File::createLegalFileName (String (presets[(size_t) i].category) + " - " + presets[(size_t) i].name + ".wav")), r.audio);
+            const auto file = out.getChildFile (File::createLegalFileName (String (preset.category) + " - " + preset.name + ".bwpreset"));
+            assert (p.savePreset (file) && restored.loadPreset (file));
+            assert (restored.matchingFactoryPreset() == i);
+        }
+        // A bounded sweep covers both simultaneous macro endpoints and three rates/velocities.
+        ok = checkPerformance (i, 44100, .25f, 0) && ok;
+        ok = checkPerformance (i, 48000, 1.0f, 1) && ok;
+        ok = checkPerformance (i, 96000, .65f, .5f) && ok;
+        std::fflush (stdout);
     }
     assert (ok);
 
@@ -125,5 +201,5 @@ int main (int argc, char** argv)
     MemoryBlock state; p.getStateInformation (state);
     WaveProcessor restored; restored.setStateInformation (state.getData(), (int) state.getSize());
     assert (restored.matchingFactoryPreset() == rubber);
-    std::printf ("ok: %d factory presets within loudness, headroom and tail limits; Env 2, macro FX, state\n", (int) presets.size());
+    std::printf ("ok: %d factory presets; metadata, routes, state, three rates/velocities, macro endpoints, loudness, headroom, tails, Env 2 and macro FX\n", (int) presets.size());
 }

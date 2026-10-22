@@ -23,3 +23,25 @@ Audit: 2026-10-17, after the filter/effects/content implementation. This project
 5. **Advanced engines:** separate specifications and validation for sample, granular, spectral and sequencing features.
 
 The [investigation ledger](OSCILLATOR_RESEARCH.md) separates new static evidence from prior context and unresolved algorithms. Further decompilation should target a concrete open question; feature presence alone does not establish a DSP formula.
+
+## Detailed sample-engine gaps (2026-10-19)
+
+The [advanced-engine investigation](ADVANCED_ENGINES_RESEARCH.md) records fresh
+static evidence for Sample, Multisample, Granular and Spectral, including addresses,
+exact named controls and unresolved algorithms. The
+[implementation proposal](../.scratch/advanced-engines/spec.md) decomposes these
+gaps into playable vertical slices with dependencies and numerical acceptance gates.
+Its proposed DSP constants are Borato design choices, not recovered Serum values.
+
+| Engine | Concrete remaining capabilities |
+|---|---|
+| Sample | Stereo, editable root/fine tuning, filtered transposition, independent routing/modulation, separate trim/loop bounds, reverse/pingpong/release-tail loops, saved slices and tempo transport. Extend the existing player. |
+| Multisample | Key/velocity zones with deterministic selection, overlap/crossfade policies, round robin, bounded SFZ import, portable multi-asset state and mapping UI. Exact Serum zone precedence and supported SFZ subset remain unknown. |
+| Granular | Bounded grain pool, independent scan/pitch, density and duration modes, tempo subdivisions, windows/skew, deterministic dispersions, launch policies, keytracking, modulation, display and persistence. Named windows are observed; normalization and random laws remain unverified. |
+| Spectral | Background temporal analysis/resynthesis, identity reconstruction, scan/freeze, independent pitch/time, phase/transient policies, two transform stages, spectral-band filtering, bounded caches, latency and persistence. Existing wavetable FFT/display is not this engine. |
+
+Shared prerequisites include validated decoding, asynchronous import/cancellation,
+aggregate memory accounting, portable assets and lifetime guarantees for old resources
+still referenced by voices. The current short-fade retirement assumption must be
+revisited before long-lived grains/zones. Existing parameter and destination indices
+remain stable. The deferred OSC C decision is not a prerequisite for these modes.

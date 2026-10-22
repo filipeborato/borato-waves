@@ -30,7 +30,7 @@ they are implemented.
 Each step is playable before the next starts.
 
 1. **Done:** wavetable osc (FFT mipmaps, 16 frames) → SVF lowpass → ADSR, 16 voices, vector knobs, WT 3D view, env view.
-2. **Sources done:** 2nd osc + sub + noise, independent pitch/pan, MIDI bend. Wavetable import (`.wav`, 2048-sample frames) remains pending.
+2. **Sources done:** 2nd osc + sub + noise, independent pitch/pan, MIDI bend. Wavetable import and frame/harmonic editing are implemented; see [WAVETABLES.md](WAVETABLES.md).
 3. **Modulation done:** 2 editable LFOs, 16 matrix routes, 4 macros, drag-to-modulate; A/B unison up to 8 lanes. Additional envelopes remain pending.
 4. Filter types (ladder, comb, formant…) + filter response display.
 5. **FX rack done** in fixed order (distortion > chorus > delay > reverb > EQ > compressor), 20 ms crossfaded bypass. Reordering remains pending.
@@ -59,6 +59,11 @@ See [SOURCES.md](SOURCES.md) for source mixing and state compatibility, [OSCILLA
 ## Factory patch content
 
 `FactoryPreset` supports optional custom LFO curves and immutable embedded tables, loaded through the existing control-thread state paths. The Atelier collection adds twelve original patches to the existing bank; see [PRESET_RESEARCH.md](PRESET_RESEARCH.md) for evidence, sound-design choices and validation commands.
+
+The October 2026 bank revision covers all 65 entries, including the FM additions
+and Chorus Silk Pad. See [PRESET_REVISION.md](PRESET_REVISION.md) for each recipe's
+changes. Names and order remain stable; saved full states retain their own values
+and may no longer match a revised factory recipe.
 
 ## Voices and warp
 
