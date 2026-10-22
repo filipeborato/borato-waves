@@ -65,6 +65,7 @@ String Dial::valueText() const
     if (id == "internalBpm") return String (plainValue, 1) + " BPM";
     if (id.endsWith ("Pitch")) return String (plainValue, 1) + " st";
     if (id.endsWith ("Fine")) return String (plainValue, 1) + " ct";
+    if (id == "sampleRoot") return MidiMessage::getMidiNoteName (roundToInt (plainValue), true, true, 4) + " (" + String (roundToInt (plainValue)) + ")";
     if (id == "subOctave") return String (plainValue, 0) + " oct";
     if (id.endsWith ("Pan")) return std::abs (plainValue) < .005f ? "Centre"
         : String (std::abs (plainValue) * 100, 0) + (plainValue < 0 ? " L" : " R");

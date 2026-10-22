@@ -1,9 +1,46 @@
 #include "Rig.h"
-#include <iostream>
-#ifdef _WIN32
+#include "PluginEditor.h"
+#include <atomic>
 #include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <new>
+#ifdef _WIN32
 #include <stdlib.h>
 #endif
+
+namespace
+{
+thread_local bool gCountingAudioHeap = false;
+std::atomic<size_t> gAudioHeapOps { 0 };
+
+struct ScopedAudioHeapGuard
+{
+    ScopedAudioHeapGuard() noexcept { gCountingAudioHeap = true; }
+    ~ScopedAudioHeapGuard() noexcept { gCountingAudioHeap = false; }
+};
+} // namespace
+
+void* operator new (std::size_t size)
+{
+    if (gCountingAudioHeap) gAudioHeapOps.fetch_add (1, std::memory_order_relaxed);
+    if (void* ptr = std::malloc (size == 0 ? 1 : size)) return ptr;
+    throw std::bad_alloc();
+}
+void* operator new[] (std::size_t size)
+{
+    if (gCountingAudioHeap) gAudioHeapOps.fetch_add (1, std::memory_order_relaxed);
+    if (void* ptr = std::malloc (size == 0 ? 1 : size)) return ptr;
+    throw std::bad_alloc();
+}
+void operator delete (void* ptr) noexcept
+{
+    if (ptr != nullptr && gCountingAudioHeap) gAudioHeapOps.fetch_add (1, std::memory_order_relaxed);
+    std::free (ptr);
+}
+void operator delete (void* ptr, std::size_t) noexcept { operator delete (ptr); }
+void operator delete[] (void* ptr) noexcept { operator delete (ptr); }
+void operator delete[] (void* ptr, std::size_t) noexcept { operator delete (ptr); }
 
 namespace
 {
@@ -30,10 +67,68 @@ juce::File writeTone (const juce::String& name, double rate, double seconds, dou
     return file;
 }
 
+// Writes a 32-bit float WAV from an explicit buffer (used to inject NaN/Inf).
+juce::File writeFloatWav (const juce::String& name, double rate, const juce::AudioBuffer<float>& audio)
+{
+    folder.createDirectory();
+    const auto file = folder.getChildFile (name + ".wav");
+    file.deleteFile();
+    std::unique_ptr<juce::OutputStream> stream (file.createOutputStream().release());
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (stream.get(), rate, (unsigned) audio.getNumChannels(), 32, {}, 0));
+    assert (writer != nullptr);
+    stream.release();
+    assert (writer->writeFromAudioSampleBuffer (audio, 0, audio.getNumSamples()));
+    return file;
+}
+
+// Custom reader that simulates an I/O failure mid-read.
+struct FailingReader : juce::AudioFormatReader
+{
+    FailingReader() : juce::AudioFormatReader (nullptr, "Failing")
+    {
+        sampleRate = 44100.0;
+        bitsPerSample = 16;
+        lengthInSamples = 1024;
+        numChannels = 1;
+        usesFloatingPointData = true;
+    }
+    bool readSamples (int* const*, int, int, juce::int64, int) override { return false; }
+};
+
 // The sample source alone.
 void sampleOnly (Rig& rig)
 {
     rig.set ("oscAOn", 0); rig.set ("sampleOn", 1); rig.set ("sampleLevel", .8f);
+}
+
+// Renders numSamples in chunks of blockSize (including a final partial block when numSamples % blockSize != 0)
+// while verifying zero heap allocations/deallocations and finite output inside processBlock.
+std::vector<float> renderChecked (WaveProcessor& processor, juce::MidiBuffer& pendingMidi, int totalSamples, int blockSize)
+{
+    std::vector<float> left;
+    left.reserve ((size_t) totalSamples);
+    juce::AudioBuffer<float> audio (2, blockSize);
+    pendingMidi.ensureSize (256);
+    for (int done = 0; done < totalSamples;)
+    {
+        const int chunk = juce::jmin (blockSize, totalSamples - done);
+        juce::AudioBuffer<float> view (audio.getArrayOfWritePointers(), 2, 0, chunk);
+        const size_t beforeOps = gAudioHeapOps.load (std::memory_order_relaxed);
+        {
+            const ScopedAudioHeapGuard guard;
+            processor.processBlock (view, pendingMidi);
+        }
+        assert (gAudioHeapOps.load (std::memory_order_relaxed) == beforeOps);
+        pendingMidi.clear();
+        for (int i = 0; i < chunk; ++i)
+        {
+            assert (std::isfinite (view.getSample (0, i)) && std::isfinite (view.getSample (1, i)));
+            left.push_back (view.getSample (0, i));
+        }
+        done += chunk;
+    }
+    return left;
 }
 
 void testPlaysAtPitch()
@@ -155,7 +250,22 @@ void testMissingFileKeepsState()
     }
     tone.deleteFile();
     Rig rig;
-    rig.processor.setStateInformation (state.getData(), (int) state.getSize());
+    // Legacy state with only a file path (no embedded container) reports missing when the file is gone.
+    auto legacyXml = juce::AudioProcessor::getXmlFromBinary (state.getData(), (int) state.getSize());
+    assert (legacyXml != nullptr);
+    if (auto* sampleEl = legacyXml->getChildByName ("SAMPLE"))
+    {
+        sampleEl->removeAttribute ("containerVersion");
+        sampleEl->removeAttribute ("channels");
+        sampleEl->removeAttribute ("frames");
+        sampleEl->removeAttribute ("rate");
+        sampleEl->removeAttribute ("pcmBytes");
+        sampleEl->removeAttribute ("hash");
+        sampleEl->removeAttribute ("data");
+    }
+    juce::MemoryBlock legacyState;
+    juce::AudioProcessor::copyXmlToBinary (*legacyXml, legacyState);
+    rig.processor.setStateInformation (legacyState.getData(), (int) legacyState.getSize());
     assert (rig.processor.sample() == nullptr && rig.processor.sampleMissing());
     assert (rig.processor.samplePath() == tone && rig.processor.sampleName() == "vanishing");
     assert (rig.processor.apvts.getRawParameterValue ("sampleOn")->load() == 1);
@@ -168,6 +278,7 @@ void testMissingFileKeepsState()
     writeTone ("vanishing", 44100, 1, 440);
     Rig relinked;
     relinked.processor.setStateInformation (again.getData(), (int) again.getSize());
+    assert (relinked.processor.waitForSampleLoad (5000));
     assert (relinked.processor.sample() != nullptr && ! relinked.processor.sampleMissing());
     relinked.send (on (60));
     assert (rms (relinked.run (.2), 960, 9600) > .05);
@@ -202,7 +313,12 @@ void testLimits()
     Rig rig;
     sampleOnly (rig);
     assert (rig.processor.loadSample (writeTone ("keep", 44100, 1, 440)).isEmpty());
-    // One frame over the memory limit is refused and the loaded sample stays.
+    const auto keptPtr = rig.processor.sample();
+    rig.set ("sampleLoop", 1);
+    rig.send (on (60));
+    assert (rms (rig.run (.05), 0, 1200) > .05);
+
+    // 1. One frame over the per-file frame limit is refused and the loaded sample stays.
     folder.createDirectory();
     const auto huge = folder.getChildFile ("huge.wav");
     {
@@ -217,15 +333,749 @@ void testLimits()
             assert (writer->writeFromAudioSampleBuffer (zeros, 0, juce::jmin (zeros.getNumSamples(), bw::kMaxSampleFrames + 1 - written)));
     }
     assert (rig.processor.loadSample (huge).isNotEmpty());
-    assert (rig.processor.sampleName() == "keep" && rig.processor.sample() != nullptr);
+    assert (rig.processor.sampleName() == "keep" && rig.processor.sample() == keptPtr);
+
+    // 2. Empty file (0 bytes) and non-audio file are refused.
+    const auto emptyFile = folder.getChildFile ("empty.wav");
+    emptyFile.replaceWithData (nullptr, 0);
+    assert (rig.processor.loadSample (emptyFile).isNotEmpty() && rig.processor.sample() == keptPtr);
+
     const auto bogus = folder.getChildFile ("bogus.wav");
     bogus.replaceWithText ("not audio");
-    assert (rig.processor.loadSample (bogus).isNotEmpty() && rig.processor.sampleName() == "keep");
-    // Stereo files mix down to mono.
+    assert (rig.processor.loadSample (bogus).isNotEmpty() && rig.processor.sampleName() == "keep" && rig.processor.sample() == keptPtr);
+
+    // 3. Incomplete read: both a failing AudioFormatReader and a truncated WAV on disk are refused.
+    {
+        FailingReader failing;
+        juce::String readerError;
+        assert (bw::decodeSample (failing, readerError) == nullptr && readerError.isNotEmpty());
+    }
+    const auto validForTruncate = writeTone ("to_truncate", 44100, 0.5, 440);
+    juce::MemoryBlock truncatedBytes;
+    assert (validForTruncate.loadFileAsData (truncatedBytes));
+    const auto truncatedFile = folder.getChildFile ("truncated.wav");
+    assert (truncatedFile.replaceWithData (truncatedBytes.getData(), truncatedBytes.getSize() / 2));
+    assert (rig.processor.loadSample (truncatedFile).isNotEmpty() && rig.processor.sample() == keptPtr);
+
+    // 4. NaN and Inf samples are refused before publishing.
+    {
+        juce::AudioBuffer<float> nanBuf (1, 512);
+        nanBuf.clear();
+        nanBuf.setSample (0, 250, std::numeric_limits<float>::quiet_NaN());
+        const auto nanFile = writeFloatWav ("nan_sample", 44100, nanBuf);
+        assert (rig.processor.loadSample (nanFile).isNotEmpty() && rig.processor.sample() == keptPtr);
+
+        juce::AudioBuffer<float> infBuf (2, 512);
+        infBuf.clear();
+        infBuf.setSample (1, 100, std::numeric_limits<float>::infinity());
+        const auto infFile = writeFloatWav ("inf_sample", 44100, infBuf);
+        assert (rig.processor.loadSample (infFile).isNotEmpty() && rig.processor.sample() == keptPtr);
+    }
+
+    // 5. Channel count above kMaxSampleChannels (e.g. 3 channels) is refused.
+    const auto threeChannels = writeTone ("three_ch", 44100, 0.2, 440, 3);
+    assert (rig.processor.loadSample (threeChannels).isNotEmpty() && rig.processor.sample() == keptPtr);
+
+    // The previous sample is still sounding uninterrupted after all refused loads.
+    assert (rms (rig.run (.05), 0, 1200) > .05);
+
+    // Stereo files mix down to mono (until Ticket 04 adds stereo playback).
     assert (rig.processor.loadSample (writeTone ("stereo", 44100, 1, 440, 2)).isEmpty());
     assert (std::abs (rig.processor.sample()->data[100] - .8f * (float) std::sin (juce::MathConstants<double>::twoPi * 440 * 100 / 44100)) < 1.0e-3f);
 }
+
+void testMemoryBudgetAndUndoEviction()
+{
+    // A max-length mono sample is 2^22 floats = 16 MiB. 16 distinct instances equal the 256 MiB aggregate budget.
+    folder.createDirectory();
+    const auto maxFile = folder.getChildFile ("budget16mb.wav");
+    {
+        maxFile.deleteFile();
+        std::unique_ptr<juce::OutputStream> stream (maxFile.createOutputStream().release());
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (stream.get(), 44100, 1, 16, {}, 0));
+        stream.release();
+        juce::AudioBuffer<float> block (1, 1 << 16);
+        for (int i = 0; i < block.getNumSamples(); ++i) block.setSample (0, i, 0.25f);
+        for (int written = 0; written < bw::kMaxSampleFrames; written += block.getNumSamples())
+            assert (writer->writeFromAudioSampleBuffer (block, 0, block.getNumSamples()));
+    }
+
+    // Part A: when voices settle between loads, old undo steps are evicted so total memory stays <= 256 MiB.
+    {
+        Rig rig;
+        sampleOnly (rig);
+        for (int i = 0; i < 20; ++i)
+        {
+            assert (rig.processor.loadSample (maxFile).isEmpty());
+            rig.run (.02); // voices settle on the new sample; retired is cleared on next check
+            assert (rig.processor.assetMemoryBytes() <= WaveProcessor::kAssetMemoryBudgetBytes);
+        }
+        assert (rig.processor.retiredMemoryBytes() == 0);
+        assert (rig.processor.assetMemoryBytes() <= WaveProcessor::kAssetMemoryBudgetBytes);
+    }
+
+    // Part B: when an active voice retains the initial sample across swaps, retired samples cannot be freed yet.
+    // Loading a 17th 16 MiB sample (272 MiB > 256 MiB) is refused with an explicit budget error message,
+    // keeping the 16th sample active; once the voice finishes its fade, retired memory is reclaimed.
+    {
+        Rig rig (48000);
+        sampleOnly (rig);
+        rig.set ("sampleLoop", 1);
+        rig.processor.setSampleSwapSeconds (2.0f);
+        assert (rig.processor.loadSample (maxFile).isEmpty());
+        std::weak_ptr<const bw::Sample> firstHeld = rig.processor.sample();
+        rig.send (on (60));
+        rig.run (.02); // voice is now playing sample #1
+
+        for (int i = 2; i <= 16; ++i)
+        {
+            assert (rig.processor.loadSample (maxFile).isEmpty());
+            rig.run (.01); // 10 ms per step: the 2 s swap fade on sample #1 is still in progress
+        }
+        assert (! firstHeld.expired());
+        assert (rig.processor.assetMemoryBytes() == WaveProcessor::kAssetMemoryBudgetBytes);
+        const auto sixteenth = rig.processor.sample();
+
+        // 17th load would require 272 MiB of non-evictable memory: refused with a visible budget message.
+        const auto err = rig.processor.loadSample (maxFile);
+        assert (err.contains ("256 MB"));
+        assert (rig.processor.sample() == sixteenth);
+        assert (rig.processor.assetMemoryBytes() == WaveProcessor::kAssetMemoryBudgetBytes);
+
+        // Advance past the 2 s swap retention + the final fade into the 16th sample:
+        // retired memory drops to 0 (while undo history still keeps the 16 samples within the 256 MiB cap).
+        rig.run (4.2);
+        assert (rig.processor.sampleSettled());
+        assert (rig.processor.retiredMemoryBytes() == 0);
+        assert (rig.processor.assetMemoryBytes() == WaveProcessor::kAssetMemoryBudgetBytes);
+
+        // Now a 17th load succeeds by evicting the oldest undo steps referencing sample #1.
+        assert (rig.processor.loadSample (maxFile).isEmpty());
+        assert (firstHeld.expired());
+        assert (rig.processor.assetMemoryBytes() <= WaveProcessor::kAssetMemoryBudgetBytes);
+    }
+    maxFile.deleteFile();
 }
+
+// Stress: 100 replacements while an old reader is artificially retained for 2 s at 96 kHz (> 65536 samples).
+// Verifies no premature free, collection right after final confirmation, ABA undo safety, and zero callback heap ops.
+void testStress100SwapsRetainedReader96kHz()
+{
+    const auto toneA = writeTone ("stressA", 48000, 0.1, 440);
+    const auto toneB = writeTone ("stressB", 48000, 0.1, 550);
+
+    Rig rig (96000.0);
+    rig.processor.prepareToPlay (96000.0, 512);
+    sampleOnly (rig);
+    rig.set ("sampleLoop", 1);
+    rig.processor.setSampleSwapSeconds (2.0f); // 192,000 samples at 96 kHz (nearly 3x the old 65,536-sample timeout)
+
+    assert (rig.processor.loadSample (toneA).isEmpty());
+    std::weak_ptr<const bw::Sample> initialSample = rig.processor.sample();
+
+    // Start 8 voices to exercise polyphonic readers at 96 kHz.
+    juce::MidiBuffer midi;
+    for (int n = 0; n < 8; ++n) midi.addEvent (on (48 + n * 2), 0);
+    renderChecked (rig.processor, midi, 960, 128);
+
+    // Perform 100 replacements over ~1.5 seconds of 96 kHz audio (144,000 samples > 65,536),
+    // cycling block sizes 64, 128, 512 and a partial block of 37 samples.
+    const std::array<int, 4> blockSizes { 64, 128, 512, 37 };
+    for (int swap = 0; swap < 100; ++swap)
+    {
+        assert (rig.processor.loadSample (swap % 2 == 0 ? toneB : toneA).isEmpty());
+        // Exercise ABA undo/redo on one of the swaps (republishing the exact same shared_ptr).
+        if (swap == 50)
+        {
+            assert (rig.processor.undo());
+            assert (rig.processor.redo());
+        }
+        renderChecked (rig.processor, midi, 1440, blockSizes[(size_t) swap % blockSizes.size()]);
+        // After 65,536 samples (~swap 46), the old reader is still inside its 2.0 s retention window:
+        // initialSample MUST still be alive!
+        assert (! initialSample.expired());
+    }
+    assert (! rig.processor.sampleSettled());
+    assert (rig.processor.retiredMemoryBytes() > 0);
+
+    // Finish the remaining 0.55 s of the first 2.0 s retention window: voices then start the second
+    // 2.0 s crossfade to the 100th sample. After both complete, everything settles and is collected.
+    renderChecked (rig.processor, midi, 96000, 512);
+    renderChecked (rig.processor, midi, 160000, 128);
+    assert (rig.processor.sampleSettled());
+    assert (rig.processor.retiredMemoryBytes() == 0);
+    // Step #1's `before` snapshot still holds initialSample at the front of the 100-step undo ring;
+    // one more edit step evicts Step #1 from undo history and frees initialSample completely.
+    assert (rig.processor.loadSample (toneB).isEmpty());
+    renderChecked (rig.processor, midi, 196000, 512);
+    assert (rig.processor.sampleSettled());
+    assert (initialSample.expired());
+    assert (rig.processor.retiredMemoryBytes() == 0);
+
+    // Verify 16-note steal, sustain pedal, mono/legato and all-notes-off release sample references cleanly.
+    rig.processor.setSampleSwapSeconds (0.005f);
+    for (int n = 0; n < 18; ++n) midi.addEvent (on (36 + n), 0); // steals 2 voices
+    midi.addEvent (pedal (true), 0);
+    for (int n = 0; n < 18; ++n) midi.addEvent (off (36 + n), 0);
+    renderChecked (rig.processor, midi, 2048, 64);
+    midi.addEvent (pedal (false), 0);
+    midi.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+    renderChecked (rig.processor, midi, 8192, 128);
+    assert (rig.processor.sampleSettled());
+
+    rig.set ("voiceMode", 2); // Legato
+    rig.set ("glide", 0.05f);
+    midi.addEvent (on (60), 0);
+    renderChecked (rig.processor, midi, 1024, 64);
+    midi.addEvent (on (67), 0);
+    assert (rig.processor.loadSample (toneA).isEmpty());
+    renderChecked (rig.processor, midi, 2048, 64);
+    assert (rig.processor.sampleSettled());
+}
+
+// Controlled slow reader synchronized via WaitableEvents (zero fragile sleeps).
+struct ControlledSlowReader : juce::AudioFormatReader
+{
+    float value;
+    juce::WaitableEvent& entered;
+    juce::WaitableEvent& proceed;
+
+    ControlledSlowReader (float sampleValue, int frames, juce::WaitableEvent& onEnter, juce::WaitableEvent& onProceed)
+        : juce::AudioFormatReader (nullptr, "ControlledSlow"), value (sampleValue), entered (onEnter), proceed (onProceed)
+    {
+        sampleRate = 48000.0;
+        bitsPerSample = 32;
+        lengthInSamples = frames;
+        numChannels = 1;
+        usesFloatingPointData = true;
+    }
+
+    bool readSamples (int* const* destSamples, int numDestChannels, int startOffsetInDestBuffer,
+                      juce::int64 startSampleInFile, int numSamples) override
+    {
+        if (startSampleInFile == 0)
+        {
+            entered.signal();
+            proceed.wait (5000);
+        }
+        for (int ch = 0; ch < numDestChannels; ++ch)
+            if (auto* dst = reinterpret_cast<float*> (destSamples[ch]))
+                for (int i = 0; i < numSamples; ++i)
+                    dst[startOffsetInDestBuffer + i] = value;
+        return true;
+    }
+};
+
+// Ticket 02: Background loading, progress, cooperative cancellation, out-of-order completion,
+// external legacy state restore indicator, editor/processor teardown during active job, and request spam cap.
+void testBackgroundLoadCancelAndOutOfOrder()
+{
+    const auto initialTone = writeTone ("bg_initial", 48000, 0.2, 440);
+    const auto fileA = folder.getChildFile ("bg_A.wav");
+    const auto fileB = folder.getChildFile ("bg_B.wav");
+    const auto fileC = folder.getChildFile ("bg_C.wav");
+
+    Rig rig (48000.0);
+    sampleOnly (rig);
+    rig.set ("sampleLoop", 1);
+    assert (rig.processor.loadSample (initialTone).isEmpty());
+    const auto initialPtr = rig.processor.sample();
+    rig.send (on (60));
+    assert (rms (rig.run (0.05), 0, 1200) > 0.05);
+
+    // 1. Start A, start B, cancel A, finish B first and A second (out of order): only B may publish.
+    juce::WaitableEvent enteredA (true), proceedA (true), enteredB (true), proceedB (true);
+    const uint64_t idA = rig.processor.startSampleLoad (fileA, [&] (const juce::File&)
+    {
+        return std::make_unique<ControlledSlowReader> (0.25f, 8192, enteredA, proceedA);
+    });
+    assert (enteredA.wait (5000));
+    assert (rig.processor.sampleLoading());
+    // While A is blocked in the background, the previous sample keeps playing on the audio thread.
+    assert (rig.processor.sample() == initialPtr);
+    assert (rms (rig.run (0.02), 0, 480) > 0.05);
+
+    const uint64_t idB = rig.processor.startSampleLoad (fileB, [&] (const juce::File&)
+    {
+        return std::make_unique<ControlledSlowReader> (0.75f, 8192, enteredB, proceedB);
+    });
+    assert (idB > idA);
+    assert (enteredB.wait (5000));
+    rig.processor.cancelSampleLoad (idA);
+
+    // Let B finish first while A is still stalled.
+    proceedB.signal();
+    // Wait until B publishes (sampleRevision increments and sample() changes from initialPtr).
+    for (int tries = 0; tries < 500 && rig.processor.sample() == initialPtr; ++tries)
+        juce::Thread::yield();
+    // Now release A so it finishes AFTER B (out-of-order completion).
+    proceedA.signal();
+    assert (rig.processor.waitForSampleLoad (5000));
+    assert (! rig.processor.sampleLoading());
+    assert (rig.processor.sample() != nullptr);
+    assert (std::abs (rig.processor.sample()->data[0] - 0.75f) < 1.0e-6f);
+    assert (rig.processor.samplePath() == fileB);
+    const auto activeBPtr = rig.processor.sample();
+
+    // 2. Cancelling the current in-flight job leaves B active and untouched.
+    juce::WaitableEvent enteredC (true), proceedC (true);
+    const uint64_t idC = rig.processor.startSampleLoad (fileC, [&] (const juce::File&)
+    {
+        return std::make_unique<ControlledSlowReader> (0.5f, 16384, enteredC, proceedC);
+    });
+    assert (enteredC.wait (5000));
+    rig.processor.cancelSampleLoad (idC);
+    assert (! rig.processor.sampleLoading());
+    proceedC.signal();
+    assert (rig.processor.waitForSampleLoad (5000));
+    assert (rig.processor.sample() == activeBPtr);
+    assert (rig.processor.samplePath() == fileB);
+
+    // 3. Restoring a legacy external path uses the background loader and exposes loading state.
+    {
+        juce::MemoryBlock stateBlock;
+        rig.processor.getStateInformation (stateBlock);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (stateBlock.getData(), (int) stateBlock.getSize());
+        assert (xml != nullptr);
+        if (auto* sampleEl = xml->getChildByName ("SAMPLE"))
+        {
+            sampleEl->removeAttribute ("containerVersion");
+            sampleEl->removeAttribute ("channels");
+            sampleEl->removeAttribute ("frames");
+            sampleEl->removeAttribute ("rate");
+            sampleEl->removeAttribute ("pcmBytes");
+            sampleEl->removeAttribute ("hash");
+            sampleEl->removeAttribute ("data");
+            sampleEl->setAttribute ("path", initialTone.getFullPathName());
+        }
+        juce::MemoryBlock legacyState;
+        juce::AudioProcessor::copyXmlToBinary (*xml, legacyState);
+
+        juce::WaitableEvent restoreEntered (true), restoreProceed (true);
+        Rig restoredRig;
+        restoredRig.processor.setRestoreReaderFactory ([&] (const juce::File&)
+        {
+            return std::make_unique<ControlledSlowReader> (0.6f, 8192, restoreEntered, restoreProceed);
+        });
+        restoredRig.processor.setStateInformation (legacyState.getData(), (int) legacyState.getSize());
+        assert (restoreEntered.wait (5000));
+        assert (restoredRig.processor.sampleLoading());
+        assert (! restoredRig.processor.sampleMissing());
+        restoreProceed.signal();
+        assert (restoredRig.processor.waitForSampleLoad (5000));
+        assert (! restoredRig.processor.sampleLoading());
+        assert (restoredRig.processor.sample() != nullptr);
+        assert (std::abs (restoredRig.processor.sample()->data[0] - 0.6f) < 1.0e-6f);
+    }
+
+    // 4. Closing the editor and destroying the processor while a background job is running is safe.
+    {
+        juce::WaitableEvent teardownEntered (true), teardownProceed (true);
+        auto proc = std::make_unique<WaveProcessor>();
+        auto ed = std::make_unique<WaveEditor> (*proc);
+        proc->startSampleLoad (fileA, [&] (const juce::File&)
+        {
+            return std::make_unique<ControlledSlowReader> (0.4f, 32768, teardownEntered, teardownProceed);
+        });
+        assert (teardownEntered.wait (5000));
+        ed.reset(); // close editor while job is running
+        teardownProceed.signal();
+        proc.reset(); // destroy processor while job is finishing
+    }
+
+    // 5. Spamming 40 load requests stays bounded in memory and publishes only the last request.
+    for (int i = 1; i <= 40; ++i)
+    {
+        const float targetVal = 0.01f * (float) i;
+        rig.processor.startSampleLoad (folder.getChildFile ("spam_" + juce::String (i) + ".wav"), [targetVal] (const juce::File&)
+        {
+            struct FastValueReader : juce::AudioFormatReader
+            {
+                float v;
+                FastValueReader (float val) : juce::AudioFormatReader (nullptr, "Fast"), v (val)
+                {
+                    sampleRate = 48000.0; bitsPerSample = 32; lengthInSamples = 4096; numChannels = 1; usesFloatingPointData = true;
+                }
+                bool readSamples (int* const* dst, int chs, int off, juce::int64, int n) override
+                {
+                    for (int c = 0; c < chs; ++c)
+                        if (auto* p = reinterpret_cast<float*> (dst[c]))
+                            for (int s = 0; s < n; ++s) p[off + s] = v;
+                    return true;
+                }
+            };
+            return std::make_unique<FastValueReader> (targetVal);
+        });
+    }
+    assert (rig.processor.waitForSampleLoad (5000));
+    assert (rig.processor.sample() != nullptr);
+    assert (std::abs (rig.processor.sample()->data[0] - 0.40f) < 1.0e-6f);
+    assert (rig.processor.assetMemoryBytes() <= WaveProcessor::kAssetMemoryBudgetBytes);
+}
+
+// Helper to write a stereo WAV with distinct Left and Right frequencies.
+juce::File writeStereoTone (const juce::String& name, double rate, double seconds, double hzL, double hzR)
+{
+    folder.createDirectory();
+    const auto file = folder.getChildFile (name + ".wav");
+    file.deleteFile();
+    const int length = (int) (rate * seconds);
+    juce::AudioBuffer<float> audio (2, length);
+    for (int i = 0; i < length; ++i)
+    {
+        audio.setSample (0, i, 0.8f * (float) std::sin (juce::MathConstants<double>::twoPi * hzL * i / rate));
+        audio.setSample (1, i, 0.8f * (float) std::sin (juce::MathConstants<double>::twoPi * hzR * i / rate));
+    }
+    std::unique_ptr<juce::OutputStream> stream (file.createOutputStream().release());
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (stream.get(), rate, 2, 32, {}, 0));
+    assert (writer != nullptr);
+    stream.release();
+    assert (writer->writeFromAudioSampleBuffer (audio, 0, length));
+    return file;
+}
+
+// Ticket 03: Portable sample container export/import, deleted original file resilience,
+// corruption/truncation/hash/oversize rejection without state loss, and relinkSample with undo/redo.
+void testPortableContainerAndRelink()
+{
+    const auto sourceWav = writeStereoTone ("portable_src", 48000, 0.25, 440.0, 660.0);
+    const auto presetDirA = folder.getChildFile ("presets_a");
+    const auto presetDirB = folder.getChildFile ("presets_b");
+    presetDirA.createDirectory();
+    presetDirB.createDirectory();
+    const auto presetFileA = presetDirA.getChildFile ("PortablePatch.bwpreset");
+    const auto presetFileB = presetDirB.getChildFile ("MovedPortablePatch.bwpreset");
+
+    uint64_t expectedHash = 0;
+    std::vector<float> expectedL, expectedR;
+    juce::MemoryBlock hostState;
+    {
+        Rig src (48000.0);
+        sampleOnly (src);
+        src.set ("sampleStart", 0.12f);
+        src.set ("sampleEnd", 0.88f);
+        src.set ("sampleLoop", 1.0f);
+        src.set ("sampleLevel", 0.77f);
+        src.set ("samplePitch", 3.0f);
+        src.set ("sampleRoot", 64.0f);
+        src.set ("samplePan", -0.25f);
+        src.set ("sampleRoute", 2.0f); // Direct
+        assert (src.processor.loadSample (sourceWav).isEmpty());
+        const auto s = src.processor.sample();
+        assert (s != nullptr && s->isStereo() && s->contentHash != 0);
+        expectedHash = s->contentHash;
+        expectedL = s->data;
+        expectedR = s->right;
+
+        assert (src.processor.savePreset (presetFileA));
+        src.processor.getStateInformation (hostState);
+    }
+
+    // Move the preset to another folder and delete the original WAV completely.
+    assert (presetFileA.moveFileTo (presetFileB));
+    assert (! presetFileA.existsAsFile() && presetFileB.existsAsFile());
+    assert (sourceWav.deleteFile() && ! sourceWav.existsAsFile());
+
+    // Re-import from the moved preset file and from host binary state: PCM, hash, and params must match bit-for-bit.
+    for (int mode = 0; mode < 2; ++mode)
+    {
+        Rig dst (48000.0);
+        if (mode == 0)
+            assert (dst.processor.loadPreset (presetFileB));
+        else
+            dst.processor.setStateInformation (hostState.getData(), (int) hostState.getSize());
+
+        const auto restored = dst.processor.sample();
+        assert (restored != nullptr && ! dst.processor.sampleMissing());
+        assert (restored->isStereo() && restored->numChannels() == 2);
+        assert (restored->numFrames() == expectedL.size());
+        assert (restored->rate == 48000.0);
+        assert (restored->contentHash == expectedHash);
+        assert (restored->data == expectedL);
+        assert (restored->right == expectedR);
+        auto paramVal = [&] (const char* id) { return dst.processor.apvts.getRawParameterValue (id)->load(); };
+        assert (std::abs (paramVal ("sampleStart") - 0.12f) < 1.0e-5f);
+        assert (std::abs (paramVal ("sampleEnd") - 0.88f) < 1.0e-5f);
+        assert (std::abs (paramVal ("sampleLoop") - 1.0f) < 1.0e-5f);
+        assert (std::abs (paramVal ("sampleLevel") - 0.77f) < 1.0e-5f);
+        assert (std::abs (paramVal ("samplePitch") - 3.0f) < 1.0e-5f);
+        assert (std::abs (paramVal ("sampleRoot") - 64.0f) < 1.0e-5f);
+        assert (std::abs (paramVal ("samplePan") - -0.25f) < 1.0e-5f);
+        assert (std::abs (paramVal ("sampleRoute") - 2.0f) < 1.0e-5f);
+    }
+
+    // Reject corrupted/malicious containers without losing the currently loaded sample or parameters.
+    Rig guarded (48000.0);
+    assert (guarded.processor.loadPreset (presetFileB));
+    const auto goodSample = guarded.processor.sample();
+    assert (goodSample != nullptr);
+
+    auto testCorruptedPreset = [&] (const juce::String& label, std::function<void (juce::XmlElement&)> mutate)
+    {
+        auto xml = juce::parseXML (presetFileB);
+        assert (xml != nullptr);
+        auto* sampleEl = xml->getChildByName ("SAMPLE");
+        assert (sampleEl != nullptr);
+        mutate (*sampleEl);
+        const auto badFile = presetDirB.getChildFile ("corrupt_" + label + ".bwpreset");
+        assert (xml->writeTo (badFile));
+        assert (! guarded.processor.loadPreset (badFile));
+        assert (guarded.processor.sampleLoadError().isNotEmpty());
+        assert (guarded.processor.sample() == goodSample);
+        assert (std::abs (guarded.processor.apvts.getRawParameterValue ("sampleRoot")->load() - 64.0f) < 1.0e-5f);
+    };
+
+    // 1. Truncated Base64 payload
+    testCorruptedPreset ("truncated", [] (juce::XmlElement& el)
+    {
+        const auto data = el.getStringAttribute ("data");
+        el.setAttribute ("data", data.substring (0, data.length() / 2));
+    });
+    // 2. False declared pcmBytes
+    testCorruptedPreset ("bad_size", [] (juce::XmlElement& el)
+    {
+        el.setAttribute ("pcmBytes", el.getIntAttribute ("pcmBytes") + 16);
+    });
+    // 3. Invalid content hash
+    testCorruptedPreset ("bad_hash", [] (juce::XmlElement& el)
+    {
+        el.setAttribute ("hash", "0000000000000000");
+    });
+    // 4. Unsupported containerVersion
+    testCorruptedPreset ("bad_version", [] (juce::XmlElement& el)
+    {
+        el.setAttribute ("containerVersion", 99);
+    });
+    // 5. Oversized declared payload (> 256 MiB) rejected before allocation
+    testCorruptedPreset ("oversize", [] (juce::XmlElement& el)
+    {
+        el.setAttribute ("pcmBytes", "300000000");
+    });
+
+    // Legacy missing reference + relinkSample + undo/redo preserving sample parameters.
+    const auto missingLegacyPath = folder.getChildFile ("legacy_gone.wav");
+    missingLegacyPath.deleteFile();
+    {
+        auto xml = juce::parseXML (presetFileB);
+        assert (xml != nullptr);
+        if (auto* sampleEl = xml->getChildByName ("SAMPLE"))
+        {
+            sampleEl->removeAllAttributes();
+            sampleEl->setAttribute ("path", missingLegacyPath.getFullPathName());
+        }
+        const auto legacyPreset = presetDirB.getChildFile ("legacy_missing.bwpreset");
+        assert (xml->writeTo (legacyPreset));
+        assert (guarded.processor.loadPreset (legacyPreset));
+        assert (guarded.processor.sample() == nullptr && guarded.processor.sampleMissing());
+        assert (guarded.processor.samplePath() == missingLegacyPath);
+
+        const auto replacementWav = writeStereoTone ("relinked_stereo", 48000, 0.2, 550.0, 880.0);
+        assert (guarded.processor.relinkSample (replacementWav).isEmpty());
+        assert (guarded.processor.sample() != nullptr && ! guarded.processor.sampleMissing());
+        assert (guarded.processor.samplePath() == replacementWav);
+        assert (guarded.processor.undoName() == "SAMPLE RELINK");
+        // Sample parameters remain preserved across relink.
+        assert (std::abs (guarded.processor.apvts.getRawParameterValue ("sampleRoot")->load() - 64.0f) < 1.0e-5f);
+        assert (std::abs (guarded.processor.apvts.getRawParameterValue ("samplePan")->load() - -0.25f) < 1.0e-5f);
+
+        // Undo reverts to the missing state; Redo restores the relinked sample.
+        assert (guarded.processor.undo());
+        assert (guarded.processor.sample() == nullptr && guarded.processor.sampleMissing());
+        assert (guarded.processor.samplePath() == missingLegacyPath);
+        assert (guarded.processor.redo());
+        assert (guarded.processor.sample() != nullptr && ! guarded.processor.sampleMissing());
+        assert (guarded.processor.samplePath() == replacementWav);
+    }
+}
+
+// Renders stereo output (Left and Right vectors) from Rig.
+std::pair<std::vector<float>, std::vector<float>> runStereo (Rig& rig, double seconds)
+{
+    const int total = (int) (seconds * rig.rate);
+    std::vector<float> left, right;
+    left.reserve ((size_t) total);
+    right.reserve ((size_t) total);
+    juce::AudioBuffer<float> audio (2, Rig::kBlock);
+    for (int done = 0; done < total; done += Rig::kBlock)
+    {
+        rig.processor.processBlock (audio, rig.pending);
+        rig.pending.clear();
+        for (int i = 0; i < Rig::kBlock; ++i)
+        {
+            left.push_back (audio.getSample (0, i));
+            right.push_back (audio.getSample (1, i));
+        }
+    }
+    return { std::move (left), std::move (right) };
+}
+
+// High-precision frequency estimation using interpolated zero-crossings for < 1 cent accuracy.
+double preciseFrequency (const std::vector<float>& x, size_t from, size_t to, double rate)
+{
+    double firstCross = -1.0, lastCross = -1.0;
+    int cycles = 0;
+    for (size_t i = from + 1; i < to && i < x.size(); ++i)
+    {
+        if (x[i - 1] <= 0.0f && x[i] > 0.0f)
+        {
+            const double frac = (double) (-x[i - 1]) / (double) (x[i] - x[i - 1]);
+            const double pos = (double) (i - 1) + frac;
+            if (firstCross < 0.0) firstCross = pos;
+            else { lastCross = pos; ++cycles; }
+        }
+    }
+    return cycles > 0 && lastCross > firstCross ? (double) cycles * rate / (lastCross - firstCross) : 0.0;
+}
+
+// Ticket 04: Stereo L/R preservation, sampleRoot (< 1 cent error), one-shot duration (< 1 sample error),
+// pan extremes, mono bus downmix, Filter 1 / Filter 2 / Direct routing, and 2x stereo memory accounting.
+void testStereoRootPanAndRouting()
+{
+    const double rate = 48000.0;
+    const auto stereoWav = writeStereoTone ("stereo_440_660", rate, 2.0, 440.0, 660.0);
+
+    // 1. Stereo channel preservation (L = 440 Hz, R = 660 Hz) and 2x memory accounting.
+    {
+        Rig rig (rate);
+        sampleOnly (rig);
+        rig.set ("sampleRoute", 2.0f); // Direct (no filter coloration)
+        assert (rig.processor.loadSample (stereoWav).isEmpty());
+        const auto s = rig.processor.sample();
+        assert (s != nullptr && s->isStereo() && s->numChannels() == 2);
+        assert (s->bytes() == 2 * s->numFrames() * sizeof (float));
+
+        rig.send (on (60));
+        const auto [left, right] = runStereo (rig, 0.5);
+        const double freqL = preciseFrequency (left, 2400, left.size() - 1200, rate);
+        const double freqR = preciseFrequency (right, 2400, right.size() - 1200, rate);
+        const double centsL = std::abs (1200.0 * std::log2 (freqL / 440.0));
+        const double centsR = std::abs (1200.0 * std::log2 (freqR / 660.0));
+        assert (centsL < 1.0);
+        assert (centsR < 1.0);
+    }
+
+    // 2. Root note tuning accuracy (< 1 cent error when sampleRoot = 69).
+    {
+        Rig rig (rate);
+        sampleOnly (rig);
+        rig.set ("sampleRoute", 2.0f);
+        rig.set ("sampleRoot", 69.0f); // A4 is the sample's native pitch
+        assert (rig.processor.loadSample (stereoWav).isEmpty());
+
+        // Playing note 69 plays the file at unity pitch (440 Hz on L, 660 Hz on R).
+        rig.send (on (69));
+        const auto [left69, right69] = runStereo (rig, 0.6);
+        const double freq69 = preciseFrequency (left69, 2400, left69.size() - 1200, rate);
+        assert (std::abs (1200.0 * std::log2 (freq69 / 440.0)) < 1.0);
+        rig.send (off (69));
+        rig.run (0.25);
+
+        // Playing note 60 (9 semitones below root 69) transposes by -900 cents within < 1 cent.
+        rig.send (on (60));
+        const auto [left60, right60] = runStereo (rig, 0.6);
+        const double expectedHz = 440.0 * std::exp2 (-9.0 / 12.0);
+        const double freq60 = preciseFrequency (left60, 2400, left60.size() - 1200, rate);
+        assert (std::abs (1200.0 * std::log2 (freq60 / expectedHz)) < 1.0);
+    }
+
+    // 3. Non-looping one-shot duration accuracy (< 1 sample error, accounting for the end fade).
+    {
+        bw::Sample oneShot;
+        oneShot.rate = rate;
+        oneShot.data.assign (4800, 0.5f);
+        oneShot.right.assign (4800, -0.5f);
+        const auto reg = oneShot.region (0.0f, 1.0f);
+        bw::SamplePlayer player;
+        player.reset (reg);
+        int activeSamples = 0;
+        const int fadeFrames = (int) (rate * 0.01);
+        while (! player.finished && activeSamples < 10000)
+        {
+            const auto [l, r] = player.nextStereo (oneShot, reg, false, 1.0);
+            if (! player.finished)
+            {
+                if (activeSamples < 4800 - fadeFrames)
+                    assert (std::abs (l - 0.5f) < 1.0e-6f && std::abs (r - -0.5f) < 1.0e-6f);
+                ++activeSamples;
+            }
+        }
+        // Exact frame count rendered before finished is 4800 (error == 0 samples < 1 sample).
+        assert (activeSamples == 4800);
+    }
+
+    // 4. Pan extremes (-1 = hard left, +1 = hard right) and mono bus downmix.
+    {
+        Rig rig (rate);
+        sampleOnly (rig);
+        rig.set ("sampleRoute", 2.0f);
+        assert (rig.processor.loadSample (stereoWav).isEmpty());
+
+        rig.set ("samplePan", -1.0f);
+        rig.send (on (60));
+        const auto [hardL_L, hardL_R] = runStereo (rig, 0.25);
+        assert (rms (hardL_L, 2400, hardL_L.size()) > 0.05);
+        assert (rms (hardL_R, 2400, hardL_R.size()) < 1.0e-6);
+        rig.send (off (60));
+        rig.run (0.2);
+
+        rig.set ("samplePan", 1.0f);
+        rig.send (on (60));
+        const auto [hardR_L, hardR_R] = runStereo (rig, 0.25);
+        assert (rms (hardR_L, 2400, hardR_L.size()) < 1.0e-6);
+        assert (rms (hardR_R, 2400, hardR_R.size()) > 0.05);
+        rig.send (off (60));
+        rig.run (0.2);
+
+        // Mono output bus downmix (1-channel buffer passed to processBlock).
+        rig.set ("samplePan", 0.0f);
+        juce::AudioBuffer<float> monoBus (1, 512);
+        juce::MidiBuffer midi;
+        midi.addEvent (on (60), 0);
+        rig.processor.processBlock (monoBus, midi);
+        midi.clear();
+        rig.processor.processBlock (monoBus, midi);
+        assert (monoBus.getRMSLevel (0, 0, 512) > 0.02f);
+    }
+
+    // 5. Sample routing: Filter 1 vs Filter 2 vs Direct.
+    {
+        const auto highTone = writeTone ("high6k", rate, 0.5, 6000.0);
+        Rig rig (rate);
+        sampleOnly (rig);
+        assert (rig.processor.loadSample (highTone).isEmpty());
+        // Filter 1: low-pass at 250 Hz (attenuates 6 kHz heavily).
+        // Filter 2: enabled in parallel, high-pass at 2000 Hz (passes 6 kHz).
+        rig.set ("filterType", 0.0f); // Low 12
+        rig.set ("cutoff", 250.0f);
+        rig.set ("filter2On", 1.0f);
+        rig.set ("filter2Type", 2.0f); // High 12
+        rig.set ("cutoff2", 2000.0f);
+        rig.set ("filterRouting", 1.0f); // Parallel
+
+        rig.set ("sampleRoute", 0.0f); // Filter 1
+        rig.send (on (60));
+        const double rmsF1 = rms (rig.run (0.2), 2400, 9600);
+        rig.send (off (60));
+        rig.run (0.2);
+
+        rig.set ("sampleRoute", 1.0f); // Filter 2
+        rig.send (on (60));
+        const double rmsF2 = rms (rig.run (0.2), 2400, 9600);
+        rig.send (off (60));
+        rig.run (0.2);
+
+        rig.set ("sampleRoute", 2.0f); // Direct
+        rig.send (on (60));
+        const double rmsDirect = rms (rig.run (0.2), 2400, 9600);
+
+        assert (rmsF1 < 0.005);
+        assert (rmsF2 > 0.04 && rmsF2 > 10.0 * rmsF1);
+        assert (rmsDirect > 0.04 && rmsDirect > 10.0 * rmsF1);
+    }
+}
+} // namespace
 
 int main()
 {
@@ -243,7 +1093,13 @@ int main()
     testMissingFileKeepsState();
     testLegacyStateAndPresets();
     testLimits();
+    testMemoryBudgetAndUndoEviction();
+    testStress100SwapsRetainedReader96kHz();
+    testBackgroundLoadCancelAndOutOfOrder();
+    testPortableContainerAndRelink();
+    testStereoRootPanAndRouting();
     folder.deleteRecursively();
     std::cout << "ok: sample pitch at 44.1/48/96 kHz, seamless loop, one-shot fade, automation, live swap and release, "
-                 "missing file, legacy state, factory reset, memory limit\n";
+                 "missing file, legacy state, factory reset, validation/256 MB budget, 100-swap 96 kHz stress, "
+                 "background load/cancel/out-of-order, portable container/relink, stereo/root/pan/routing and zero callback allocs\n";
 }

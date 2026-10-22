@@ -134,6 +134,9 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     l.add (std::make_unique<P> (juce::ParameterID { "compAttack", 1 }, "Comp Attack", R (0.1f, 100, 0, 0.3f), 10.0f));
     l.add (std::make_unique<P> (juce::ParameterID { "compRelease", 1 }, "Comp Release", R (10, 1000, 0, 0.4f), 150.0f));
     continuous ("compMakeup", "Comp Makeup", 0, 24, 0);
+    l.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "sampleRoot", 1 }, "Sample Root Note", 0, 127, bw::kSampleRootNote));
+    continuous ("samplePan", "Sample Pan", -1, 1, 0);
+    choice ("sampleRoute", routeNames ());
     return l;
 }
 
@@ -146,13 +149,14 @@ void WaveVoice::prepare (double sampleRate, int blockSize)
     env2.reset ();
     clearCurrentNote ();
     juce::ignoreUnused (blockSize);
-    residualLength = juce::jmax (1, juce::roundToInt (sampleRate * 0.005));
+    residualLength = swapLength = juce::jmax (1, juce::roundToInt (sampleRate * 0.005));
     residualLeft = 0; lastOut = residual = {};
     for (auto& f : filters) f.reset ();
     for (auto* smoother : { &cutoff, &resonance, &subAmplitude, &subPitch, &noiseAmplitude, &bend, &subEnabled, &noiseEnabled, &cutoff2, &resonance2, &filter2Enabled, &fmDepth,
-                           &sampleAmplitude, &sampleEnabled, &samplePitch })
+                           &sampleAmplitude, &sampleEnabled, &samplePitch, &samplePan })
         smoother->reset (sampleRate, 0.02);
     playingSample = fadingSample = nullptr; swapLeft = 0;
+    cachedSampleRoot = -1; cachedSampleSemitones = cachedSamplePan = 10000; sampleLeftGain = sampleRightGain = 1;
     glideOffset.setCurrentAndTargetValue (0); pendingGlide = 0;
     for (size_t i = 0; i < sources.size (); ++i)
     {
@@ -183,6 +187,7 @@ void WaveVoice::updateTargets (bool reset)
     set (sampleAmplitude, params.sampleLevel->load ());
     set (sampleEnabled, params.sampleOn->load () >= .5f ? 1.0f : 0.0f);
     set (samplePitch, params.samplePitch->load ());
+    set (samplePan, params.samplePan->load ());
     filters[0].setMode (juce::roundToInt (params.filterType->load ()));
     filters[1].setMode (juce::roundToInt (params.filter2Type->load ()));
     for (size_t i = 0; i < sources.size (); ++i)
@@ -295,6 +300,7 @@ void WaveVoice::stopNote (float, bool allowTailOff)
         const float fade = (float) residualLeft / (float) residualLength;
         for (size_t ch = 0; ch < 2; ++ch) residual[ch] = lastOut[ch] + residual[ch] * fade;
         residualLeft = residualLength; lastOut = {};
+        playingSample = fadingSample = nullptr; swapLeft = 0;
         adsr.reset ();
         env2.reset ();
         clearCurrentNote ();
@@ -361,12 +367,15 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
     const bool displayVoice = modulation.latestVoice.load (std::memory_order_relaxed) == voiceId;
     auto routeOf = [] (std::atomic<float>* r) { return (size_t) juce::jlimit (0, 2, juce::roundToInt (r->load ())); };
     const std::array<size_t, 2> sourceRoutes { routeOf (params.oscillators[0].route), routeOf (params.oscillators[1].route) };
-    const size_t subRoute = routeOf (params.subRoute), noiseRoute = routeOf (params.noiseRoute);
+    const size_t subRoute = routeOf (params.subRoute), noiseRoute = routeOf (params.noiseRoute), sampleRoute = routeOf (params.sampleRoute);
+    const int sampleRoot = juce::jlimit (0, 127, juce::roundToInt (params.sampleRoot->load ()));
     const bool serial = params.filterRouting->load () < .5f, sampleLoop = params.sampleLoop->load () >= .5f;
     const float regionStart = params.sampleStart->load (), regionEnd = params.sampleEnd->load ();
     if (params.sample != playingSample && swapLeft == 0) // a second swap waits for the first fade
     {
-        fadingSample = playingSample; fadingPlayer = player; swapLeft = residualLength;
+        fadingSample = playingSample; fadingPlayer = player;
+        swapLength = juce::jmax (1, juce::roundToInt (sampleRate * params.sampleSwapSeconds));
+        swapLeft = swapLength;
         playingSample = params.sample;
         if (playingSample != nullptr) player.reset (playingSample->region (regionStart, regionEnd));
     }
@@ -494,26 +503,38 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         noiseState ^= noiseState << 13; noiseState ^= noiseState >> 17; noiseState ^= noiseState << 5;
         const float noiseLevel = effective (15, noiseAmplitude.getNextValue ()) * noiseEnabled.getNextValue ();
         const float noise = ((float)(noiseState>>8)/8388608.0f-1)*noiseLevel;
-        // The sample source feeds Filter 1. While its level is zero it pauses rather than reading.
+        // The sample source routes to Filter 1, Filter 2 or Direct. While its level is zero it pauses rather than reading.
         const float sampleGain = sampleAmplitude.getNextValue () * sampleEnabled.getNextValue ();
         const float sampleSemitones = samplePitch.getNextValue () + pitchBend;
+        const float currentSamplePan = juce::jlimit (-1.0f, 1.0f, samplePan.getNextValue ());
         if ((sampleGain != 0 || swapLeft > 0) && (playingSample != nullptr || fadingSample != nullptr))
         {
-            if (sampleSemitones != cachedSampleSemitones)
+            if (sampleSemitones != cachedSampleSemitones || sampleRoot != cachedSampleRoot)
             {
                 cachedSampleSemitones = sampleSemitones;
-                sampleRatio = fundamental / juce::MidiMessage::getMidiNoteInHertz (bw::kSampleRootNote) * std::exp2 (sampleSemitones / 12.0) / sampleRate;
+                cachedSampleRoot = sampleRoot;
+                sampleRatio = fundamental / juce::MidiMessage::getMidiNoteInHertz (sampleRoot) * std::exp2 (sampleSemitones / 12.0) / sampleRate;
+            }
+            if (currentSamplePan != cachedSamplePan)
+            {
+                cachedSamplePan = currentSamplePan;
+                const float angle = (currentSamplePan + 1.0f) * juce::MathConstants<float>::pi * 0.25f;
+                sampleLeftGain = std::cos (angle) * juce::MathConstants<float>::sqrt2;
+                sampleRightGain = std::sin (angle) * juce::MathConstants<float>::sqrt2;
             }
             auto play = [&] (bw::SamplePlayer& head, const bw::Sample& source)
-            { return head.next (source, source.region (regionStart, regionEnd), sampleLoop, sampleRatio * source.rate); };
-            float sampled = playingSample != nullptr ? play (player, *playingSample) : 0.0f;
+            { return head.nextStereo (source, source.region (regionStart, regionEnd), sampleLoop, sampleRatio * source.rate); };
+            auto [sampledL, sampledR] = playingSample != nullptr ? play (player, *playingSample) : std::pair<float, float> { 0.0f, 0.0f };
             if (swapLeft > 0)
             {
-                const float t = (float) swapLeft / (float) residualLength;
-                sampled = sampled * (1 - t) + (fadingSample != nullptr ? play (fadingPlayer, *fadingSample) * t : 0.0f);
+                const float t = (float) swapLeft / (float) swapLength;
+                const auto [fadeL, fadeR] = fadingSample != nullptr ? play (fadingPlayer, *fadingSample) : std::pair<float, float> { 0.0f, 0.0f };
+                sampledL = sampledL * (1.0f - t) + fadeL * t;
+                sampledR = sampledR * (1.0f - t) + fadeR * t;
                 if (--swapLeft == 0) fadingSample = nullptr;
             }
-            busL[0] += sampled * sampleGain; busR[0] += sampled * sampleGain;
+            busL[sampleRoute] += sampledL * sampleGain * sampleLeftGain;
+            busR[sampleRoute] += sampledR * sampleGain * sampleRightGain;
         }
         busL[subRoute] += sub; busR[subRoute] += sub;
         busL[noiseRoute] += noise; busR[noiseRoute] += noise;
@@ -532,7 +553,7 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
             lastOut = { voiceOut (0, busL[0], busL[1], busL[2])*envelope, voiceOut (1, busR[0], busR[1], busR[2])*envelope };
             out.addSample (0, start+i, lastOut[0]); out.addSample (1, start+i, lastOut[1]);
         }
-        if (! adsr.isActive ()) { clearCurrentNote (); break; }
+        if (! adsr.isActive ()) { playingSample = fadingSample = nullptr; swapLeft = 0; clearCurrentNote (); break; }
     }
 }
 
@@ -548,7 +569,7 @@ WaveProcessor::WaveProcessor ()
         p ("subOn"), p ("subLevel"), p ("subOctave"), p ("noiseOn"), p ("noiseLevel"),
         p ("filterType"), p ("filter2On"), p ("filter2Type"), p ("cutoff2"), p ("reso2"), p ("filterRouting"), p ("subRoute"), p ("noiseRoute"),
         p ("env2Attack"), p ("env2Decay"), p ("env2Sustain"), p ("env2Release"), p ("fmDepth"),
-        p ("sampleOn"), p ("sampleLevel"), p ("samplePitch"), p ("sampleStart"), p ("sampleEnd"), p ("sampleLoop") };
+        p ("sampleOn"), p ("sampleLevel"), p ("samplePitch"), p ("sampleStart"), p ("sampleEnd"), p ("sampleLoop"), p ("sampleRoot"), p ("samplePan"), p ("sampleRoute") };
     effectParams = { p ("distOn"), p ("distMode"), p ("distDrive"), p ("distMix"),
         p ("delayOn"), p ("delayTime"), p ("delaySync"), p ("delayDivision"), p ("delayFeedback"), p ("delayPingPong"), p ("delayMix"),
         p ("reverbOn"), p ("reverbSize"), p ("reverbDamping"), p ("reverbWidth"), p ("reverbMix"),
@@ -603,6 +624,17 @@ WaveProcessor::WaveProcessor ()
     synth.addSound (new WaveSound ());
     for (int i = 0; i < 16; ++i)
         synth.addVoice (new WaveVoice (wavetableBank, params, modulation, i));
+    sampleLoadIdleEvent.signal ();
+}
+
+WaveProcessor::~WaveProcessor ()
+{
+    shuttingDown.store (true, std::memory_order_release);
+    const uint64_t id = latestSampleLoadId.fetch_add (1, std::memory_order_acq_rel) + 1;
+    cancelledUpToLoadId.store (id, std::memory_order_release);
+    sampleLoadPool.removeAllJobs (true, 10000);
+    for (auto* parameter : getParameters ())
+        parameter->removeListener (this);
 }
 
 void WaveProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -639,6 +671,7 @@ void WaveProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     for (size_t i = 0; i < userSlots.size (); ++i)
         params.userTables[i] = userSlots[i].acquire (buffer.getNumSamples ());
     params.sample = sampleSlot.acquire (buffer.getNumSamples ());
+    params.sampleSwapSeconds = sampleSwapSeconds.load (std::memory_order_relaxed);
     double bpm = internalBpm->load ();
     double ppq = 0; bool hasPpq = false, playing = true;
     if (auto* hostPlayHead = getPlayHead ())
@@ -810,33 +843,140 @@ double WaveProcessor::getTailLengthSeconds () const
     return effectParams.delayOn->load () >= .5f || effectParams.reverbOn->load () >= .5f ? 10.0 : 0.0;
 }
 
+namespace
+{
+struct UniqueAssetBytes
+{
+    std::vector<const void*> seen;
+    size_t bytes = 0;
+
+    template <typename T>
+    void add (const T* item)
+    {
+        if (item == nullptr) return;
+        if (std::find (seen.begin (), seen.end (), static_cast<const void*> (item)) != seen.end ()) return;
+        seen.push_back (item);
+        bytes += item->bytes ();
+    }
+    template <typename T>
+    void add (const std::shared_ptr<const T>& item) { add (item.get ()); }
+};
+} // namespace
+
+void WaveProcessor::collectAssetsLocked ()
+{
+    for (auto& slot : userSlots) slot.collect ();
+    sampleSlot.collect ();
+}
+
+size_t WaveProcessor::nonEvictableAssetBytesLocked (const bw::Wavetable* nextTable, const bw::Sample* nextSample) const
+{
+    UniqueAssetBytes set;
+    for (const auto& slot : userSlots)
+    {
+        set.add (slot.get ());
+        for (const auto& r : slot.retiredItems ()) set.add (r);
+    }
+    set.add (sampleSlot.get ());
+    for (const auto& r : sampleSlot.retiredItems ()) set.add (r);
+    set.add (nextTable);
+    set.add (nextSample);
+    return set.bytes + pendingSampleJobBytes;
+}
+
+size_t WaveProcessor::totalAssetBytesLocked (const bw::Wavetable* nextTable, const bw::Sample* nextSample) const
+{
+    UniqueAssetBytes set;
+    for (const auto& slot : userSlots)
+    {
+        set.add (slot.get ());
+        for (const auto& r : slot.retiredItems ()) set.add (r);
+    }
+    set.add (sampleSlot.get ());
+    for (const auto& r : sampleSlot.retiredItems ()) set.add (r);
+    set.add (nextTable);
+    set.add (nextSample);
+    auto addSnapshot = [&] (const Snapshot& s)
+    {
+        for (const auto& t : s.tables) set.add (t);
+        set.add (s.sample);
+    };
+    if (editDepth > 0) addSnapshot (editStart);
+    for (const auto& step : history)
+    {
+        addSnapshot (step.before);
+        addSnapshot (step.after);
+    }
+    return set.bytes + pendingSampleJobBytes;
+}
+
+void WaveProcessor::evictHistoryForBudgetLocked (const bw::Wavetable* nextTable, const bw::Sample* nextSample)
+{
+    while (! history.empty () && (history.size () > kHistorySteps || totalAssetBytesLocked (nextTable, nextSample) > kHistoryBytes))
+    {
+        history.erase (history.begin ());
+        if (historyIndex > 0) --historyIndex;
+    }
+    if (editDepth > 0 && totalAssetBytesLocked (nextTable, nextSample) > kHistoryBytes)
+    {
+        editStart.sample.reset ();
+        editStart.tables = {};
+    }
+}
+
+size_t WaveProcessor::assetMemoryBytes ()
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    collectAssetsLocked ();
+    return totalAssetBytesLocked ();
+}
+
+size_t WaveProcessor::retiredMemoryBytes ()
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    collectAssetsLocked ();
+    UniqueAssetBytes set;
+    for (const auto& slot : userSlots)
+        for (const auto& r : slot.retiredItems ()) set.add (r);
+    for (const auto& r : sampleSlot.retiredItems ()) set.add (r);
+    return set.bytes;
+}
+
 juce::String WaveProcessor::importWavetable (int oscillator, const juce::File& file)
 {
     juce::String error;
     const auto cycles = bw::loadCycles (file, error);
     if (cycles.empty ()) return error;
-    publishCycles (oscillator, cycles, file.getFileNameWithoutExtension ());
-    return {};
+    return publishCycles (oscillator, cycles, file.getFileNameWithoutExtension ());
 }
 juce::String WaveProcessor::importTuned (int oscillator, const bw::TunedSource& source, double period, const juce::String& name)
 {
     const auto cycles = bw::cyclesFromPeriod (source.mono, period);
     if (cycles.empty ()) return "The period is longer than the audio";
-    publishCycles (oscillator, cycles, name);
-    return {};
+    return publishCycles (oscillator, cycles, name);
 }
-void WaveProcessor::publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name)
+juce::String WaveProcessor::publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name)
 {
     // ponytail: built on the calling thread (~tens of ms for 256 frames); move to a worker if imports stall the UI.
     auto table = std::make_shared<bw::Wavetable> ();
     table->setFrames (cycles);
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        collectAssetsLocked ();
+        if (nonEvictableAssetBytesLocked (table.get (), nullptr) > kHistoryBytes)
+            return "Wavetable exceeds 256 MB memory budget";
+        evictHistoryForBudgetLocked (table.get (), nullptr);
+    }
     setUserTable (oscillator, std::move (table), name);
+    return {};
 }
 void WaveProcessor::setUserTable (int oscillator, std::shared_ptr<const bw::Wavetable> table, const juce::String& name)
 {
     const ScopedEdit edit (*this);
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
+        collectAssetsLocked ();
+        evictHistoryForBudgetLocked (table.get (), nullptr);
         const auto index = (size_t) juce::jlimit (0, 1, oscillator);
         userTableNames[index] = table != nullptr ? name.substring (0, 64) : juce::String ();
         userSlots[index].publish (std::move (table));
@@ -866,16 +1006,293 @@ juce::String WaveProcessor::loadSample (const juce::File& file)
 {
     juce::String error;
     auto loaded = bw::loadSample (file, error);
-    if (loaded == nullptr) return error;
+    if (loaded == nullptr)
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        lastSampleLoadError = error;
+        return error;
+    }
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        collectAssetsLocked ();
+        if (nonEvictableAssetBytesLocked (nullptr, loaded.get ()) > kHistoryBytes)
+        {
+            lastSampleLoadError = "Sample exceeds 256 MB memory budget";
+            return lastSampleLoadError;
+        }
+        evictHistoryForBudgetLocked (nullptr, loaded.get ());
+    }
     publishSample (std::move (loaded), file);
     return {};
 }
-void WaveProcessor::clearSample () { publishSample (nullptr, {}); }
-void WaveProcessor::publishSample (std::shared_ptr<const bw::Sample> loaded, const juce::File& path)
+
+juce::String WaveProcessor::relinkSample (const juce::File& file)
 {
-    const ScopedEdit edit (*this);
+    juce::String error;
+    auto loaded = bw::loadSample (file, error);
+    if (loaded == nullptr)
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
+        lastSampleLoadError = error;
+        return error;
+    }
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        collectAssetsLocked ();
+        if (nonEvictableAssetBytesLocked (nullptr, loaded.get ()) > kHistoryBytes)
+        {
+            lastSampleLoadError = "Sample exceeds 256 MB memory budget";
+            return lastSampleLoadError;
+        }
+        evictHistoryForBudgetLocked (nullptr, loaded.get ());
+    }
+    publishSample (std::move (loaded), file, "SAMPLE RELINK");
+    return {};
+}
+
+bool WaveProcessor::isRequestCancelledLocked (uint64_t requestId) const noexcept
+{
+    if (shuttingDown.load (std::memory_order_acquire)) return true;
+    if (requestId < latestSampleLoadId.load (std::memory_order_acquire)) return true;
+    if (requestId <= cancelledUpToLoadId.load (std::memory_order_acquire)) return true;
+    if (requestId == specificCancelledLoadId.load (std::memory_order_acquire)) return true;
+    return false;
+}
+
+uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory)
+{
+    const uint64_t requestId = latestSampleLoadId.fetch_add (1, std::memory_order_acq_rel) + 1;
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        lastSampleLoadError.clear ();
+        sampleLoadProgressValue.store (0.0f, std::memory_order_relaxed);
+        sampleLoadingFlag.store (true, std::memory_order_release);
+    }
+    // Drop queued jobs that have not started yet so rapid request bursts remain bounded.
+    sampleLoadPool.removeAllJobs (false, 0);
+
+    struct LoadJob final : juce::ThreadPoolJob
+    {
+        WaveProcessor& processor;
+        uint64_t requestId;
+        juce::File file;
+        SampleReaderFactory readerFactory;
+
+        LoadJob (WaveProcessor& p, uint64_t id, const juce::File& f, SampleReaderFactory rf)
+            : juce::ThreadPoolJob ("SampleLoad"), processor (p), requestId (id), file (f), readerFactory (std::move (rf))
+        {
+            processor.activeSampleJobs.fetch_add (1, std::memory_order_acq_rel);
+            processor.sampleLoadIdleEvent.reset ();
+        }
+
+        ~LoadJob () override
+        {
+            if (processor.activeSampleJobs.fetch_sub (1, std::memory_order_acq_rel) == 1)
+                processor.sampleLoadIdleEvent.signal ();
+        }
+
+        JobStatus runJob () override
+        {
+            auto shouldCancel = [this] () noexcept -> bool
+            {
+                return shouldExit () || processor.isRequestCancelledLocked (requestId);
+            };
+
+            if (shouldCancel ())
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample load cancelled");
+                return jobHasFinished;
+            }
+
+            std::unique_ptr<juce::AudioFormatReader> reader;
+            if (readerFactory)
+            {
+                reader = readerFactory (file);
+            }
+            else if (file != juce::File ())
+            {
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats ();
+                reader.reset (formats.createReaderFor (file));
+            }
+
+            if (reader == nullptr)
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, "Could not read the audio file");
+                return jobHasFinished;
+            }
+            if (reader->sampleRate <= 0.0 || ! std::isfinite (reader->sampleRate))
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample has an invalid sample rate");
+                return jobHasFinished;
+            }
+            if (reader->numChannels == 0 || reader->numChannels > bw::kMaxSampleChannels)
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample has an unsupported channel count");
+                return jobHasFinished;
+            }
+            if (reader->lengthInSamples <= 0)
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample is empty");
+                return jobHasFinished;
+            }
+            if ((uint64_t) reader->lengthInSamples > (uint64_t) bw::kMaxSampleFrames)
+            {
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample exceeds 60 seconds");
+                return jobHasFinished;
+            }
+
+            const size_t channels = reader->numChannels >= 2 ? 2u : 1u;
+            const size_t reservationBytes = (size_t) reader->lengthInSamples * channels * sizeof (float);
+            {
+                std::lock_guard<std::mutex> lock (processor.extraStateMutex);
+                if (processor.isRequestCancelledLocked (requestId))
+                {
+                    processor.completeSampleLoad (requestId, nullptr, file, "Sample load cancelled");
+                    return jobHasFinished;
+                }
+                processor.collectAssetsLocked ();
+                if (processor.nonEvictableAssetBytesLocked () + reservationBytes > WaveProcessor::kHistoryBytes)
+                {
+                    processor.completeSampleLoad (requestId, nullptr, file, "Sample exceeds 256 MB memory budget");
+                    return jobHasFinished;
+                }
+                processor.pendingSampleJobBytes += reservationBytes;
+            }
+
+            struct ScopedReservation
+            {
+                WaveProcessor& p;
+                size_t bytes;
+                ~ScopedReservation ()
+                {
+                    std::lock_guard<std::mutex> lock (p.extraStateMutex);
+                    p.pendingSampleJobBytes -= bytes;
+                }
+            };
+
+            juce::String error;
+            std::shared_ptr<const bw::Sample> loaded;
+            {
+                const ScopedReservation reservation { processor, reservationBytes };
+                loaded = bw::decodeSample (*reader, error, -1,
+                    shouldCancel,
+                    [this] (float progress)
+                    {
+                        if (! processor.isRequestCancelledLocked (requestId)
+                            && requestId == processor.latestSampleLoadId.load (std::memory_order_acquire))
+                        {
+                            processor.sampleLoadProgressValue.store (progress, std::memory_order_relaxed);
+                        }
+                    },
+                    reservationBytes);
+            }
+
+            processor.completeSampleLoad (requestId, std::move (loaded), file, error);
+            return jobHasFinished;
+        }
+    };
+
+    sampleLoadPool.addJob (new LoadJob (*this, requestId, file, std::move (readerFactory)), true);
+    return requestId;
+}
+
+void WaveProcessor::cancelSampleLoad (uint64_t requestId)
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    const uint64_t latest = latestSampleLoadId.load (std::memory_order_acquire);
+    if (requestId == 0 || requestId == latest)
+    {
+        cancelledUpToLoadId.store (latest, std::memory_order_release);
+        sampleLoadingFlag.store (false, std::memory_order_release);
+        sampleLoadProgressValue.store (0.0f, std::memory_order_relaxed);
+    }
+    else
+    {
+        specificCancelledLoadId.store (requestId, std::memory_order_release);
+    }
+}
+
+bool WaveProcessor::waitForSampleLoad (int timeoutMs)
+{
+    return sampleLoadIdleEvent.wait (timeoutMs);
+}
+
+juce::String WaveProcessor::sampleLoadError () const
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    return lastSampleLoadError;
+}
+
+void WaveProcessor::setRestoreReaderFactory (SampleReaderFactory factory)
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    restoreReaderFactory = std::move (factory);
+}
+
+bool WaveProcessor::completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample> loaded, const juce::File& path, const juce::String& error)
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    const bool isLatest = (requestId == latestSampleLoadId.load (std::memory_order_acquire));
+    if (isRequestCancelledLocked (requestId))
+    {
+        if (isLatest)
+        {
+            sampleLoadingFlag.store (false, std::memory_order_release);
+            sampleLoadProgressValue.store (0.0f, std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    if (loaded == nullptr)
+    {
+        lastSampleLoadError = error.isNotEmpty () ? error : juce::String ("Could not read the audio file");
+        if (isLatest)
+        {
+            sampleLoadingFlag.store (false, std::memory_order_release);
+            sampleLoadProgressValue.store (0.0f, std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    collectAssetsLocked ();
+    if (nonEvictableAssetBytesLocked (nullptr, loaded.get ()) > kHistoryBytes)
+    {
+        lastSampleLoadError = "Sample exceeds 256 MB memory budget";
+        if (isLatest)
+        {
+            sampleLoadingFlag.store (false, std::memory_order_release);
+            sampleLoadProgressValue.store (0.0f, std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    evictHistoryForBudgetLocked (nullptr, loaded.get ());
+    sampleFile = path;
+    sampleSlot.publish (std::move (loaded));
+    sampleRevision.fetch_add (1, std::memory_order_relaxed);
+    lastSampleLoadError.clear ();
+    if (isLatest)
+    {
+        sampleLoadProgressValue.store (1.0f, std::memory_order_relaxed);
+        sampleLoadingFlag.store (false, std::memory_order_release);
+    }
+    return true;
+}
+
+void WaveProcessor::clearSample () { publishSample (nullptr, {}); }
+void WaveProcessor::publishSample (std::shared_ptr<const bw::Sample> loaded, const juce::File& path, const juce::String& editStepName)
+{
+    const ScopedEdit edit (*this, editStepName);
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        const uint64_t id = latestSampleLoadId.fetch_add (1, std::memory_order_acq_rel) + 1;
+        cancelledUpToLoadId.store (id, std::memory_order_release);
+        sampleLoadingFlag.store (false, std::memory_order_release);
+        sampleLoadProgressValue.store (0.0f, std::memory_order_relaxed);
+        lastSampleLoadError.clear ();
+        collectAssetsLocked ();
+        evictHistoryForBudgetLocked (nullptr, loaded.get ());
         sampleFile = path;
         sampleSlot.publish (std::move (loaded));
         sampleRevision.fetch_add (1, std::memory_order_relaxed);
@@ -887,6 +1304,12 @@ std::shared_ptr<const bw::Sample> WaveProcessor::sample () const
     std::lock_guard<std::mutex> lock (extraStateMutex);
     return sampleSlot.get ();
 }
+bool WaveProcessor::sampleSettled ()
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    sampleSlot.collect ();
+    return sampleSlot.idle ();
+}
 juce::File WaveProcessor::samplePath () const
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
@@ -895,7 +1318,7 @@ juce::File WaveProcessor::samplePath () const
 bool WaveProcessor::sampleMissing () const
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
-    return sampleFile != juce::File () && sampleSlot.get () == nullptr;
+    return ! sampleLoadingFlag.load (std::memory_order_acquire) && sampleFile != juce::File () && sampleSlot.get () == nullptr;
 }
 
 void WaveProcessor::loadFactoryPreset (int index)
@@ -928,7 +1351,7 @@ static bool sameCurve (const bw::LfoCurve& a, const bw::LfoCurve& b)
 }
 int WaveProcessor::matchingFactoryPreset () const
 {
-    if (samplePath () != juce::File ()) return -1; // factory presets carry no sample
+    if (sample () != nullptr || samplePath () != juce::File () || sampleLoading ()) return -1; // factory presets carry no sample
     const auto& parameters = getParameters ();
     std::array<bw::LfoCurve, 2> curves { getLfoCurve (0), getLfoCurve (1) };
     std::array<juce::String, 4> macros { getMacroName (0), getMacroName (1), getMacroName (2), getMacroName (3) };
@@ -963,9 +1386,19 @@ juce::File WaveProcessor::presetDirectory ()
 }
 bool WaveProcessor::savePreset (const juce::File& file)
 {
+    if (! file.getParentDirectory ().createDirectory ()) return false;
     const auto xml = createStateXml ();
+    if (xml == nullptr) return false;
     xml->setAttribute ("presetCategory", "USER");
-    return file.getParentDirectory ().createDirectory () && xml->writeTo (file);
+    juce::TemporaryFile temp (file);
+    {
+        std::unique_ptr<juce::FileOutputStream> stream (temp.getFile ().createOutputStream ());
+        if (stream == nullptr || ! stream->openedOk ()) return false;
+        xml->writeTo (*stream);
+        stream->flush ();
+        if (stream->getStatus ().failed ()) return false;
+    }
+    return temp.overwriteTargetFileWithTemporary ();
 }
 bool WaveProcessor::loadPreset (const juce::File& file)
 {
@@ -973,8 +1406,8 @@ bool WaveProcessor::loadPreset (const juce::File& file)
     if (xml == nullptr || ! xml->hasTagName (apvts.state.getType ().toString ())
         || xml->getIntAttribute ("formatVersion", 1) > kStateVersion) return false;
     const ScopedEdit edit (*this, "PRESET " + file.getFileNameWithoutExtension ().toUpperCase ());
+    if (! restoreState (*xml)) return false;
     std::fill (touched.begin (), touched.end (), true); // the state replaces every parameter, without gestures
-    restoreState (*xml);
     return true;
 }
 
@@ -1016,6 +1449,7 @@ void WaveProcessor::endEdit ()
     // Wheel ticks and arrow steps are a gesture each: on the same control within half a second, they extend the last step.
     const auto now = juce::Time::getMillisecondCounter ();
     if (historyIndex == (int) history.size () && historyIndex > 0 && now - lastStepTime < 500
+        && before.sample == after.sample && before.tables == after.tables
         && history.back ().name == step.name && history.back ().parameters == step.parameters && changes.size () == 1)
     {
         history.back ().after = std::move (step.after);
@@ -1025,20 +1459,10 @@ void WaveProcessor::endEdit ()
     lastStepTime = now;
     history.resize ((size_t) historyIndex);
     history.push_back (std::move (step));
-    const auto bytes = [this]
-    {
-        size_t total = 0; // the tables and samples each step introduced
-        for (const auto& s : history)
-        {
-            for (size_t t = 0; t < 2; ++t)
-                if (s.after.tables[t] != nullptr && s.after.tables[t] != s.before.tables[t]) total += s.after.tables[t]->data.size () * sizeof (float);
-            if (s.after.sample != nullptr && s.after.sample != s.before.sample) total += s.after.sample->data.size () * sizeof (float);
-        }
-        return total;
-    };
-    while (history.size () > 1 && (history.size () > kHistorySteps || bytes () > kHistoryBytes))
-        history.erase (history.begin ());
     historyIndex = (int) history.size ();
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    collectAssetsLocked ();
+    evictHistoryForBudgetLocked ();
 }
 bool WaveProcessor::undo ()
 {
@@ -1097,6 +1521,8 @@ std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
     state.setProperty ("formatVersion", kStateVersion, nullptr);
     juce::ValueTree extra ("MODULATION"); extra.setProperty ("version", 1, nullptr);
     juce::ValueTree tables ("USERTABLES");
+    std::shared_ptr<const bw::Sample> currentSample;
+    juce::File currentSamplePath;
     {
         std::lock_guard<std::mutex> lock (extraStateMutex);
         for (int i = 0; i < 2; ++i)
@@ -1119,24 +1545,53 @@ std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
                 entry.setProperty ("frames", table->numFrames, nullptr); entry.setProperty ("data", samples.toBase64Encoding (), nullptr);
                 tables.addChild (entry, -1, nullptr);
             }
+        currentSample = sampleSlot.get ();
+        currentSamplePath = sampleFile;
     }
     state.addChild (extra, -1, nullptr);
     state.addChild (tables, -1, nullptr);
-    if (const auto path = samplePath (); path != juce::File ())
-    {
-        juce::ValueTree reference ("SAMPLE");
-        reference.setProperty ("path", path.getFullPathName (), nullptr);
-        state.addChild (reference, -1, nullptr);
-    }
+    if (currentSample != nullptr || currentSamplePath != juce::File ())
+        state.addChild (bw::serializeSampleContainer (currentSample.get (), currentSamplePath), -1, nullptr);
     return state.createXml ();
 }
 void WaveProcessor::getStateInformation (juce::MemoryBlock& dest)
 {
     if (auto xml = createStateXml ()) copyXmlToBinary (*xml, dest);
 }
-void WaveProcessor::restoreState (const juce::XmlElement& xml)
+bool WaveProcessor::restoreState (const juce::XmlElement& xml)
 {
     auto state = juce::ValueTree::fromXml (xml);
+    if (! state.isValid ()) return false;
+
+    const auto sampleTree = state.getChildWithName ("SAMPLE");
+    std::shared_ptr<const bw::Sample> embeddedSample;
+    juce::File parsedSamplePath;
+    bool hasSampleContainer = false;
+    {
+        juce::String error;
+        if (! bw::deserializeSampleContainer (sampleTree, embeddedSample, parsedSamplePath, hasSampleContainer, error, kHistoryBytes))
+        {
+            std::lock_guard<std::mutex> lock (extraStateMutex);
+            lastSampleLoadError = error;
+            return false;
+        }
+        if (hasSampleContainer && embeddedSample != nullptr)
+        {
+            std::lock_guard<std::mutex> lock (extraStateMutex);
+            collectAssetsLocked ();
+            UniqueAssetBytes retiredSet;
+            for (const auto& slot : userSlots)
+                for (const auto& r : slot.retiredItems ()) retiredSet.add (r);
+            for (const auto& r : sampleSlot.retiredItems ()) retiredSet.add (r);
+            retiredSet.add (embeddedSample);
+            if (retiredSet.bytes + pendingSampleJobBytes > kHistoryBytes)
+            {
+                lastSampleLoadError = "Sample exceeds 256 MB memory budget";
+                return false;
+            }
+        }
+    }
+
     for (auto* parameter : getParameters ())
         if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (parameter))
             if (! state.getChildWithProperty ("id", ranged->paramID).isValid ())
@@ -1186,27 +1641,47 @@ void WaveProcessor::restoreState (const juce::XmlElement& xml)
         }
         setUserTable (i, std::move (table), entry.getProperty ("name").toString ());
     }
-    // A missing or unreadable file keeps its reference, so saving again does not lose it.
-    if (const auto path = state.getChildWithName ("SAMPLE").getProperty ("path").toString (); juce::File::isAbsolutePath (path))
+
+    if (hasSampleContainer)
     {
-        juce::String error;
-        publishSample (bw::loadSample (juce::File (path), error), juce::File (path));
+        publishSample (std::move (embeddedSample), parsedSamplePath);
     }
-    else clearSample ();
+    else if (parsedSamplePath != juce::File ())
+    {
+        // A missing or unreadable file keeps its reference, so saving again does not lose it.
+        SampleReaderFactory factoryCopy;
+        {
+            std::lock_guard<std::mutex> lock (extraStateMutex);
+            factoryCopy = restoreReaderFactory;
+        }
+        publishSample (nullptr, parsedSamplePath);
+        if (factoryCopy != nullptr || parsedSamplePath.existsAsFile ())
+            startSampleLoad (parsedSamplePath, std::move (factoryCopy));
+    }
+    else
+    {
+        clearSample ();
+    }
+
     for (auto name : { "MODULATION", "USERTABLES", "SAMPLE" })
         if (const auto child = state.getChildWithName (name); child.isValid ()) state.removeChild (child, nullptr);
     apvts.replaceState (state);
+    return true;
 }
 void WaveProcessor::setStateInformation (const void* data, int size)
 {
     if (auto xml = getXmlFromBinary (data, size); xml && xml->hasTagName (apvts.state.getType ()))
     {
+        bool ok = false;
         {
             const juce::ScopedValueSetter<bool> quiet (replaying, true);
-            restoreState (*xml);
+            ok = restoreState (*xml);
         }
-        history.clear (); // a new project or patch from the host
-        historyIndex = 0;
+        if (ok)
+        {
+            history.clear (); // a new project or patch from the host
+            historyIndex = 0;
+        }
     }
 }
 

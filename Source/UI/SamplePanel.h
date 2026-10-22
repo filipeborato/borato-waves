@@ -4,24 +4,27 @@
 
 namespace bw::ui
 {
-// The sample source: file, start/end/loop, level and pitch, with an overview of the region.
+// The sample source: file, start/end/loop, level, pitch, root, pan and route, with an overview of the region.
 class SamplePanel : public juce::Component, private juce::Timer
 {
 public:
     explicit SamplePanel (WaveProcessor&);
     void paint (juce::Graphics&) override;
-    void resized() override;
+    void resized () override;
 private:
-    void timerCallback() override;
-    void choose();
+    void timerCallback () override;
+    void choose (bool isRelink = false);
     WaveProcessor& processor;
-    Action load, clear;
+    Action load, relink, cancel, clear;
     ParameterToggle enabled, loop;
-    Dial level, pitch, start, end;
+    ParameterChoice route;
+    Dial level, pitch, root, pan, start, end;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::String status;
-    std::vector<float> overview; // peak per column of the loaded sample
+    std::vector<float> overview, overviewRight; // peak per column of the loaded sample (L/mono and R)
     unsigned revision = ~0u;
-    std::array<float, 3> shown {};
+    bool wasLoading = false, wasMissing = false;
+    float lastProgress = -1.0f;
+    std::array<float, 4> shown {};
 };
 }

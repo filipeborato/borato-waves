@@ -21,10 +21,11 @@ struct SynthParams
     std::atomic<float> *subOn, *subLevel, *subOctave, *noiseOn, *noiseLevel;
     std::atomic<float> *filterType, *filter2On, *filter2Type, *cutoff2, *reso2, *filterRouting, *subRoute, *noiseRoute;
     std::atomic<float> *env2Attack, *env2Decay, *env2Sustain, *env2Release, *fmDepth;
-    std::atomic<float> *sampleOn, *sampleLevel, *samplePitch, *sampleStart, *sampleEnd, *sampleLoop;
+    std::atomic<float> *sampleOn, *sampleLevel, *samplePitch, *sampleStart, *sampleEnd, *sampleLoop, *sampleRoot, *samplePan, *sampleRoute;
     // Written by the audio thread at block start; null when no user table or sample is loaded.
     std::array<const bw::Wavetable*, 2> userTables {};
     const bw::Sample* sample = nullptr;
+    float sampleSwapSeconds = 0.005f;
 };
 
 inline juce::StringArray routeNames() { return { "Filter 1", "Filter 2", "Direct" }; }
@@ -53,7 +54,7 @@ public:
     void legato (int note, float glideSeconds);
     // After a block: whether this voice reads only the current user table / sample.
     bool settled (size_t oscillator) const { return ! isVoiceActive () || oscillators[oscillator].settled (); }
-    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && playingSample == params.sample); }
+    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && fadingSample == nullptr && playingSample == params.sample); }
 
 private:
     void glideTo (int note, float seconds);
@@ -119,13 +120,13 @@ private:
     int noteNumber = 69;
     float pendingGlide = 0;
     int residualLeft = 0, residualLength = 240;
-    // A replaced sample fades out over residualLength while the new one fades in from its start.
-    juce::SmoothedValue<float> sampleAmplitude, sampleEnabled, samplePitch;
+    // A replaced sample fades out over swapLength while the new one fades in from its start.
+    juce::SmoothedValue<float> sampleAmplitude, sampleEnabled, samplePitch, samplePan;
     const bw::Sample* playingSample = nullptr;
     const bw::Sample* fadingSample = nullptr;
     bw::SamplePlayer player, fadingPlayer;
-    int swapLeft = 0;
-    float cachedSampleSemitones = 10000;
+    int swapLeft = 0, swapLength = 240, cachedSampleRoot = -1;
+    float cachedSampleSemitones = 10000, cachedSamplePan = 10000, sampleLeftGain = 1, sampleRightGain = 1;
     double sampleRatio = 1;
 };
 
@@ -155,6 +156,7 @@ class WaveProcessor : public juce::AudioProcessor, private juce::AudioProcessorP
 {
 public:
     WaveProcessor ();
+    ~WaveProcessor () override;
 
     void prepareToPlay (double sampleRate, int blockSize) override;
     void releaseResources () override;
@@ -209,14 +211,35 @@ public:
     std::atomic<unsigned> tableRevision { 0 };
 
     // The sample source keeps a file reference. A missing or unreadable file keeps the reference (and the
-    // state that names it) but plays nothing. loadSample decodes on the calling (non-audio) thread.
+    // state that names it) but plays nothing. loadSample decodes on the calling (non-audio) thread;
+    // startSampleLoad runs on a bounded background worker with progress and cooperative cancellation.
+    using SampleReaderFactory = std::function<std::unique_ptr<juce::AudioFormatReader> (const juce::File&)>;
+    static constexpr size_t kMaxPendingSampleJobs = 2;
     juce::String loadSample (const juce::File& file);
+    juce::String relinkSample (const juce::File& file);
+    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {});
+    void cancelSampleLoad (uint64_t requestId = 0);
+    bool waitForSampleLoad (int timeoutMs = 5000);
+    bool sampleLoading () const noexcept { return sampleLoadingFlag.load (std::memory_order_acquire); }
+    float sampleLoadProgress () const noexcept { return sampleLoadProgressValue.load (std::memory_order_relaxed); }
+    juce::String sampleLoadError () const;
+    void setRestoreReaderFactory (SampleReaderFactory factory);
     void clearSample ();
     std::shared_ptr<const bw::Sample> sample () const;
+    bool sampleSettled ();
     juce::File samplePath () const;
     juce::String sampleName () const { return samplePath ().getFileNameWithoutExtension (); }
     bool sampleMissing () const;
     std::atomic<unsigned> sampleRevision { 0 };
+    void setSampleSwapSeconds (float seconds) noexcept { sampleSwapSeconds.store (juce::jmax (0.001f, seconds), std::memory_order_relaxed); }
+
+    // Aggregate asset memory budget (256 MiB across active assets, retired assets awaiting voices, and undo history).
+    // Policy: loading a new asset first collects settled retired items, then evicts oldest undo steps if needed;
+    // if active + uncollected retired + candidate still exceeds kAssetMemoryBudgetBytes, the load is refused and
+    // the previous asset stays active.
+    static constexpr size_t kAssetMemoryBudgetBytes = bw::kMaxAssetMemoryBytes;
+    size_t assetMemoryBytes ();
+    size_t retiredMemoryBytes ();
 
     // Preset files hold the same XML as host state; newer format versions are refused.
     static constexpr int kStateVersion = 1;
@@ -265,7 +288,7 @@ private:
     Snapshot capture () const;
     void restore (const Snapshot&, const std::vector<bool>& parameters);
     // ponytail: step and memory caps bound the tables and samples history keeps alive; spill them to disk if 256 MB is too few.
-    static constexpr size_t kHistorySteps = 100, kHistoryBytes = (size_t) 256 << 20;
+    static constexpr size_t kHistorySteps = 100, kHistoryBytes = bw::kMaxAssetMemoryBytes;
     std::vector<Step> history;
     Snapshot editStart;
     std::vector<bool> touched;
@@ -274,16 +297,33 @@ private:
     juce::uint32 lastStepTime = 0;
     bool replaying = false;
 
+    void collectAssetsLocked ();
+    size_t nonEvictableAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr) const;
+    size_t totalAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr) const;
+    void evictHistoryForBudgetLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr);
+
     std::unique_ptr<juce::XmlElement> createStateXml ();
-    void restoreState (const juce::XmlElement& xml);
+    bool restoreState (const juce::XmlElement& xml);
     mutable std::mutex extraStateMutex;
     std::array<bw::UserTableSlot, 2> userSlots;
     std::vector<std::vector<float>> factoryNormalised; // per preset, in getParameters() order
     std::array<juce::String, 2> userTableNames;
-    void publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name);
-    void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path);
+    juce::String publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name);
+    void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& editStepName = {});
+    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error);
+    bool isRequestCancelledLocked (uint64_t requestId) const noexcept;
     bw::PublishSlot<bw::Sample> sampleSlot;
     juce::File sampleFile;
+    std::atomic<float> sampleSwapSeconds { 0.005f };
+    juce::ThreadPool sampleLoadPool { (int) kMaxPendingSampleJobs };
+    std::atomic<uint64_t> latestSampleLoadId { 0 }, cancelledUpToLoadId { 0 }, specificCancelledLoadId { 0 };
+    std::atomic<int> activeSampleJobs { 0 };
+    size_t pendingSampleJobBytes = 0;
+    std::atomic<bool> sampleLoadingFlag { false }, shuttingDown { false };
+    std::atomic<float> sampleLoadProgressValue { 0.0f };
+    juce::String lastSampleLoadError;
+    SampleReaderFactory restoreReaderFactory;
+    juce::WaitableEvent sampleLoadIdleEvent { true };
     bw::Effects effects;
     bw::EffectParams effectParams {};
     bw::CurveExchange::Curves savedCurves { bw::LfoCurve::factory (0), bw::LfoCurve::factory (0) };

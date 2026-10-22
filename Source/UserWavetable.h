@@ -201,57 +201,49 @@ inline TunedSource loadTunedSource (const juce::File& file, juce::String& error)
 }
 
 // Non-audio threads publish immutable data (callers serialise publish/get). The audio thread
-// acquires once per block. A replaced item stays alive until the audio thread reports that every
-// voice has settled on its successor, or the successor has been rendered long enough for every
-// voice's crossfade away from it (two 15 ms fades at most) to finish.
+// acquires once per block. A replaced item stays alive in `retired` until the audio thread
+// confirms by generation that every voice has settled on the latest published item.
 template <typename T>
 class PublishSlot
 {
 public:
-    static constexpr juce::int64 kSafeSamples = 1 << 16;
-
     void publish (std::shared_ptr<const T> table)
     {
         collect();
         if (owned != nullptr) retired.push_back (std::move (owned));
         owned = std::move (table);
+        const uint64_t nextGen = generation.load (std::memory_order_relaxed) + 1;
         latest.store (owned.get(), std::memory_order_release);
+        generation.store (nextGen, std::memory_order_release);
     }
     const std::shared_ptr<const T>& get() const noexcept { return owned; }
+    const std::vector<std::shared_ptr<const T>>& retiredItems() const noexcept { return retired; }
     bool idle() const noexcept { return retired.empty(); }
     void collect()
     {
-        if (seen.load (std::memory_order_acquire) == owned.get()
-            && (settled.load (std::memory_order_acquire) || rendered.load (std::memory_order_relaxed) >= kSafeSamples))
+        if (settledGeneration.load (std::memory_order_acquire) == generation.load (std::memory_order_relaxed))
             retired.clear();
     }
 
-    // Audio thread: returns the item for this block. Counts only samples already rendered.
-    const T* acquire (int blockSamples) noexcept
+    // Audio thread: returns the item for this block and records the acquired generation.
+    const T* acquire (int = 0) noexcept
     {
+        const uint64_t gen = generation.load (std::memory_order_acquire);
         const auto* table = latest.load (std::memory_order_acquire);
-        if (table != inUse)
-        {
-            inUse = table;
-            rendered.store (0, std::memory_order_relaxed);
-            settled.store (false, std::memory_order_relaxed);
-            seen.store (table, std::memory_order_release);
-        }
-        else rendered.store (rendered.load (std::memory_order_relaxed) + previousBlock, std::memory_order_relaxed);
-        previousBlock = blockSamples;
+        inUse = table;
+        inUseGeneration = gen;
         return table;
     }
-    // Audio thread, after rendering: no voice reads anything older than the acquired item.
-    void settle() noexcept { settled.store (true, std::memory_order_release); }
+    // Audio thread, after rendering: no voice reads anything older than the acquired generation.
+    void settle() noexcept { settledGeneration.store (inUseGeneration, std::memory_order_release); }
 
 private:
     std::shared_ptr<const T> owned;
     std::vector<std::shared_ptr<const T>> retired;
-    std::atomic<const T*> latest { nullptr }, seen { nullptr };
-    std::atomic<juce::int64> rendered { 0 };
-    std::atomic<bool> settled { false };
+    std::atomic<const T*> latest { nullptr };
+    std::atomic<uint64_t> generation { 0 }, settledGeneration { 0 };
     const T* inUse = nullptr;
-    juce::int64 previousBlock = 0;
+    uint64_t inUseGeneration = 0;
 };
 using UserTableSlot = PublishSlot<Wavetable>;
 } // namespace bw

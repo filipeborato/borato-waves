@@ -14,6 +14,7 @@ struct Wavetable
 
     int numFrames = 0;
     std::vector<float> data;
+    size_t bytes() const noexcept { return data.size() * sizeof (float); }
 
     static int maxHarmonic (int level) { return (kSize / 2) >> level; }
 
