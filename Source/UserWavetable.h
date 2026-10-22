@@ -69,7 +69,7 @@ inline std::unique_ptr<juce::AudioFormatReader> openAudio (const juce::File& fil
 // Mono mixdown of the first `limit` samples.
 inline std::vector<float> readMono (juce::AudioFormatReader& reader, juce::int64 limit)
 {
-    const int length = (int) juce::jmax<juce::int64> (0, juce::jmin (reader.lengthInSamples, limit));
+    const int length = (int) std::max<juce::int64> (0, juce::jmin (reader.lengthInSamples, limit));
     juce::AudioBuffer<float> buffer ((int) reader.numChannels, juce::jmax (1, length));
     buffer.clear();
     reader.read (&buffer, 0, length, 0, true, true);

@@ -1,5 +1,6 @@
 #pragma once
 #include "UserWavetable.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -124,7 +125,7 @@ inline std::shared_ptr<const Sample> decodeSample (
         const auto format = reader.getFormatName().toUpperCase();
         if (format.contains ("WAV") || format.contains ("AIFF") || format.contains ("AIF"))
         {
-            const juce::int64 bytesPerSample = juce::jmax<juce::int64> (1, reader.bitsPerSample / 8);
+            const juce::int64 bytesPerSample = std::max<juce::int64> (1, reader.bitsPerSample / 8);
             const juce::int64 expectedPcmBytes = reader.lengthInSamples * (juce::int64) reader.numChannels * bytesPerSample;
             if (rawFileBytes < expectedPcmBytes)
             {
