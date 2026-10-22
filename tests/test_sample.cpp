@@ -684,6 +684,23 @@ void testBackgroundLoadCancelAndOutOfOrder()
         proc.reset(); // destroy processor while job is finishing
     }
 
+    // Cancellation after reader creation must finish without recursively locking the state mutex.
+    {
+        juce::WaitableEvent factoryEntered (true), factoryProceed (true);
+        const auto kept = rig.processor.sample();
+        const auto request = rig.processor.startSampleLoad (initialTone, [&] (const juce::File& file)
+        {
+            factoryEntered.signal();
+            assert (factoryProceed.wait (5000));
+            return bw::openAudio (file);
+        });
+        assert (factoryEntered.wait (5000));
+        rig.processor.cancelSampleLoad (request);
+        factoryProceed.signal();
+        assert (rig.processor.waitForSampleLoad (5000));
+        assert (rig.processor.sample() == kept);
+    }
+
     // 5. Spamming 40 load requests stays bounded in memory and publishes only the last request.
     for (int i = 1; i <= 40; ++i)
     {

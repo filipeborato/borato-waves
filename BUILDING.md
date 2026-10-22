@@ -32,7 +32,7 @@ Outputs are under `build/BoratoWave_artefacts/<configuration>/VST3` and `Standal
 Exactly two workflows:
 
 - `ci.yml`: PRs to main/master; Ubuntu 24.04 Release VST3 compilation only. No artifacts. A newer commit cancels the previous run for that PR.
-- `build-release-artifacts.yml`: only pushed `v*` tags; Windows x64, Linux x64, macOS arm64 and Intel Release builds, plus the complete Debug test suite on Ubuntu/Xvfb. No CPU benchmark gate on shared runners.
+- `build-release-artifacts.yml`: only pushed `v*` tags; Windows x64, Linux x64, macOS arm64 and Intel Release builds, plus the complete Debug test suite on Ubuntu/Xvfb. The platform build matrix starts only after those tests pass, avoiding expensive builds when the Linux gate fails. No CPU benchmark gate on shared runners.
 
 Release tags must exactly match `v` plus the version in `project(BoratoWave VERSION ...)`. A mismatch fails before builds start. Change that version deliberately for a new release, commit the intended source, then create and push its tag, for example for version 0.1.0:
 
@@ -52,3 +52,9 @@ Windows archives use ZIP; macOS ZIPs preserve bundles using ditto; Linux TAR.GZ 
 Run `actionlint` at the repository root. Check a fresh local-JUCE configuration and a fresh fetch-JUCE configuration. On GitHub, verify a PR runs only the cheap Ubuntu job, ordinary branch pushes run neither workflow, and a matching version tag runs the release pipeline. Never create a test release tag merely to lint YAML.
 
 `.scratch/` and `docs/` are local, ignored working material; release/build instructions live in this tracked file.
+
+## Local portability preflight
+
+Before pushing build fixes, use Ubuntu 24.04 in WSL (or a native Ubuntu machine) to run the same GCC/Ninja build locally. Install every development package listed in the workflows, including `libxi-dev` for JUCE 9 XInput2 headers. Keep the build directory on the Linux filesystem. Configure Debug with tests enabled, build, and run CTest sequentially through Xvfb. Configure Release separately and build both distribution targets.
+
+Windows x64 can be built locally with Visual Studio. macOS arm64 and Intel (x86_64, not 32-bit x86) require Xcode on a Mac for actual compilation and binary validation. Static checks from Windows do not prove macOS compatibility. Do not create release tags to probe compilation; group fixes and validate locally first.
