@@ -9,7 +9,7 @@ const Rectangle<int> waveform { 20, 96, 1160, 300 };
 }
 
 SamplePanel::SamplePanel (WaveProcessor& p)
-    : processor (p),
+    : addZoneButton ("ADD ZONE", [this] { addZone (); }), processor (p),
       load ("LOAD SAMPLE", [this] { choose (false); }),
       relink ("RELINK", [this] { choose (true); }),
       cancel ("CANCEL", [this] { processor.cancelSampleLoad (); status = "SAMPLE LOAD CANCELLED"; repaint (); }),
@@ -29,6 +29,19 @@ SamplePanel::SamplePanel (WaveProcessor& p)
         addAndMakeVisible (c);
     relink.setEnabled (processor.sampleMissing ());
     cancel.setEnabled (processor.sampleLoading ());
+    addAndMakeVisible (zoneChoice); addAndMakeVisible (addZoneButton);
+    zoneChoice.setTitle ("Sample zone");
+    zoneChoice.onChange = [this] { selectedZone = zoneChoice.getSelectedItemIndex (); revision = ~0u; timerCallback (); };
+    for (auto* slider : { &lowKey, &highKey, &zoneRoot })
+    {
+        addAndMakeVisible (slider);
+        slider->setRange (0, 127, 1);
+        slider->setSliderStyle (Slider::IncDecButtons);
+        slider->setTextBoxStyle (Slider::TextBoxLeft, false, 60, 24);
+        slider->onValueChange = [this] { editZone (); };
+    }
+    lowKey.setTitle ("Zone low key"); highKey.setTitle ("Zone high key"); zoneRoot.setTitle ("Zone root key");
+    timerCallback ();
     startTimerHz (15);
 }
 
@@ -41,6 +54,8 @@ void SamplePanel::resized ()
     route.setBounds (808, 52, 124, 28);
     enabled.setBounds (940, 52, 116, 28);
     loop.setBounds (1064, 52, 116, 28);
+    zoneChoice.setBounds (20, 540, 200, 28); addZoneButton.setBounds (230, 540, 110, 28);
+    lowKey.setBounds (410, 540, 120, 28); highKey.setBounds (600, 540, 120, 28); zoneRoot.setBounds (790, 540, 120, 28);
     int x = 20;
     for (auto* dial : { &level, &pitch, &root, &pan, &start, &end })
     {
@@ -60,19 +75,34 @@ void SamplePanel::paint (Graphics& g)
     const char* routeBadge = routeIdx == 1 ? "> FILTER 2" : (routeIdx == 2 ? "> DIRECT" : "> FILTER 1");
     badge (g, routeBadge, { getWidth () - 86, 13, 72, 20 }, routeIdx == 2 ? coral : mint);
 
-    const auto sample = processor.sample ();
+    const auto sample = displayedSample ();
     const bool loading = processor.sampleLoading ();
     const bool missing = processor.sampleMissing ();
     const float progress = jlimit (0.0f, 1.0f, processor.sampleLoadProgress ());
 
+    const auto bank = processor.sampleBank ();
+    const String selectedName = bank && selectedZone >= 0 && selectedZone < (int) bank->zones.size ()
+        ? bank->zones[(size_t) selectedZone].path.getFileNameWithoutExtension () : processor.sampleName ();
     const String heading = loading ? "LOADING... " + String (roundToInt (progress * 100.0f)) + "%"
                          : missing ? "MISSING / " + processor.samplePath ().getFullPathName ()
-                         : sample != nullptr ? processor.sampleName () + "  /  " + String (sample->isStereo () ? "STEREO" : "MONO") + "  /  "
+                         : sample != nullptr ? selectedName + "  /  " + String (sample->isStereo () ? "STEREO" : "MONO") + "  /  "
                                                    + String ((double) sample->numFrames () / sample->rate, 2) + " s  /  "
                                                    + String (sample->rate / 1000.0, 1) + " kHz"
                                              : String ("NO SAMPLE / LOAD A WAV, AIFF OR FLAC FILE");
     label (g, heading, { 386, 52, 412, 28 }, 11, (missing || loading) ? coral : muted);
 
+    label (g, "LOW", { 360, 540, 45, 28 }, 11, muted);
+    label (g, "HIGH", { 545, 540, 50, 28 }, 11, muted);
+    label (g, "ROOT", { 735, 540, 50, 28 }, 11, muted);
+    if (const auto bank = processor.sampleBank ())
+        for (int note = 0; note < 128; ++note)
+        {
+            const int zone = bank->findZone (note);
+            const float x = 20.0f + 1160.0f * note / 128.0f;
+            g.setColour (zone < 0 ? inset : zone == displayedZone ? coral : mint.withAlpha (zone == selectedZone ? .8f : .3f));
+            g.fillRect (x, 590.0f, 1160.0f / 128.0f - 1.0f, 30.0f);
+        }
+    label (g, "KEY MAP 0 - 127 / ACTIVE ZONE " + (displayedZone < 0 ? String ("NONE") : String (displayedZone + 1)), { 20, 622, 500, 20 }, 11, muted);
     surface (g, waveform, inset);
     const auto r = waveform.toFloat ().reduced (10);
     if (! overview.empty ())
@@ -128,24 +158,30 @@ void SamplePanel::paint (Graphics& g)
 
 void SamplePanel::timerCallback ()
 {
+    const int active = processor.activeSampleZone.load (std::memory_order_relaxed);
+    if (active != displayedZone) { displayedZone = active; repaint (); }
     const auto now = processor.sampleRevision.load (std::memory_order_relaxed);
     const bool loading = processor.sampleLoading ();
     const bool missing = processor.sampleMissing ();
     const float progress = processor.sampleLoadProgress ();
-    const std::array<float, 4> region { processor.apvts.getRawParameterValue ("sampleStart")->load (),
+    std::array<float, 4> region { processor.apvts.getRawParameterValue ("sampleStart")->load (),
                                         processor.apvts.getRawParameterValue ("sampleEnd")->load (),
                                         processor.apvts.getRawParameterValue ("sampleLoop")->load (),
                                         processor.apvts.getRawParameterValue ("sampleRoute")->load () };
+    if (processor.sampleZonesMapped ())
+        if (const auto bank = processor.sampleBank (); bank && selectedZone >= 0 && selectedZone < (int) bank->zones.size ())
+        { const auto& z = bank->zones[(size_t) selectedZone]; region[0] = z.start; region[1] = z.end; region[2] = z.loop ? 1.0f : 0.0f; }
     relink.setEnabled (missing);
     cancel.setEnabled (loading);
     if (now == revision && region == shown && loading == wasLoading && missing == wasMissing && std::abs (progress - lastProgress) < 1.0e-3f)
         return;
     if (now != revision)
     {
+        refreshZones ();
         revision = now;
         overview.clear ();
         overviewRight.clear ();
-        if (const auto sample = processor.sample ())
+        if (const auto sample = displayedSample ())
         {
             const int columns = waveform.getWidth () - 20;
             overview.assign ((size_t) columns, 0.0f);
@@ -170,6 +206,64 @@ void SamplePanel::timerCallback ()
     repaint ();
 }
 
+std::shared_ptr<const bw::Sample> SamplePanel::displayedSample () const
+{
+    if (const auto bank = processor.sampleBank (); bank && selectedZone >= 0 && selectedZone < (int) bank->zones.size ())
+        return bank->zones[(size_t) selectedZone].sample;
+    return processor.sample ();
+}
+
+void SamplePanel::refreshZones ()
+{
+    const ScopedValueSetter<bool> guard (updatingZones, true);
+    const bool mapped = processor.sampleZonesMapped ();
+    root.setEnabled (! mapped); start.setEnabled (! mapped); end.setEnabled (! mapped); loop.setEnabled (! mapped);
+    zoneChoice.clear (dontSendNotification);
+    const auto bank = processor.sampleBank ();
+    for (auto* slider : { &lowKey, &highKey, &zoneRoot }) slider->setEnabled (bank != nullptr);
+    if (! bank) { addZoneButton.setEnabled (false); return; }
+    for (size_t i = 0; i < bank->zones.size (); ++i)
+        zoneChoice.addItem ("Zone " + String ((int) i + 1) + " / " + bank->zones[i].path.getFileNameWithoutExtension (), (int) i + 1);
+    selectedZone = jlimit (0, (int) bank->zones.size () - 1, selectedZone);
+    zoneChoice.setSelectedItemIndex (selectedZone, dontSendNotification);
+    const auto& z = bank->zones[(size_t) selectedZone];
+    lowKey.setValue (z.lowKey, dontSendNotification); highKey.setValue (z.highKey, dontSendNotification);
+    zoneRoot.setValue (z.rootKey, dontSendNotification);
+    addZoneButton.setEnabled (bank->zones.size () < bw::kMaxSampleZones && z.highKey > z.lowKey);
+}
+
+void SamplePanel::editZone ()
+{
+    if (updatingZones) return;
+    const auto bank = processor.sampleBank ();
+    if (! bank || selectedZone < 0 || selectedZone >= (int) bank->zones.size ()) return;
+    auto edited = *bank;
+    auto& z = edited.zones[(size_t) selectedZone];
+    z.lowKey = (int) lowKey.getValue (); z.highKey = (int) highKey.getValue (); z.rootKey = (int) zoneRoot.getValue ();
+    status = processor.setSampleBank (edited).toUpperCase ();
+    const auto colour = status.isEmpty () ? mint : coral;
+    lowKey.setColour (Slider::textBoxOutlineColourId, colour); highKey.setColour (Slider::textBoxOutlineColourId, colour);
+    repaint ();
+}
+
+void SamplePanel::addZone ()
+{
+    const auto bank = processor.sampleBank ();
+    if (! bank || bank->zones.size () >= bw::kMaxSampleZones) return;
+    auto edited = *bank;
+    auto& old = edited.zones[(size_t) selectedZone];
+    if (old.lowKey >= old.highKey) return;
+    auto added = old;
+    old.highKey = (old.lowKey + old.highKey) / 2;
+    added.lowKey = old.highKey + 1;
+    edited.zones.push_back (std::move (added));
+    status = processor.setSampleBank (edited).toUpperCase ();
+    if (status.isEmpty ()) selectedZone = (int) edited.zones.size () - 1;
+    revision = ~0u;
+    refreshZones ();
+    repaint ();
+}
+
 void SamplePanel::choose (bool isRelink)
 {
     chooser = std::make_unique<FileChooser> (isRelink ? "Relink sample" : "Load sample",
@@ -185,7 +279,7 @@ void SamplePanel::choose (bool isRelink)
         }
         else
         {
-            processor.startSampleLoad (file);
+            processor.startSampleLoad (file, {}, processor.sampleZonesMapped () ? selectedZone : -1);
             if (auto* on = processor.apvts.getParameter ("sampleOn"); on->getValue () < .5f)
             {
                 on->beginChangeGesture ();

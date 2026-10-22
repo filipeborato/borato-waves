@@ -11,9 +11,19 @@ public:
     explicit SamplePanel (WaveProcessor&);
     void paint (juce::Graphics&) override;
     void resized () override;
+    void visibilityChanged () override { if (isVisible ()) timerCallback (); }
 private:
     void timerCallback () override;
     void choose (bool isRelink = false);
+    void refreshZones ();
+    void editZone ();
+    void addZone ();
+    std::shared_ptr<const bw::Sample> displayedSample () const;
+    juce::ComboBox zoneChoice;
+    juce::Slider lowKey, highKey, zoneRoot;
+    Action addZoneButton;
+    int selectedZone = 0, displayedZone = -1;
+    bool updatingZones = false;
     WaveProcessor& processor;
     Action load, relink, cancel, clear;
     ParameterToggle enabled, loop;

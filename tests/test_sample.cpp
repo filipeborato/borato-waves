@@ -1,5 +1,6 @@
 #include "Rig.h"
 #include "PluginEditor.h"
+#include "UI/Controls.h"
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -1094,6 +1095,239 @@ void testStereoRootPanAndRouting()
 }
 } // namespace
 
+namespace
+{
+void testTranspositionAliasingAndPassband ()
+{
+    constexpr int count = 16384;
+    double worst = 0, worstStop = 0;
+    for (const double rate : { 44100.0, 48000.0, 96000.0 })
+        for (const int pitch : { -24, -12, -5, 0, 7, 12, 19, 24 })
+        {
+            const double increment = 48000.0 / rate * std::exp2 (pitch / 12.0);
+            const double scale = std::max (1.0, increment);
+            bw::Sample sample; sample.data.resize ((size_t) (count * increment) + 4096);
+            const double omega = juce::MathConstants<double>::twoPi;
+            for (size_t n = 0; n < sample.data.size (); ++n)
+                sample.data[n] = (float) ((std::sin (omega * .07 * n / scale)
+                    + std::sin (omega * .21 * n / scale) + std::sin (omega * .35 * n / scale)) / 3);
+            std::vector<float> residual (count);
+            double error = 0, reference = 0, actual = 0;
+            for (int n = 0; n < count; ++n)
+            {
+                const double x = 1024.123 + n * increment;
+                const double ideal = (std::sin (omega * .07 * x / scale)
+                    + std::sin (omega * .21 * x / scale) + std::sin (omega * .35 * x / scale)) / 3;
+                const double y = sample.readFilteredStereo (x, increment).first;
+                residual[(size_t) n] = (float) (y - ideal);
+                error += (y - ideal) * (y - ideal); reference += ideal * ideal; actual += y * y;
+            }
+            worst = std::max (worst, std::sqrt (error / reference));
+            assert (error / reference < 1.0e-6); // All residual energy, including aliases, below -60 dB.
+            assert (std::abs (10 * std::log10 (actual / reference)) < .5);
+            const auto bins = spectrum (residual);
+            assert (*std::max_element (bins.begin (), bins.end ()) < count * count * 1.0e-6);
+            if (increment >= 1.5)
+            {
+                for (size_t n = 0; n < sample.data.size (); ++n) sample.data[n] = (float) std::sin (omega * .65 * n / increment);
+                double energy = 0;
+                for (int n = 0; n < count; ++n) { const double y = sample.readFilteredStereo (1024.123 + n * increment, increment).first; energy += y * y; }
+                worstStop = std::max (worstStop, std::sqrt (2 * energy / count));
+                assert (2 * energy / count < 1.0e-6);
+            }
+            // Smooth chirp in the useful passband, with continuously varying playback speed.
+            const double slope = .1 / (sample.data.size () * scale);
+            for (size_t n = 0; n < sample.data.size (); ++n) sample.data[n] = (float) std::sin (omega * (.04 * n / scale + .5 * slope * n * n));
+            double position = 1024.123;
+            for (int n = 0; n < 2048; ++n)
+            {
+                const double step = increment * (1 + .01 * std::sin (n * .001));
+                const double expected = std::sin (omega * (.04 * position / scale + .5 * slope * position * position));
+                assert (std::abs (sample.readFilteredStereo (position, step).first - expected) < .001);
+                position += step;
+            }
+        }
+    bw::Sample impulse; impulse.data.resize (4096); impulse.data[2048] = 1;
+    assert (std::abs (impulse.readFilteredStereo (2048, 1).first - 1) < 1.0e-6);
+    assert (std::abs (impulse.readFilteredStereo (2047, 1).first) < 1.0e-6);
+    for (double step : { .25, 1.0, 4.0, 16.0, 63.9, 64.0, 1.0e20 })
+        for (double position : { 0.0, 4095.0 }) assert (std::isfinite (impulse.readFilteredStereo (position, step).first));
+    volatile float sink = 0;
+    const auto begin = juce::Time::getHighResolutionTicks ();
+    for (int n = 0; n < count; ++n) sink = impulse.read (1024.123 + n % 100);
+    const auto middle = juce::Time::getHighResolutionTicks ();
+    for (int n = 0; n < count; ++n) sink = impulse.readFilteredStereo (1024.123 + n % 100, 4).first;
+    const auto end = juce::Time::getHighResolutionTicks ();
+    juce::ignoreUnused (sink);
+    std::cout << "sinc residual dB=" << 20 * std::log10 (worst) << " stop dB=" << 20 * std::log10 (worstStop)
+              << " Hermite ms=" << juce::Time::highResolutionTicksToSeconds (middle - begin) * 1000
+              << " sinc(step4) ms=" << juce::Time::highResolutionTicksToSeconds (end - middle) * 1000 << std::endl;
+}
+
+void sampleRoute (Rig& r, int destination, float depth, bool bipolar = false)
+{
+    r.set ("mod1Enabled", 1); r.set ("mod1Source", 3); r.set ("mod1Destination", (float) destination);
+    r.set ("mod1Amount", depth); r.set ("mod1Bipolar", bipolar ? 1.0f : 0.0f);
+}
+void testSampleModulation ()
+{
+    const std::array<const char*, 24> legacy { "wtPos", "level", "oscAPan", "oscAPitch", "oscADetune", "oscASpread",
+        "wtPosB", "levelB", "oscBPan", "oscBPitch", "oscBDetune", "oscBSpread", "cutoff", "reso", "subLevel", "noiseLevel",
+        "cutoff2", "reso2", "distDrive", "delayMix", "reverbMix", "oscAWarp", "oscBWarp", "fmDepth" };
+    for (size_t i = 0; i < legacy.size (); ++i) assert (juce::String (legacy[i]) == bw::destinationIds ()[i]);
+    const auto file = writeTone ("mod-sample", 48000, 1.0, 337);
+    for (int destination : { bw::kSampleLevelDestination, bw::kSamplePanDestination, bw::kSamplePitchDestination })
+    {
+        Rig base, modulated;
+        for (auto* r : { &base, &modulated }) { sampleOnly (*r); r->set ("sampleRoute", 2); assert (r->processor.loadSample (file).isEmpty ()); r->send (on (60)); }
+        sampleRoute (modulated, destination, 0, true);
+        assert (base.run (.15) == modulated.run (.15));
+        sampleRoute (modulated, destination, 1, true);
+        for (int i = 0; i < 12; ++i) { modulated.set ("macro1", (float) (i % 2)); modulated.run (.005); }
+        juce::MemoryBlock state; modulated.processor.getStateInformation (state);
+        Rig restored; restored.processor.setStateInformation (state.getData (), (int) state.getSize ());
+        assert ((int) restored.processor.apvts.getRawParameterValue ("mod1Destination")->load () == destination);
+        assert (restored.processor.apvts.getRawParameterValue ("mod1Bipolar")->load () > .5f);
+    }
+    for (const int destination : { bw::kSampleLevelDestination, bw::kSamplePanDestination, bw::kSamplePitchDestination })
+        for (float macro : { 0.0f, 1.0f })
+        {
+            Rig r; sampleOnly (r); r.set ("sampleRoute", 2); r.set ("macro1", macro);
+            assert (r.processor.loadSample (file).isEmpty ()); sampleRoute (r, destination, 1, true); r.send (on (60));
+            const auto audio = r.run (.2);
+            if (destination == bw::kSamplePitchDestination)
+                assert (std::abs (frequency (audio) / (337 * (macro < .5f ? .25 : 4)) - 1) < .005);
+            if (destination == bw::kSampleLevelDestination)
+                assert (macro < .5f ? silent (audio) : peak (audio) > .1f);
+            if (destination == bw::kSamplePanDestination)
+            {
+                juce::AudioBuffer<float> stereo (2, 512); juce::MidiBuffer midi;
+                r.processor.processBlock (stereo, midi);
+                const double left = stereo.getRMSLevel (0, 0, 512), right = stereo.getRMSLevel (1, 0, 512);
+                assert (macro < .5f ? (left > .05 && right < 1.0e-6) : (right > .05 && left < 1.0e-6));
+            }
+        }
+    Rig running, muted;
+    for (auto* r : { &running, &muted }) { sampleOnly (*r); r->set ("sampleRoute", 2); assert (r->processor.loadSample (file).isEmpty ()); r->send (on (60)); }
+    sampleRoute (muted, bw::kSampleLevelDestination, 1, true); muted.set ("macro1", 0);
+    running.run (.1); assert (silent (muted.run (.1)));
+    muted.set ("mod1Amount", 0); running.run (.05); muted.run (.05);
+    assert (running.run (.1) == muted.run (.1)); // Exact head continuity after a silent interval.
+}
+
+juce::Component* sampleControl (juce::Component& parent, const juce::String& title)
+{
+    if (parent.getTitle () == title) return &parent;
+    for (auto* child : parent.getChildren ()) if (auto* found = sampleControl (*child, title)) return found;
+    return nullptr;
+}
+void testSampleZoneUI ()
+{
+    Rig rig;
+    const auto file = writeTone ("ui-zone", 48000, .1, 220);
+    assert (rig.processor.loadSample (file).isEmpty ());
+    std::unique_ptr<juce::AudioProcessorEditor> editor (rig.processor.createEditor ());
+    for (const auto* name : { "SAMPLE LEVEL", "SAMPLE PAN", "SAMPLE PITCH" })
+    {
+        auto* dial = dynamic_cast<bw::ui::Dial*> (sampleControl (*editor, name));
+        assert (dial && dial->onModulationDrop);
+        dial->onModulationDrop (3, dial->parameterId ());
+    }
+    for (int i = 1; i <= 3; ++i)
+        assert ((int) rig.processor.apvts.getRawParameterValue ("mod" + juce::String (i) + "Destination")->load () == 23 + i);
+    auto* add = sampleControl (*editor, "ADD ZONE"); assert (add);
+    add->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    assert (rig.processor.sampleBank ()->zones.size () == 2);
+    auto* low = dynamic_cast<juce::Slider*> (sampleControl (*editor, "Zone low key")); assert (low);
+    low->setValue (60, juce::sendNotificationSync); // Overlaps zone 0, must preserve the valid map.
+    assert (rig.processor.sampleBank ()->zones[1].lowKey == 64);
+    low->setValue (65, juce::sendNotificationSync);
+    assert (rig.processor.sampleBank ()->zones[1].lowKey == 65);
+    rig.processor.startSampleLoad (file, {}, 1);
+    assert (rig.processor.waitForSampleLoad (5000));
+    assert (rig.processor.sampleBank ()->zones.size () == 2);
+    assert (rig.processor.sampleBank ()->zones[1].path == file);
+    sampleControl (*editor, "SAMPLE")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    juce::Thread::sleep (80);
+    juce::Timer::callPendingTimersSynchronously ();
+    const auto image = editor->createComponentSnapshot (editor->getLocalBounds ());
+    assert (image.isValid ());
+    auto output = juce::File::getCurrentWorkingDirectory ().getChildFile ("build/sample-zones.png").createOutputStream ();
+    if (output) { output->setPosition (0); output->truncate (); juce::PNGImageFormat ().writeImageToStream (image, *output); }
+}
+
+void testMultisampleTwoZonesAndLegato ()
+{
+    const auto lowFile = writeTone ("zone-low", 48000, .5, 220), highFile = writeTone ("zone-high", 48000, .5, 880);
+    juce::String error;
+    bw::SampleBank bank;
+    bank.zones = { { bw::loadSample (lowFile, error), lowFile, 36, 59, 57, 0, 1, true },
+                   { bw::loadSample (highFile, error), highFile, 60, 72, 81, 0, 1, true } };
+    assert (bank.valid ());
+    Rig r; sampleOnly (r); r.set ("sampleRoute", 2);
+    assert (r.processor.setSampleBank (bank).isEmpty ());
+    for (int note : { 24, 36, 59, 60, 72, 84 })
+    {
+        r.send (juce::MidiMessage::allSoundOff (1)); r.run (.15); r.send (on (note));
+        const auto audio = r.run (.12);
+        if (note == 24 || note == 84) assert (silent (audio));
+        else { assert (near (frequency (audio), note)); assert (r.processor.activeSampleZone.load () == (note < 60 ? 0 : 1)); }
+    }
+    auto invalid = bank; invalid.zones[0].highKey = 60;
+    assert (r.processor.setSampleBank (invalid).contains ("overlapping"));
+    invalid = bank; invalid.zones[0].start = std::numeric_limits<float>::quiet_NaN ();
+    assert (r.processor.setSampleBank (invalid).isNotEmpty ());
+    const auto bytes = r.processor.assetMemoryBytes ();
+    auto duplicate = bank; duplicate.zones[1].sample = duplicate.zones[0].sample;
+    assert (duplicate.bytes () == duplicate.zones[0].sample->bytes ());
+    const auto sharedRoundTrip = bw::deserializeSampleBank (bw::serializeSampleBank (duplicate), error);
+    assert (sharedRoundTrip && sharedRoundTrip->zones[0].sample == sharedRoundTrip->zones[1].sample);
+    auto badReference = bw::serializeSampleBank (duplicate);
+    badReference.getChild (1).setProperty ("sampleZone", 1, nullptr);
+    assert (! bw::deserializeSampleBank (badReference, error));
+    assert (bytes <= WaveProcessor::kAssetMemoryBudgetBytes);
+    r.set ("voiceMode", 2); r.send (juce::MidiMessage::allSoundOff (1)); r.run (.05);
+    r.send (on (59)); const auto previous = r.run (.1);
+    r.send (on (60)); const auto switched = renderChecked (r.processor, r.pending, 9600, 64);
+    assert (maxStep (switched, 0, switched.size (), previous.back ()) < .1f);
+    assert (r.processor.activeSampleZone.load () == 1);
+    auto changed = bank; changed.zones[0].sample = bank.zones[1].sample;
+    r.processor.setSampleSwapSeconds (.1f);
+    assert (r.processor.setSampleBank (changed).isEmpty ());
+    r.run (.001); assert (! r.processor.sampleSettled ());
+    renderChecked (r.processor, r.pending, 9600, 64); assert (r.processor.sampleSettled ());
+    assert (r.processor.undo ()); assert (r.processor.sampleBank ()->zones[0].sample == bank.zones[0].sample);
+    juce::MemoryBlock state; r.processor.getStateInformation (state);
+    const auto preset = folder.getChildFile ("zone-bank.bwpreset");
+    assert (r.processor.savePreset (preset));
+    lowFile.deleteFile (); highFile.deleteFile ();
+    Rig restored; restored.processor.setStateInformation (state.getData (), (int) state.getSize ());
+    assert (restored.processor.sampleBank ()->zones.size () == 2);
+    assert (restored.processor.loadPreset (preset));
+    assert (restored.processor.sampleBank ()->zones.size () == 2);
+    assert (restored.processor.sampleBank ()->zones[1].sample->contentHash == bank.zones[1].sample->contentHash);
+    restored.send (on (60)); assert (! silent (restored.run (.1)));
+    {
+        bw::SampleBank oversized;
+        for (int i = 0; i < 17; ++i)
+        {
+            auto asset = std::make_shared<bw::Sample> (); asset->data.resize (bw::kMaxSampleFrames);
+            oversized.zones.push_back ({ asset, {}, i, i, 60, 0, 1, false });
+        }
+        const auto before = restored.processor.sampleBank ();
+        assert (restored.processor.setSampleBank (oversized).contains ("256 MB"));
+        assert (restored.processor.sampleBank () == before);
+    }
+    auto fullMap = bank; fullMap.zones.clear ();
+    for (int note = 0; note < 128; ++note) fullMap.zones.push_back ({ bank.zones[0].sample, {}, note, note, note, 0, 1, false });
+    assert (fullMap.valid ()); fullMap.zones.push_back (fullMap.zones[0]); assert (! fullMap.valid ());
+    auto malformed = bw::serializeSampleBank (bank); malformed.getChild (1).setProperty ("low", 59, nullptr);
+    assert (! bw::deserializeSampleBank (malformed, error));
+    malformed.setProperty ("version", 99, nullptr); assert (! bw::deserializeSampleBank (malformed, error));
+    std::cout << "ok: sample modulation and portable zones" << std::endl;
+}
+} // namespace
+
 int main()
 {
 #ifdef _WIN32
@@ -1102,6 +1336,10 @@ int main()
     _set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     juce::ScopedJuceInitialiser_GUI init;
+    testTranspositionAliasingAndPassband ();
+    testSampleModulation ();
+    testMultisampleTwoZonesAndLegato ();
+    testSampleZoneUI ();
     testPlaysAtPitch();
     testLoopIsSeamless();
     testOneShotEnds();

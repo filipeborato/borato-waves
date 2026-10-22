@@ -34,6 +34,31 @@ inline uint64_t computeSampleHash (int channels, int frames, double rate, const 
     return h;
 }
 
+// 64-tap Blackman sinc, 1024 fractional phases. Constructed before audio starts.
+struct SincKernelTable
+{
+    static constexpr int radius = 32, phases = 1024;
+    std::array<float, radius * phases + 1> values {};
+    SincKernelTable ()
+    {
+        for (size_t i = 0; i < values.size (); ++i)
+        {
+            const double x = (double) i / phases, a = juce::MathConstants<double>::pi * x;
+            values[i] = (float) ((i == 0 ? 1.0 : std::sin (a) / a)
+                * (0.42 + 0.5 * std::cos (a / radius) + 0.08 * std::cos (2 * a / radius)));
+        }
+        values.back () = 0;
+    }
+    float at (double x) const noexcept
+    {
+        const double phase = std::abs (x) * phases;
+        if (phase >= radius * phases) return 0;
+        const auto i = (size_t) phase;
+        return values[i] + (float) (phase - (double) i) * (values[i + 1] - values[i]);
+    }
+};
+inline const SincKernelTable sampleSincKernel;
+
 // Imported audio for the sample source: mono (`right` empty) or stereo (`right.size() == data.size()`)
 // at the file's own rate, immutable once published.
 struct Sample
@@ -68,6 +93,33 @@ struct Sample
     {
         const float l = read (position, 0);
         return { l, ! right.empty() ? read (position, 1) : l };
+    }
+
+    std::pair<float, float> readFilteredStereo (double position, double increment,
+                                                  double first = 0, double last = -1) const noexcept
+    {
+        if (data.empty () || ! std::isfinite (position) || ! std::isfinite (increment) || increment <= 0)
+            return {};
+        // Bound worst-case callback work to 4096 taps; extreme ratios fade to silence.
+        const double guard = juce::jlimit (0.0, 1.0, (64.0 - increment) / 16.0);
+        if (guard <= 0) return {};
+        const double step = std::max (1.0, increment), support = SincKernelTable::radius * step;
+        const int lo = juce::jlimit (0, numFrames () - 1, (int) first);
+        const int hi = last < 0 ? numFrames () - 1 : juce::jlimit (lo, numFrames () - 1, (int) std::ceil (last) - 1);
+        position = juce::jlimit ((double) lo, (double) hi, position);
+        const bool stereo = isStereo ();
+        double left = 0, r = 0, sum = 0;
+        const int begin = (int) std::ceil (position - support), finish = (int) std::floor (position + support);
+        for (int n = begin; n <= finish; ++n)
+        {
+            const double weight = sampleSincKernel.at ((position - n) / step);
+            const auto index = (size_t) juce::jlimit (lo, hi, n);
+            left += weight * data[index];
+            if (stereo) r += weight * right[index];
+            sum += weight;
+        }
+        const double gain = guard / sum;
+        return { (float) (left * gain), (float) ((stereo ? r : left) * gain) };
     }
 
     // Normalised start/end (either order) to frames, at least kMinSampleRegion apart.
@@ -323,6 +375,116 @@ inline bool deserializeSampleContainer (
     return true;
 }
 
+constexpr int kMaxSampleZones = 128;
+struct SampleZone
+{
+    std::shared_ptr<const Sample> sample;
+    juce::File path;
+    int lowKey = 0, highKey = 127, rootKey = 60;
+    float start = 0, end = 1;
+    bool loop = false;
+};
+struct SampleBank
+{
+    std::vector<SampleZone> zones;
+    int findZone (int note) const noexcept
+    {
+        for (size_t i = 0; i < zones.size (); ++i)
+            if (note >= zones[i].lowKey && note <= zones[i].highKey) return (int) i;
+        return -1;
+    }
+    bool hasKeyOverlap () const noexcept
+    {
+        for (size_t i = 0; i < zones.size (); ++i)
+            for (size_t j = i + 1; j < zones.size (); ++j)
+                if (zones[i].lowKey <= zones[j].highKey && zones[j].lowKey <= zones[i].highKey) return true;
+        return false;
+    }
+    bool valid () const noexcept
+    {
+        if (zones.empty () || zones.size () > kMaxSampleZones || hasKeyOverlap ()) return false;
+        for (const auto& z : zones)
+            if (! z.sample || z.sample->numFrames () < kMinSampleRegion || z.sample->numFrames () > kMaxSampleFrames
+                || ! std::isfinite (z.sample->rate) || z.sample->rate <= 0
+                || (! z.sample->right.empty () && z.sample->right.size () != z.sample->data.size ()) || z.lowKey < 0 || z.highKey > 127
+                || z.lowKey > z.highKey || z.rootKey < 0 || z.rootKey > 127 || ! std::isfinite (z.start)
+                || ! std::isfinite (z.end) || z.start < 0 || z.end > 1 || z.start >= z.end) return false;
+        return true;
+    }
+    size_t bytes () const noexcept
+    {
+        size_t count = 0;
+        for (size_t i = 0; i < zones.size (); ++i)
+        {
+            bool seen = false;
+            for (size_t j = 0; j < i; ++j) seen |= zones[j].sample == zones[i].sample;
+            if (! seen && zones[i].sample) count += zones[i].sample->bytes ();
+        }
+        return count;
+    }
+};
+inline juce::ValueTree serializeSampleBank (const SampleBank& bank)
+{
+    juce::ValueTree tree ("SAMPLE_BANK");
+    tree.setProperty ("version", 1, nullptr);
+    for (size_t i = 0; i < bank.zones.size (); ++i)
+    {
+        const auto& z = bank.zones[i];
+        juce::ValueTree zone ("ZONE");
+        zone.setProperty ("low", z.lowKey, nullptr); zone.setProperty ("high", z.highKey, nullptr);
+        zone.setProperty ("root", z.rootKey, nullptr); zone.setProperty ("start", z.start, nullptr);
+        zone.setProperty ("end", z.end, nullptr); zone.setProperty ("loop", z.loop, nullptr);
+        int reference = -1;
+        for (size_t j = 0; j < i; ++j) if (bank.zones[j].sample == z.sample) { reference = (int) j; break; }
+        zone.setProperty ("path", z.path.getFullPathName (), nullptr);
+        if (reference >= 0) zone.setProperty ("sampleZone", reference, nullptr);
+        else zone.addChild (serializeSampleContainer (z.sample.get (), z.path), -1, nullptr);
+        tree.addChild (zone, -1, nullptr);
+    }
+    return tree;
+}
+inline std::shared_ptr<const SampleBank> deserializeSampleBank (const juce::ValueTree& tree, juce::String& error)
+{
+    if ((int) tree.getProperty ("version", 0) != 1 || tree.getNumChildren () < 1 || tree.getNumChildren () > kMaxSampleZones)
+    { error = "Invalid sample bank header"; return {}; }
+    auto bank = std::make_shared<SampleBank> ();
+    size_t remaining = kMaxAssetMemoryBytes;
+    for (const auto& node : tree)
+    {
+        if (! node.hasType ("ZONE")) { error = "Invalid sample zone"; return {}; }
+        SampleZone z;
+        z.lowKey = node.getProperty ("low", -1); z.highKey = node.getProperty ("high", -1);
+        z.rootKey = node.getProperty ("root", -1); z.start = node.getProperty ("start", -1.0f);
+        z.end = node.getProperty ("end", -1.0f); z.loop = node.getProperty ("loop", false);
+        for (const auto* key : { "low", "high", "root" })
+        {
+            const double value = (double) node.getProperty (key, -1);
+            if (! std::isfinite (value) || value < 0 || value > 127 || value != std::floor (value))
+            { error = "Invalid MIDI key"; return {}; }
+        }
+        if (node.hasProperty ("sampleZone"))
+        {
+            const double value = (double) node.getProperty ("sampleZone");
+            if (! std::isfinite (value) || value < 0 || value >= (double) bank->zones.size ()
+                || value != std::floor (value) || node.getNumChildren () != 0)
+            { error = "Invalid zone sample reference"; return {}; }
+            z.sample = bank->zones[(size_t) value].sample;
+            const auto path = node.getProperty ("path").toString ();
+            if (juce::File::isAbsolutePath (path)) z.path = juce::File (path);
+        }
+        else
+        {
+            bool embedded = false;
+            if (node.getNumChildren () != 1 || ! deserializeSampleContainer (node.getChildWithName ("SAMPLE"), z.sample, z.path, embedded, error, remaining)
+                || ! z.sample) { if (error.isEmpty ()) error = "Zone requires embedded audio"; return {}; }
+            remaining -= z.sample->bytes ();
+        }
+        bank->zones.push_back (std::move (z));
+    }
+    if (! bank->valid ()) { error = "Invalid or overlapping key ranges"; return {}; }
+    return bank;
+}
+
 // One voice's read head. The region (frames) is taken at reset and, in a loop, again at each wrap, so
 // moving start/end never jumps the head: a loop pass ends no sooner than one fade after the wrap.
 // Loop: the last `fade` frames crossfade into the frames one period earlier, so the wrap never steps.
@@ -347,13 +509,13 @@ struct SamplePlayer
             to = std::min ((double) sample.data.size(), std::max (region.second, position + maxFade));
         }
         const double fade = std::min (maxFade, (to - from) * 0.5), period = to - from - fade;
-        auto [outL, outR] = sample.readStereo (position);
+        auto [outL, outR] = sample.readFilteredStereo (position, increment);
         if (const double into = position - (to - fade); into > 0)
         {
             const float t = (float) std::min (1.0, into / fade);
             if (loop)
             {
-                const auto [wrapL, wrapR] = sample.readStereo (position - period);
+                const auto [wrapL, wrapR] = sample.readFilteredStereo (position - period, increment);
                 outL += t * (wrapL - outL);
                 outR += t * (wrapR - outR);
             }

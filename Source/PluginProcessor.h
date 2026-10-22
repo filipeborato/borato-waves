@@ -25,6 +25,8 @@ struct SynthParams
     // Written by the audio thread at block start; null when no user table or sample is loaded.
     std::array<const bw::Wavetable*, 2> userTables {};
     const bw::Sample* sample = nullptr;
+    const bw::SampleBank* sampleBank = nullptr;
+    std::atomic<int>* activeSampleZone = nullptr;
     float sampleSwapSeconds = 0.005f;
 };
 
@@ -54,7 +56,7 @@ public:
     void legato (int note, float glideSeconds);
     // After a block: whether this voice reads only the current user table / sample.
     bool settled (size_t oscillator) const { return ! isVoiceActive () || oscillators[oscillator].settled (); }
-    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && fadingSample == nullptr && playingSample == params.sample); }
+    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && fadingSample == nullptr && playingBank == params.sampleBank && (playingBank != nullptr || playingSample == params.sample)); }
 
 private:
     void glideTo (int note, float seconds);
@@ -125,6 +127,11 @@ private:
     const bw::Sample* playingSample = nullptr;
     const bw::Sample* fadingSample = nullptr;
     bw::SamplePlayer player, fadingPlayer;
+    const bw::SampleBank* playingBank = nullptr;
+    const bw::SampleZone* playingZone = nullptr;
+    const bw::SampleZone* fadingZone = nullptr;
+    const bw::SampleZone* targetZone () const noexcept;
+    void selectSample (bool reset);
     int swapLeft = 0, swapLength = 240, cachedSampleRoot = -1;
     float cachedSampleSemitones = 10000, cachedSamplePan = 10000, sampleLeftGain = 1, sampleRightGain = 1;
     double sampleRatio = 1;
@@ -217,7 +224,7 @@ public:
     static constexpr size_t kMaxPendingSampleJobs = 2;
     juce::String loadSample (const juce::File& file);
     juce::String relinkSample (const juce::File& file);
-    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {});
+    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {}, int zoneIndex = -1);
     void cancelSampleLoad (uint64_t requestId = 0);
     bool waitForSampleLoad (int timeoutMs = 5000);
     bool sampleLoading () const noexcept { return sampleLoadingFlag.load (std::memory_order_acquire); }
@@ -225,6 +232,10 @@ public:
     juce::String sampleLoadError () const;
     void setRestoreReaderFactory (SampleReaderFactory factory);
     void clearSample ();
+    std::shared_ptr<const bw::SampleBank> sampleBank () const;
+    bool sampleZonesMapped () const;
+    juce::String setSampleBank (const bw::SampleBank&);
+    std::atomic<int> activeSampleZone { -1 };
     std::shared_ptr<const bw::Sample> sample () const;
     bool sampleSettled ();
     juce::File samplePath () const;
@@ -282,6 +293,7 @@ private:
         std::array<std::shared_ptr<const bw::Wavetable>, 2> tables;
         std::array<juce::String, 2> tableNames;
         std::shared_ptr<const bw::Sample> sample;
+        std::shared_ptr<const bw::SampleBank> sampleBank;
         juce::File samplePath;
     };
     struct Step { Snapshot before, after; std::vector<bool> parameters; juce::String name; };
@@ -298,9 +310,9 @@ private:
     bool replaying = false;
 
     void collectAssetsLocked ();
-    size_t nonEvictableAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr) const;
-    size_t totalAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr) const;
-    void evictHistoryForBudgetLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr);
+    size_t nonEvictableAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr, const bw::SampleBank* nextBank = nullptr) const;
+    size_t totalAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr, const bw::SampleBank* nextBank = nullptr) const;
+    void evictHistoryForBudgetLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr, const bw::SampleBank* nextBank = nullptr);
 
     std::unique_ptr<juce::XmlElement> createStateXml ();
     bool restoreState (const juce::XmlElement& xml);
@@ -310,9 +322,10 @@ private:
     std::array<juce::String, 2> userTableNames;
     juce::String publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name);
     void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& editStepName = {});
-    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error);
+    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error, int zoneIndex);
     bool isRequestCancelledLocked (uint64_t requestId) const noexcept;
     bw::PublishSlot<bw::Sample> sampleSlot;
+    bw::PublishSlot<bw::SampleBank> sampleBankSlot;
     juce::File sampleFile;
     std::atomic<float> sampleSwapSeconds { 0.005f };
     juce::ThreadPool sampleLoadPool { (int) kMaxPendingSampleJobs };
