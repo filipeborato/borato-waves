@@ -1,2 +1,5 @@
 /build*/
 *.log
+/.scratch/
+/docs/
+/AGENTS.md

@@ -1,0 +1,172 @@
+name: Build Release Artifacts
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^project\(BoratoWave VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  tests:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install JUCE dependencies and virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libasound2-dev libjack-jackd2-dev libfreetype6-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev xvfb xauth
+      - name: Configure Debug tests
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBORATOWAVE_FETCH_JUCE=ON -DBORATOWAVE_BUILD_TESTS=ON
+      - name: Build tests
+        run: cmake --build build --parallel 2 --target test_wavetable test_interface test_sources test_modulation test_effects test_presets test_atelier test_voices test_sample test_table_editor test_history test_tuned_import
+      - name: Run tests with assertions enabled
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" ctest --test-dir build --output-on-failure --no-tests=error --parallel 1
+
+  build:
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: Windows-x64
+          - runner: ubuntu-24.04
+            platform: Linux-x64
+          - runner: macos-15
+            platform: macOS-arm64
+            arch: arm64
+          - runner: macos-15-intel
+            platform: macOS-intel
+            arch: x86_64
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install JUCE Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libasound2-dev libjack-jackd2-dev libfreetype6-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBORATOWAVE_FETCH_JUCE=ON -DBORATOWAVE_BUILD_TESTS=OFF
+      - name: Configure Linux
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBORATOWAVE_FETCH_JUCE=ON -DBORATOWAVE_BUILD_TESTS=OFF
+      - name: Configure macOS
+        if: runner.os == 'macOS'
+        run: >-
+          cmake -S . -B build -G Xcode
+          -DBORATOWAVE_FETCH_JUCE=ON -DBORATOWAVE_BUILD_TESTS=OFF
+          -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO
+      - name: Build Release
+        run: cmake --build build --config Release --target BoratoWave_VST3 BoratoWave_Standalone --parallel 2
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $root = 'build/BoratoWave_artefacts/Release'
+          $base = "BoratoWaves-v$env:VERSION-$env:PLATFORM"
+          foreach ($format in @('VST3', 'Standalone')) {
+            $name = if ($format -eq 'VST3') { 'Borato Waves.vst3' } else { 'Borato Waves.exe' }
+            $source = "$root/$format/$name"
+            if (-not (Test-Path -LiteralPath $source)) { throw "Missing $source" }
+            Compress-Archive -LiteralPath $source -DestinationPath "dist/$base-$format.zip"
+          }
+          @(
+            '# Borato Waves - Windows x64'
+            ''
+            'Extract the complete VST3 bundle into C:\Program Files\Common Files\VST3\ and rescan your DAW.'
+            'Extract and run Borato Waves.exe for Standalone. Select your audio/MIDI devices; ASIO is enabled.'
+            'These builds are not commercially signed.'
+          ) | Set-Content "dist/INSTALL-$env:PLATFORM.md"
+          Get-ChildItem dist/*.zip | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content "dist/SHA256SUMS-$env:PLATFORM.txt"
+      - name: Package Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          root="build/BoratoWave_artefacts/Release"
+          base="BoratoWaves-v$VERSION-$PLATFORM"
+          test -d "$root/VST3/Borato Waves.vst3"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            test -d "$root/Standalone/Borato Waves.app"
+            for bundle in "$root/VST3/Borato Waves.vst3" "$root/Standalone/Borato Waves.app"; do
+              lipo -verify_arch "$ARCH" "$bundle/Contents/MacOS/Borato Waves"
+              codesign --force --deep --sign - "$bundle"
+              codesign --verify --deep --strict "$bundle"
+            done
+            ditto -c -k --keepParent "$root/VST3/Borato Waves.vst3" "dist/$base-VST3.zip"
+            ditto -c -k --keepParent "$root/Standalone/Borato Waves.app" "dist/$base-Standalone.zip"
+            printf '%s\n' '# Borato Waves - macOS' '' 'Extract the VST3 bundle to ~/Library/Audio/Plug-Ins/VST3/ and rescan your DAW.' 'Move Borato Waves.app to /Applications and select audio/MIDI devices.' 'Use the package for your CPU architecture. Minimum deployment target: macOS 11.' 'Ad-hoc signed, not notarized: Gatekeeper may block the first launch.' > "dist/INSTALL-$PLATFORM.md"
+            (cd dist && shasum -a 256 ./*.zip) > "dist/SHA256SUMS-$PLATFORM.txt"
+          else
+            test -x "$root/Standalone/Borato Waves"
+            file "$root/Standalone/Borato Waves"
+            tar -czf "dist/$base-VST3.tar.gz" -C "$root/VST3" 'Borato Waves.vst3'
+            tar -czf "dist/$base-Standalone.tar.gz" -C "$root/Standalone" 'Borato Waves'
+            printf '%s\n' '# Borato Waves - Linux x64' '' 'Built on Ubuntu 24.04; older distributions are not guaranteed compatible.' 'Extract the complete VST3 bundle to ~/.vst3/ and rescan your DAW.' 'Extract and run ./"Borato Waves" for Standalone; select audio/MIDI devices.' > "dist/INSTALL-$PLATFORM.md"
+            (cd dist && sha256sum ./*.tar.gz) > "dist/SHA256SUMS-$PLATFORM.txt"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [version, tests, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify complete release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)" -eq 8
+          cd dist
+          for manifest in SHA256SUMS-*.txt; do sha256sum --check "$manifest"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: Borato Waves v${{ needs.version.outputs.version }}
+          fail_on_unmatched_files: true
+          files: dist/*

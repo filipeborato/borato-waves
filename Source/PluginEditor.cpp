@@ -405,8 +405,10 @@ public:
         logo.startNewSubPath (24, 46); logo.lineTo (31, 46); logo.lineTo (37, 28); logo.lineTo (45, 58);
         logo.lineTo (53, 34); logo.lineTo (59, 46); logo.lineTo (67, 46);
         curve (g, logo, mint, 2.5f);
-        label (g, "borato", { 82, 18, 155, 32 }, 29, text, Justification::centredLeft, true);
-        label (g, "W A V E   /   WAVETABLE SYNTH", { 84, 52, 242, 18 }, 9, muted);
+        label (g, "Borato", { 82, 16, 98, 34 }, 29, text, Justification::centredLeft, true);
+        label (g, "Waves", { 182, 16, 118, 34 }, 29, mint, Justification::centredLeft, true);
+        badge (g, "W A V E S", { 82, 53, 68, 17 }, mint);
+        label (g, "/   WAVETABLE SYNTH", { 158, 53, 180, 17 }, 9, muted);
         label (g, "FACTORY / " + String (currentPatch >= 0 ? bw::factoryPresets()[(size_t) currentPatch].category : "USER"), { 406, 9, 356, 13 }, 8, muted);
         label (g, "VOICE ENGINE", { 846, 10, 104, 15 }, 9, muted);
 

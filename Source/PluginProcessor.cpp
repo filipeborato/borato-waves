@@ -1382,7 +1382,7 @@ int WaveProcessor::matchingFactoryPreset () const
 
 juce::File WaveProcessor::presetDirectory ()
 {
-    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("Borato").getChildFile ("Borato Wave").getChildFile ("Presets");
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("Borato").getChildFile ("Borato Waves").getChildFile ("Presets");
 }
 bool WaveProcessor::savePreset (const juce::File& file)
 {
