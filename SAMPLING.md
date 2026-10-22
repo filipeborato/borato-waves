@@ -1,4 +1,4 @@
-# Sample playback and key zones
+# Sample playback, velocity layers and granular synthesis
 
 ## Filtered transposition
 
@@ -29,7 +29,8 @@ A mipmapped source would be needed to extend extreme ratios economically.
 ## Modulation
 
 Existing destination IDs 0 through 23 are unchanged. The appended destinations
-are 24 (Sample Level), 25 (Sample Pan), and 26 (Sample Pitch). Global effect
+are 24 (Sample Level), 25 (Sample Pan), and 26 (Sample Pitch), followed by
+27 (Grain Position), 28 (Grain Size), 29 (Grain Density), and 30 (Grain Pitch). Global effect
 destinations remain exactly 18 through 20. The original ticket's proposed
 26/27/28 numbering did not match the existing implementation.
 
@@ -44,7 +45,8 @@ Load a sample, then use **ADD ZONE** to split the selected key range in half.
 Both zones initially share the audio. Select the new zone and use **LOAD SAMPLE**
 to replace only its audio through the existing cancellable background loader.
 Edit LOW, HIGH and ROOT as MIDI note numbers. Ranges are inclusive; overlapping
-or inverted ranges are rejected and highlighted. The keyboard bar shows mapped
+or inverted ranges are rejected and highlighted, except identical key ranges
+with separate velocity layers. The keyboard bar shows mapped
 ranges and the most recent voice's zone. Unmapped notes produce no sample audio.
 
 Banks support up to 128 zones. Each zone owns its root, start/end and loop
@@ -62,11 +64,65 @@ allocation, file access or new locks occur in the audio callback.
 
 The 256 MiB asset budget counts unique sample buffers across current banks,
 retired banks, pending decodes and undo history. Bank edits participate in undo.
-Portable `SAMPLE_BANK` version 1 embeds each distinct shared asset once, with
-backward references from other zones. It validates ranges, roots, references,
+Portable `SAMPLE_BANK` version 2 embeds each distinct shared asset once, with
+backward references across zones and round-robin slots. Version 1 remains readable
+with full velocity ranges and one variant. It validates ranges, roots, references,
 version, PCM size, finite samples and hashes before publication. Legacy SAMPLE
 states remain loadable and are exposed as an equivalent full-range zone by the
 bank API; they retain the existing single-sample playback/automation path.
+
+## Velocity layers and round robin
+
+**ADD LAYER** splits the selected velocity interval; **ADD ZONE** splits the key
+range of all its velocity layers together. Velocity bounds are inclusive 1..127,
+with crossfade widths 0..63. Base intervals cannot overlap; expanded crossfade
+intervals allow at most two layers. Crossing layers share a crossfade law.
+
+Weights are selected from MIDI velocity at note-on, including legato retargeting,
+and are held during the note. Explicit bank edits can update the selection.
+Velocity zero is note-off. Linear weights are `1-t, t`, preserving the gain of
+identical in-phase audio. Equal Power uses `cos(pi*t/2), sin(pi*t/2)`, preserving
+energy for uncorrelated audio; correlated layers can therefore gain up to 3 dB.
+
+Each layer has 1..4 round-robin slots. LOAD SAMPLE and RELINK affect the selected
+slot. Missing slots remain in the sequence and produce silence. Only note-on
+with positive layer weight advances that zone's sequential counter, starting
+at RR 1. Note-off, sustain, unrelated zones and mono return to a held note do
+not advance it. Prepare, all-notes-off and state restoration reset counters;
+restoration applies on the next audio block. No random seed affects round robin.
+The UI displays the last triggered slot. Mapping edits support undo/redo.
+
+## Granular synthesis
+
+Select **Granular** in the Sample page. Defaults are 40 grains/s and 100 ms,
+giving four nominal overlapping grains. Controls are density 1..100 grains/s,
+size 5..500 ms, position 0..1, scan -2..2 times source speed, position spread
+0..1, pitch -24..24 semitones and integer seed 0..65535. Default position is
+0.5, seed 1; scan, spread and pitch default to zero. Old states use Sample mode.
+
+Each voice has one static pool of 32 grains, including both velocity layers:
+16 voices are capped at 512 grains. A full pool refuses the new emission without
+stealing an audible grain. The UI shows occupancy, expected density-times-size,
+and a saturation flag retained until the voice resets. Existing grains retain
+their source assets through a sample swap and drain when granular mode is disabled.
+
+Grains use a 1,025-entry interpolated Hann window and the filtered sample reader.
+The mix is divided by `max(1, sum of active Hann windows)`: overlapping DC stays
+at unity while sparse clouds keep their individual envelopes. Reads clamp to
+the captured sample region, holding its final frame at the end. Scan wraps the
+emission cursor independently of pitch; position jitter clamps to the region.
+
+Position, size and source selection are captured at birth. Density sets the next
+emission interval; changes do not reschedule an interval already underway.
+Pitch, sample level and pan continue to modulate active grains. Scan and spread
+affect future birth positions. Seed applies on the next note, using SplitMix64
+with voice index and note serial. Scheduled attempts consume RNG even at capacity.
+The fractional sample scheduler is independent of audio block boundaries.
+
+Grain markers use fixed atomic snapshots published once per block, with no new
+audio-thread locks or heap operations. Portable state includes assets, mappings,
+variants, parameters and routes; it restarts the deterministic sequence rather
+than storing live grain positions. The 256 MiB budget includes every owned variant.
 
 ## Verification
 
@@ -83,6 +139,21 @@ Run the Debug `test_sample` target (assertions must remain enabled). It covers:
 - portable roundtrip after deleting original files, shared-buffer references,
   malformed references, UI route binding and key-range edits;
 - existing sample regression suite, including callback heap-operation checks.
+
+The layer/granular checks additionally cover all 127 velocities (linear null and
+equal-power RMS variation approximately 0.00000026 dB on orthogonal fixtures),
+100 round-robin triggers, missing variants, reset reproducibility, and UI undo,
+relink and modulation routing. DC ripple is below 0.1 dB at 44.1/48/96 kHz.
+Pool tests reach exactly 32/512 grains without callback allocation or saturation
+gain jumps. Ten-second density measurements meet 1% accuracy. Engine output and
+spawn timing are bit-identical across 37/64/128/512-frame blocks. Processor
+roundtrips meet -90 dBFS RMS error; opening the editor leaves audio bit-identical.
+Portable playback is tested after deleting the original source file.
+
+These are local Windows Debug checks, not a real-time CPU qualification. Dense
+cloud cost scales with grain count, velocity layers and transposition ratio.
+Release profiling, native macOS/Linux builds and live host listening remain
+necessary before claiming production polyphony at every supported sample rate.
 
 The measured stationary residual was approximately -110 dB relative to the
 analytic reference, with approximately -107 dB stopband rejection on these

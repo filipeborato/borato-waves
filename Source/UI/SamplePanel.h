@@ -18,17 +18,19 @@ private:
     void refreshZones ();
     void editZone ();
     void addZone ();
+    void addLayer ();
     std::shared_ptr<const bw::Sample> displayedSample () const;
-    juce::ComboBox zoneChoice;
-    juce::Slider lowKey, highKey, zoneRoot;
-    Action addZoneButton;
-    int selectedZone = 0, displayedZone = -1;
+    juce::ComboBox zoneChoice, velocityLaw, variantChoice;
+    juce::Slider lowKey, highKey, zoneRoot, lowVelocity, highVelocity, velocityFade, variantCount;
+    Action addZoneButton, addLayerButton;
+    int selectedZone = 0, displayedZone = -1, selectedVariant = 0;
     bool updatingZones = false;
     WaveProcessor& processor;
     Action load, relink, cancel, clear;
     ParameterToggle enabled, loop;
-    ParameterChoice route;
+    ParameterChoice route, mode;
     Dial level, pitch, root, pan, start, end;
+    Dial density, size, position, scan, spread, grainPitch, seed;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::String status;
     std::vector<float> overview, overviewRight; // peak per column of the loaded sample (L/mono and R)

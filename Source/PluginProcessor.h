@@ -6,6 +6,7 @@
 #include "Effects.h"
 #include "UserWavetable.h"
 #include "Sample.h"
+#include "Granular.h"
 #include "FactoryPresets.h"
 #include <array>
 
@@ -28,6 +29,8 @@ struct SynthParams
     const bw::SampleBank* sampleBank = nullptr;
     std::atomic<int>* activeSampleZone = nullptr;
     float sampleSwapSeconds = 0.005f;
+    bw::SamplePlaybackState* playback = nullptr;
+    struct GrainParams { std::atomic<float> *mode, *density, *size, *position, *scan, *spread, *seed, *pitch; } grain {};
 };
 
 inline juce::StringArray routeNames() { return { "Filter 1", "Filter 2", "Direct" }; }
@@ -56,7 +59,10 @@ public:
     void legato (int note, float glideSeconds);
     // After a block: whether this voice reads only the current user table / sample.
     bool settled (size_t oscillator) const { return ! isVoiceActive () || oscillators[oscillator].settled (); }
-    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && fadingSample == nullptr && playingBank == params.sampleBank && (playingBank != nullptr || playingSample == params.sample)); }
+    bool sampleSettled () const;
+    int grainCount () const noexcept { return granular.activeCount (); }
+    bool grainSaturated () const noexcept { return granular.saturated; }
+    void publishGrains (bw::GrainDisplaySnapshot& display) const noexcept { granular.publish (display); }
 
 private:
     void glideTo (int note, float seconds);
@@ -124,14 +130,21 @@ private:
     int residualLeft = 0, residualLength = 240;
     // A replaced sample fades out over swapLength while the new one fades in from its start.
     juce::SmoothedValue<float> sampleAmplitude, sampleEnabled, samplePitch, samplePan;
-    const bw::Sample* playingSample = nullptr;
-    const bw::Sample* fadingSample = nullptr;
-    bw::SamplePlayer player, fadingPlayer;
+    struct SampleLayer
+    {
+        const bw::Sample* sample = nullptr;
+        const bw::SampleZone* zone = nullptr;
+        bw::SamplePlayer player;
+        float weight = 0;
+        int index = -1, variant = 0;
+    };
+    std::array<SampleLayer, 2> layers {}, fadingLayers {};
     const bw::SampleBank* playingBank = nullptr;
-    const bw::SampleZone* playingZone = nullptr;
-    const bw::SampleZone* fadingZone = nullptr;
-    const bw::SampleZone* targetZone () const noexcept;
+    bw::SampleTrigger sampleTrigger;
     void selectSample (bool reset);
+    bw::GrainSources grainSources () const noexcept;
+    bw::GranularVoiceEngine granular;
+    juce::SmoothedValue<float> granularMix, grainDensity, grainSize, grainPosition, grainScan, grainSpread, grainPitch;
     int swapLeft = 0, swapLength = 240, cachedSampleRoot = -1;
     float cachedSampleSemitones = 10000, cachedSamplePan = 10000, sampleLeftGain = 1, sampleRightGain = 1;
     double sampleRatio = 1;
@@ -143,6 +156,7 @@ class WaveSynth : public juce::Synthesiser
 public:
     enum Mode { poly, mono, legato };
     void setMode (int newMode, float glideSeconds);
+    const SynthParams* sampleContext = nullptr;
     void noteOn (int channel, int note, float velocity) override;
     void noteOff (int channel, int note, float velocity, bool allowTailOff) override;
     void allNotesOff (int channel, bool allowTailOff) override;
@@ -157,6 +171,7 @@ private:
     bool gate = false, pedal = false;
     std::array<int, 128> held {};
     std::array<float, 128> velocities {};
+    std::array<bw::SampleTrigger, 128> heldTriggers {};
 };
 
 class WaveProcessor : public juce::AudioProcessor, private juce::AudioProcessorParameter::Listener
@@ -224,7 +239,7 @@ public:
     static constexpr size_t kMaxPendingSampleJobs = 2;
     juce::String loadSample (const juce::File& file);
     juce::String relinkSample (const juce::File& file);
-    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {}, int zoneIndex = -1);
+    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {}, int zoneIndex = -1, int variantIndex = 0);
     void cancelSampleLoad (uint64_t requestId = 0);
     bool waitForSampleLoad (int timeoutMs = 5000);
     bool sampleLoading () const noexcept { return sampleLoadingFlag.load (std::memory_order_acquire); }
@@ -236,6 +251,10 @@ public:
     bool sampleZonesMapped () const;
     juce::String setSampleBank (const bw::SampleBank&);
     std::atomic<int> activeSampleZone { -1 };
+    bw::SamplePlaybackState samplePlayback;
+    bw::GrainDisplaySnapshot grainDisplay;
+    std::atomic<int> activeGrains { 0 };
+    std::atomic<bool> grainPoolSaturated { false };
     std::shared_ptr<const bw::Sample> sample () const;
     bool sampleSettled ();
     juce::File samplePath () const;
@@ -322,10 +341,12 @@ private:
     std::array<juce::String, 2> userTableNames;
     juce::String publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name);
     void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& editStepName = {});
-    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error, int zoneIndex);
+    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error, int zoneIndex, int variantIndex);
     bool isRequestCancelledLocked (uint64_t requestId) const noexcept;
     bw::PublishSlot<bw::Sample> sampleSlot;
     bw::PublishSlot<bw::SampleBank> sampleBankSlot;
+    std::atomic<unsigned> sampleSequenceRevision { 0 };
+    unsigned seenSampleSequenceRevision = 0;
     juce::File sampleFile;
     std::atomic<float> sampleSwapSeconds { 0.005f };
     juce::ThreadPool sampleLoadPool { (int) kMaxPendingSampleJobs };

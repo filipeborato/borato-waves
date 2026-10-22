@@ -98,16 +98,22 @@ struct Sample
     std::pair<float, float> readFilteredStereo (double position, double increment,
                                                   double first = 0, double last = -1) const noexcept
     {
-        if (data.empty () || ! std::isfinite (position) || ! std::isfinite (increment) || increment <= 0)
+        if (data.empty () || ! std::isfinite (position) || ! std::isfinite (increment) || ! std::isfinite (first) || ! std::isfinite (last) || increment <= 0)
             return {};
         // Bound worst-case callback work to 4096 taps; extreme ratios fade to silence.
         const double guard = juce::jlimit (0.0, 1.0, (64.0 - increment) / 16.0);
         if (guard <= 0) return {};
         const double step = std::max (1.0, increment), support = SincKernelTable::radius * step;
-        const int lo = juce::jlimit (0, numFrames () - 1, (int) first);
+        const int lo = juce::jlimit (0, numFrames () - 1, (int) std::ceil (first));
         const int hi = last < 0 ? numFrames () - 1 : juce::jlimit (lo, numFrames () - 1, (int) std::ceil (last) - 1);
         position = juce::jlimit ((double) lo, (double) hi, position);
         const bool stereo = isStereo ();
+        // At unity cutoff and integer phase, sinc is exactly the identity; this is common for dense grain clouds.
+        if (increment <= 1.0 && position == std::floor (position))
+        {
+            const auto index = (size_t) position;
+            return { data[index], stereo ? right[index] : data[index] };
+        }
         double left = 0, r = 0, sum = 0;
         const int begin = (int) std::ceil (position - support), finish = (int) std::floor (position + support);
         for (int n = begin; n <= finish; ++n)
@@ -376,6 +382,18 @@ inline bool deserializeSampleContainer (
 }
 
 constexpr int kMaxSampleZones = 128;
+enum class VelocityCrossfadeLaw { linear, equalPower };
+struct SampleVariant
+{
+    std::shared_ptr<const Sample> sample;
+    juce::File path;
+    bool missing = false;
+};
+struct VelocityLayers
+{
+    std::array<int, 2> zones { -1, -1 };
+    std::array<float, 2> weights {};
+};
 struct SampleZone
 {
     std::shared_ptr<const Sample> sample;
@@ -383,6 +401,19 @@ struct SampleZone
     int lowKey = 0, highKey = 127, rootKey = 60;
     float start = 0, end = 1;
     bool loop = false;
+    int lowVel = 1, highVel = 127, crossfadeVel = 0;
+    VelocityCrossfadeLaw crossfadeLaw = VelocityCrossfadeLaw::linear;
+    // Slot 0 falls back to the original sample/path for compatibility with single-sample callers.
+    std::array<SampleVariant, 4> variants {};
+    int numVariants = 1;
+    const Sample* sampleForVariant (int index) const noexcept
+    {
+        if (index < 0 || index >= numVariants || variants[(size_t) index].missing) return nullptr;
+        const auto* asset = variants[(size_t) index].sample.get ();
+        return asset ? asset : index == 0 ? sample.get () : nullptr;
+    }
+    juce::File pathForVariant (int index) const
+    { return index == 0 && variants[0].path == juce::File () ? path : variants[(size_t) index].path; }
 };
 struct SampleBank
 {
@@ -397,36 +428,88 @@ struct SampleBank
     {
         for (size_t i = 0; i < zones.size (); ++i)
             for (size_t j = i + 1; j < zones.size (); ++j)
-                if (zones[i].lowKey <= zones[j].highKey && zones[j].lowKey <= zones[i].highKey) return true;
+                if (zones[i].lowKey <= zones[j].highKey && zones[j].lowKey <= zones[i].highKey)
+                {
+                    const auto& a = zones[i]; const auto& b = zones[j];
+                    if (a.lowKey != b.lowKey || a.highKey != b.highKey || (a.lowVel <= b.highVel && b.lowVel <= a.highVel)) return true;
+                }
         return false;
     }
     bool valid () const noexcept
     {
         if (zones.empty () || zones.size () > kMaxSampleZones || hasKeyOverlap ()) return false;
         for (const auto& z : zones)
-            if (! z.sample || z.sample->numFrames () < kMinSampleRegion || z.sample->numFrames () > kMaxSampleFrames
-                || ! std::isfinite (z.sample->rate) || z.sample->rate <= 0
-                || (! z.sample->right.empty () && z.sample->right.size () != z.sample->data.size ()) || z.lowKey < 0 || z.highKey > 127
-                || z.lowKey > z.highKey || z.rootKey < 0 || z.rootKey > 127 || ! std::isfinite (z.start)
-                || ! std::isfinite (z.end) || z.start < 0 || z.end > 1 || z.start >= z.end) return false;
+        {
+            if (z.lowKey < 0 || z.highKey > 127 || z.lowKey > z.highKey || z.rootKey < 0 || z.rootKey > 127
+                || ! std::isfinite (z.start) || ! std::isfinite (z.end) || z.start < 0 || z.end > 1 || z.start >= z.end
+                || z.lowVel < 1 || z.highVel > 127 || z.lowVel > z.highVel || z.crossfadeVel < 0 || z.crossfadeVel > 63
+                || (z.crossfadeLaw != VelocityCrossfadeLaw::linear && z.crossfadeLaw != VelocityCrossfadeLaw::equalPower)
+                || z.numVariants < 1 || z.numVariants > 4) return false;
+            for (int v = 0; v < z.numVariants; ++v)
+                if (const auto* asset = z.sampleForVariant (v))
+                    if (asset->numFrames () < kMinSampleRegion || asset->numFrames () > kMaxSampleFrames
+                        || ! std::isfinite (asset->rate) || asset->rate <= 0
+                        || (! asset->right.empty () && asset->right.size () != asset->data.size ())) return false;
+            for (int velocity = 1; velocity <= 127; ++velocity)
+            {
+                int count = 0;
+                for (const auto& other : zones)
+                    if (other.lowKey == z.lowKey && other.highKey == z.highKey
+                        && velocity >= other.lowVel - other.crossfadeVel && velocity <= other.highVel + other.crossfadeVel)
+                    {
+                        if (++count > 2) return false;
+                        if (velocity >= z.lowVel - z.crossfadeVel && velocity <= z.highVel + z.crossfadeVel
+                            && other.crossfadeLaw != z.crossfadeLaw) return false;
+                    }
+            }
+        }
         return true;
+    }
+    VelocityLayers selectVelocityLayers (int note, int velocity) const noexcept
+    {
+        VelocityLayers selected;
+        if (velocity < 1 || velocity > 127) return selected;
+        int count = 0;
+        for (size_t i = 0; i < zones.size () && count < 2; ++i)
+        {
+            const auto& z = zones[i];
+            if (note >= z.lowKey && note <= z.highKey && velocity >= z.lowVel - z.crossfadeVel && velocity <= z.highVel + z.crossfadeVel)
+                selected.zones[(size_t) count++] = (int) i;
+        }
+        if (count == 1) selected.weights[0] = 1;
+        if (count == 2)
+        {
+            if (zones[(size_t) selected.zones[0]].lowVel > zones[(size_t) selected.zones[1]].lowVel) std::swap (selected.zones[0], selected.zones[1]);
+            const auto& a = zones[(size_t) selected.zones[0]]; const auto& b = zones[(size_t) selected.zones[1]];
+            const int low = std::max (a.lowVel - a.crossfadeVel, b.lowVel - b.crossfadeVel);
+            const int high = std::min (a.highVel + a.crossfadeVel, b.highVel + b.crossfadeVel);
+            const float t = high > low ? juce::jlimit (0.0f, 1.0f, (float) (velocity - low) / (float) (high - low)) : .5f;
+            selected.weights = a.crossfadeLaw == VelocityCrossfadeLaw::linear
+                ? std::array<float, 2> { 1 - t, t }
+                : std::array<float, 2> { std::cos (t * juce::MathConstants<float>::halfPi), std::sin (t * juce::MathConstants<float>::halfPi) };
+        }
+        return selected;
+    }
+    template <typename Fn> void forEachAsset (Fn&& fn) const
+    {
+        for (const auto& z : zones) { fn (z.sample.get ()); for (const auto& v : z.variants) fn (v.sample.get ()); }
     }
     size_t bytes () const noexcept
     {
-        size_t count = 0;
-        for (size_t i = 0; i < zones.size (); ++i)
+        std::array<const Sample*, kMaxSampleZones * 5> seen {};
+        size_t used = 0, count = 0;
+        forEachAsset ([&] (const Sample* asset)
         {
-            bool seen = false;
-            for (size_t j = 0; j < i; ++j) seen |= zones[j].sample == zones[i].sample;
-            if (! seen && zones[i].sample) count += zones[i].sample->bytes ();
-        }
+            if (asset && std::find (seen.begin (), seen.begin () + (ptrdiff_t) used, asset) == seen.begin () + (ptrdiff_t) used)
+            { if (used < seen.size ()) seen[used++] = asset; count += asset->bytes (); }
+        });
         return count;
     }
 };
 inline juce::ValueTree serializeSampleBank (const SampleBank& bank)
 {
-    juce::ValueTree tree ("SAMPLE_BANK");
-    tree.setProperty ("version", 1, nullptr);
+    juce::ValueTree tree ("SAMPLE_BANK"); tree.setProperty ("version", 2, nullptr);
+    std::array<const Sample*, kMaxSampleZones * 4> assets {};
     for (size_t i = 0; i < bank.zones.size (); ++i)
     {
         const auto& z = bank.zones[i];
@@ -434,56 +517,143 @@ inline juce::ValueTree serializeSampleBank (const SampleBank& bank)
         zone.setProperty ("low", z.lowKey, nullptr); zone.setProperty ("high", z.highKey, nullptr);
         zone.setProperty ("root", z.rootKey, nullptr); zone.setProperty ("start", z.start, nullptr);
         zone.setProperty ("end", z.end, nullptr); zone.setProperty ("loop", z.loop, nullptr);
-        int reference = -1;
-        for (size_t j = 0; j < i; ++j) if (bank.zones[j].sample == z.sample) { reference = (int) j; break; }
-        zone.setProperty ("path", z.path.getFullPathName (), nullptr);
-        if (reference >= 0) zone.setProperty ("sampleZone", reference, nullptr);
-        else zone.addChild (serializeSampleContainer (z.sample.get (), z.path), -1, nullptr);
+        zone.setProperty ("lowVel", z.lowVel, nullptr); zone.setProperty ("highVel", z.highVel, nullptr);
+        zone.setProperty ("crossfadeVel", z.crossfadeVel, nullptr); zone.setProperty ("law", (int) z.crossfadeLaw, nullptr);
+        zone.setProperty ("numVariants", z.numVariants, nullptr);
+        for (int v = 0; v < z.numVariants; ++v)
+        {
+            juce::ValueTree node = v == 0 ? zone : juce::ValueTree ("VARIANT");
+            if (v > 0) node.setProperty ("slot", v, nullptr);
+            const auto* asset = z.sampleForVariant (v); const auto path = z.pathForVariant (v);
+            const size_t index = i * 4 + (size_t) v;
+            node.setProperty ("path", path.getFullPathName (), nullptr);
+            if (! asset) node.setProperty ("missing", true, nullptr);
+            else
+            {
+                const auto found = std::find (assets.begin (), assets.begin () + (ptrdiff_t) index, asset);
+                if (found != assets.begin () + (ptrdiff_t) index)
+                {
+                    const int reference = (int) std::distance (assets.begin (), found);
+                    if (v == 0 && reference % 4 == 0) node.setProperty ("sampleZone", reference / 4, nullptr);
+                    else node.setProperty ("assetRef", reference, nullptr);
+                }
+                else node.addChild (serializeSampleContainer (asset, path), -1, nullptr);
+            }
+            assets[index] = asset;
+            if (v > 0) zone.addChild (node, -1, nullptr);
+        }
         tree.addChild (zone, -1, nullptr);
     }
     return tree;
 }
 inline std::shared_ptr<const SampleBank> deserializeSampleBank (const juce::ValueTree& tree, juce::String& error)
 {
-    if ((int) tree.getProperty ("version", 0) != 1 || tree.getNumChildren () < 1 || tree.getNumChildren () > kMaxSampleZones)
+    const int version = tree.getProperty ("version", 0);
+    if ((version != 1 && version != 2) || tree.getNumChildren () < 1 || tree.getNumChildren () > kMaxSampleZones)
     { error = "Invalid sample bank header"; return {}; }
     auto bank = std::make_shared<SampleBank> ();
+    std::array<std::shared_ptr<const Sample>, kMaxSampleZones * 4> assets {};
     size_t remaining = kMaxAssetMemoryBytes;
     for (const auto& node : tree)
     {
         if (! node.hasType ("ZONE")) { error = "Invalid sample zone"; return {}; }
         SampleZone z;
-        z.lowKey = node.getProperty ("low", -1); z.highKey = node.getProperty ("high", -1);
-        z.rootKey = node.getProperty ("root", -1); z.start = node.getProperty ("start", -1.0f);
-        z.end = node.getProperty ("end", -1.0f); z.loop = node.getProperty ("loop", false);
-        for (const auto* key : { "low", "high", "root" })
+        auto integer = [&] (const char* key, int fallback, int lo, int hi, int& out)
         {
-            const double value = (double) node.getProperty (key, -1);
-            if (! std::isfinite (value) || value < 0 || value > 127 || value != std::floor (value))
-            { error = "Invalid MIDI key"; return {}; }
-        }
-        if (node.hasProperty ("sampleZone"))
+            const double value = (double) node.getProperty (key, fallback);
+            if (! std::isfinite (value) || value < lo || value > hi || value != std::floor (value)) return false;
+            out = (int) value; return true;
+        };
+        int law = 0;
+        if (! integer ("low", -1, 0, 127, z.lowKey) || ! integer ("high", -1, 0, 127, z.highKey)
+            || ! integer ("root", -1, 0, 127, z.rootKey) || ! integer ("lowVel", 1, 1, 127, z.lowVel)
+            || ! integer ("highVel", 127, 1, 127, z.highVel) || ! integer ("crossfadeVel", 0, 0, 63, z.crossfadeVel)
+            || ! integer ("law", 0, 0, 1, law) || ! integer ("numVariants", 1, 1, 4, z.numVariants))
+        { error = "Invalid layer or variant header"; return {}; }
+        z.crossfadeLaw = (VelocityCrossfadeLaw) law;
+        z.start = node.getProperty ("start", -1.0f); z.end = node.getProperty ("end", -1.0f); z.loop = node.getProperty ("loop", false);
+        int variantChildren = 0;
+        for (const auto& child : node)
+            if (child.hasType ("VARIANT")) ++variantChildren;
+            else if (! child.hasType ("SAMPLE")) { error = "Invalid zone child"; return {}; }
+        if (variantChildren != z.numVariants - 1 || (version == 1 && variantChildren != 0))
+        { error = "Invalid variant count"; return {}; }
+        for (int v = 0; v < z.numVariants; ++v)
         {
-            const double value = (double) node.getProperty ("sampleZone");
-            if (! std::isfinite (value) || value < 0 || value >= (double) bank->zones.size ()
-                || value != std::floor (value) || node.getNumChildren () != 0)
-            { error = "Invalid zone sample reference"; return {}; }
-            z.sample = bank->zones[(size_t) value].sample;
-            const auto path = node.getProperty ("path").toString ();
-            if (juce::File::isAbsolutePath (path)) z.path = juce::File (path);
-        }
-        else
-        {
-            bool embedded = false;
-            if (node.getNumChildren () != 1 || ! deserializeSampleContainer (node.getChildWithName ("SAMPLE"), z.sample, z.path, embedded, error, remaining)
-                || ! z.sample) { if (error.isEmpty ()) error = "Zone requires embedded audio"; return {}; }
-            remaining -= z.sample->bytes ();
+            const auto entry = v == 0 ? node : node.getChildWithProperty ("slot", v);
+            if (! entry.isValid () || (v > 0 && ! entry.hasType ("VARIANT"))) { error = "Missing variant slot"; return {}; }
+            auto& variant = z.variants[(size_t) v];
+            const auto path = entry.getProperty ("path").toString ();
+            if (juce::File::isAbsolutePath (path)) variant.path = juce::File (path);
+            variant.missing = entry.getProperty ("missing", false);
+            const size_t index = bank->zones.size () * 4 + (size_t) v;
+            int payloads = 0;
+            for (const auto& child : entry) if (child.hasType ("SAMPLE")) ++payloads;
+            const bool hasReference = entry.hasProperty ("sampleZone") || entry.hasProperty ("assetRef");
+            if ((entry.hasProperty ("sampleZone") && entry.hasProperty ("assetRef")) || payloads > 1
+                || (variant.missing && (version == 1 || hasReference || payloads != 0)))
+            { error = "Invalid variant payload"; return {}; }
+            if (hasReference)
+            {
+                const double value = entry.hasProperty ("sampleZone") ? 4.0 * (double) entry.getProperty ("sampleZone") : (double) entry.getProperty ("assetRef");
+                if (! std::isfinite (value) || value < 0 || value >= (double) index || value != std::floor (value) || payloads != 0 || ! assets[(size_t) value])
+                { error = "Invalid zone sample reference"; return {}; }
+                variant.sample = assets[(size_t) value];
+            }
+            else if (! variant.missing)
+            {
+                bool embedded = false;
+                if (payloads != 1 || ! deserializeSampleContainer (entry.getChildWithName ("SAMPLE"), variant.sample, variant.path, embedded, error, remaining) || ! variant.sample)
+                { if (error.isEmpty ()) error = "Variant requires embedded audio"; return {}; }
+                remaining -= variant.sample->bytes ();
+            }
+            assets[index] = variant.sample;
+            if (v == 0) { z.sample = variant.sample; z.path = variant.path; variant.sample.reset (); variant.path = {}; }
         }
         bank->zones.push_back (std::move (z));
     }
-    if (! bank->valid ()) { error = "Invalid or overlapping key ranges"; return {}; }
+    if (! bank->valid ()) { error = "Invalid or overlapping key/velocity ranges"; return {}; }
     return bank;
 }
+
+struct SampleTrigger
+{
+    int note = -1, velocity = 0;
+    VelocityLayers layers;
+    std::array<int, 2> variants {};
+    uint64_t serial = 0;
+};
+struct SamplePlaybackState
+{
+    std::array<uint32_t, kMaxSampleZones> counters {};
+    std::array<std::atomic<int>, kMaxSampleZones> lastVariant {};
+    SampleTrigger current;
+    uint64_t serial = 0;
+    void reset () noexcept
+    {
+        counters.fill (0); serial = 0; current = {};
+        for (auto& v : lastVariant) v.store (-1, std::memory_order_relaxed);
+    }
+    SampleTrigger trigger (const SampleBank* bank, int note, int velocity) noexcept
+    {
+        SampleTrigger result; result.note = note; result.velocity = velocity;
+        if (velocity < 1 || velocity > 127) return result;
+        result.serial = ++serial;
+        if (bank)
+        {
+            result.layers = bank->selectVelocityLayers (note, velocity);
+            for (size_t l = 0; l < 2; ++l)
+                if (const int index = result.layers.zones[l]; index >= 0 && result.layers.weights[l] > 0)
+                {
+                    const int count = bank->zones[(size_t) index].numVariants;
+                    result.variants[l] = (int) (counters[(size_t) index] % (uint32_t) count);
+                    counters[(size_t) index] = (counters[(size_t) index] + 1u) % (uint32_t) count;
+                    lastVariant[(size_t) index].store (result.variants[l], std::memory_order_relaxed);
+                }
+        }
+        return result;
+    }
+};
 
 // One voice's read head. The region (frames) is taken at reset and, in a loop, again at each wrap, so
 // moving start/end never jumps the head: a loop pass ends no sooner than one fade after the wrap.

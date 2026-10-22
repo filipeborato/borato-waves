@@ -137,6 +137,14 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     l.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "sampleRoot", 1 }, "Sample Root Note", 0, 127, bw::kSampleRootNote));
     continuous ("samplePan", "Sample Pan", -1, 1, 0);
     choice ("sampleRoute", routeNames ());
+    choice ("sampleMode", { "Sample", "Granular" });
+    continuous ("grainDensity", "Grain Density", 1, 100, 40);
+    continuous ("grainSize", "Grain Size ms", 5, 500, 100);
+    continuous ("grainPosition", "Grain Position", 0, 1, .5f);
+    continuous ("grainScan", "Grain Scan", -2, 2, 0);
+    continuous ("grainSpreadPos", "Grain Position Spread", 0, 1, 0);
+    l.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "grainSeed", 1 }, "Grain Seed", 0, 65535, 1));
+    continuous ("grainPitch", "Grain Pitch", -24, 24, 0);
     return l;
 }
 
@@ -153,9 +161,9 @@ void WaveVoice::prepare (double sampleRate, int blockSize)
     residualLeft = 0; lastOut = residual = {};
     for (auto& f : filters) f.reset ();
     for (auto* smoother : { &cutoff, &resonance, &subAmplitude, &subPitch, &noiseAmplitude, &bend, &subEnabled, &noiseEnabled, &cutoff2, &resonance2, &filter2Enabled, &fmDepth,
-                           &sampleAmplitude, &sampleEnabled, &samplePitch, &samplePan })
+                           &sampleAmplitude, &sampleEnabled, &samplePitch, &samplePan, &granularMix, &grainDensity, &grainSize, &grainPosition, &grainScan, &grainSpread, &grainPitch })
         smoother->reset (sampleRate, 0.02);
-    playingSample = fadingSample = nullptr; playingBank = nullptr; playingZone = fadingZone = nullptr; swapLeft = 0;
+    layers = {}; fadingLayers = {}; playingBank = nullptr; swapLeft = 0; granular.reset (getSampleRate (), 1);
     cachedSampleRoot = -1; cachedSampleSemitones = cachedSamplePan = 10000; sampleLeftGain = sampleRightGain = 1;
     glideOffset.setCurrentAndTargetValue (0); pendingGlide = 0;
     for (size_t i = 0; i < sources.size (); ++i)
@@ -188,6 +196,10 @@ void WaveVoice::updateTargets (bool reset)
     set (sampleEnabled, params.sampleOn->load () >= .5f ? 1.0f : 0.0f);
     set (samplePitch, params.samplePitch->load ());
     set (samplePan, params.samplePan->load ());
+    set (granularMix, params.grain.mode->load () >= .5f ? 1.0f : 0.0f);
+    set (grainDensity, params.grain.density->load ()); set (grainSize, params.grain.size->load ());
+    set (grainPosition, params.grain.position->load ()); set (grainScan, params.grain.scan->load ());
+    set (grainSpread, params.grain.spread->load ()); set (grainPitch, params.grain.pitch->load ());
     filters[0].setMode (juce::roundToInt (params.filterType->load ()));
     filters[1].setMode (juce::roundToInt (params.filter2Type->load ()));
     for (size_t i = 0; i < sources.size (); ++i)
@@ -258,6 +270,8 @@ void WaveVoice::startNote (int note, float vel, juce::SynthesiserSound*, int whe
     bend.setCurrentAndTargetValue (bend.getTargetValue ());
     updateTargets (true);
     updateModulation (true);
+    sampleTrigger = params.playback->current;
+    granular.reset (getSampleRate (), (uint64_t) params.grain.seed->load () ^ ((uint64_t) voiceId << 32) ^ sampleTrigger.serial);
     selectSample (true);
     for (auto& f : filters) f.reset ();
     cachedCutoff = cutoff.getCurrentValue (); cachedResonance = resonance.getCurrentValue ();
@@ -288,6 +302,7 @@ void WaveVoice::glideTo (int note, float seconds)
 void WaveVoice::legato (int note, float glideSeconds)
 {
     glideTo (note, glideSeconds);
+    sampleTrigger = params.playback->current;
     modulation.latestVoice.store (voiceId, std::memory_order_relaxed);
 }
 
@@ -299,7 +314,7 @@ void WaveVoice::stopNote (float, bool allowTailOff)
         const float fade = (float) residualLeft / (float) residualLength;
         for (size_t ch = 0; ch < 2; ++ch) residual[ch] = lastOut[ch] + residual[ch] * fade;
         residualLeft = residualLength; lastOut = {};
-        playingSample = fadingSample = nullptr; playingBank = nullptr; playingZone = fadingZone = nullptr; swapLeft = 0;
+        layers = {}; fadingLayers = {}; playingBank = nullptr; swapLeft = 0; granular.reset (getSampleRate (), 1);
         adsr.reset ();
         env2.reset ();
         clearCurrentNote ();
@@ -348,29 +363,61 @@ void WaveVoice::updateModulation (bool reset)
     }
 }
 
-const bw::SampleZone* WaveVoice::targetZone () const noexcept
+bw::GrainSources WaveVoice::grainSources () const noexcept
 {
-    if (params.sampleBank == nullptr) return nullptr;
-    const int index = params.sampleBank->findZone (noteNumber);
-    return index < 0 ? nullptr : &params.sampleBank->zones[(size_t) index];
+    bw::GrainSources result {};
+    for (size_t i = 0; i < layers.size (); ++i)
+    {
+        const auto& layer = layers[i]; auto& source = result[i];
+        source.sample = layer.sample; source.weight = layer.weight;
+        if (! source.sample) continue;
+        const auto* zone = layer.zone;
+        std::tie (source.from, source.to) = source.sample->region (zone ? zone->start : params.sampleStart->load (), zone ? zone->end : params.sampleEnd->load ());
+        const int root = zone ? zone->rootKey : juce::roundToInt (params.sampleRoot->load ());
+        source.ratio = source.sample->rate / juce::MidiMessage::getMidiNoteInHertz (root) / getSampleRate ();
+    }
+    return result;
+}
+
+bool WaveVoice::sampleSettled () const
+{
+    if (! isVoiceActive ()) return true;
+    if (swapLeft != 0 || playingBank != params.sampleBank) return false;
+    if (! playingBank && layers[0].sample != params.sample) return false;
+    return granular.referencesOnly (grainSources ());
 }
 
 void WaveVoice::selectSample (bool reset)
 {
-    const auto* zone = targetZone ();
-    const auto* sample = params.sampleBank != nullptr ? (zone != nullptr ? zone->sample.get () : nullptr) : params.sample;
-    if (reset || (swapLeft == 0 && (playingBank != params.sampleBank || playingZone != zone || playingSample != sample)))
+    const auto selected = params.sampleBank ? params.sampleBank->selectVelocityLayers (noteNumber, sampleTrigger.velocity) : bw::VelocityLayers {};
+    std::array<SampleLayer, 2> desired {};
+    for (size_t i = 0; i < desired.size (); ++i)
     {
-        fadingSample = reset ? nullptr : playingSample;
-        fadingZone = reset ? nullptr : playingZone;
-        fadingPlayer = player;
+        auto& layer = desired[i]; layer.index = selected.zones[i]; layer.weight = selected.weights[i];
+        if (params.sampleBank && layer.index >= 0)
+        {
+            layer.zone = &params.sampleBank->zones[(size_t) layer.index];
+            // A bank edit or mono note-off retarget never consumes a new round-robin slot.
+            for (size_t n = 0; n < 2; ++n)
+                if (sampleTrigger.layers.zones[n] == layer.index) layer.variant = sampleTrigger.variants[n] % layer.zone->numVariants;
+            layer.sample = layer.zone->sampleForVariant (layer.variant);
+        }
+    }
+    if (! params.sampleBank) { desired[0].sample = params.sample; desired[0].weight = 1; }
+    bool changed = playingBank != params.sampleBank;
+    for (size_t i = 0; i < desired.size (); ++i)
+        changed |= desired[i].sample != layers[i].sample || desired[i].zone != layers[i].zone || desired[i].weight != layers[i].weight || desired[i].variant != layers[i].variant;
+    if (reset || (swapLeft == 0 && changed))
+    {
+        fadingLayers = reset ? std::array<SampleLayer, 2> {} : layers;
         swapLength = juce::jmax (1, juce::roundToInt (getSampleRate () * params.sampleSwapSeconds));
         swapLeft = reset ? 0 : swapLength;
-        playingBank = params.sampleBank; playingZone = zone; playingSample = sample;
-        if (sample != nullptr) player.reset (sample->region (zone ? zone->start : params.sampleStart->load (), zone ? zone->end : params.sampleEnd->load ()));
+        playingBank = params.sampleBank; layers = desired;
+        for (auto& layer : layers) if (layer.sample)
+            layer.player.reset (layer.sample->region (layer.zone ? layer.zone->start : params.sampleStart->load (), layer.zone ? layer.zone->end : params.sampleEnd->load ()));
     }
-    if (params.activeSampleZone != nullptr && modulation.latestVoice.load (std::memory_order_relaxed) == voiceId)
-        params.activeSampleZone->store (params.sampleBank ? params.sampleBank->findZone (noteNumber) : (sample ? 0 : -1), std::memory_order_relaxed);
+    if (params.activeSampleZone && modulation.latestVoice.load (std::memory_order_relaxed) == voiceId)
+        params.activeSampleZone->store (params.sampleBank ? desired[desired[1].weight > desired[0].weight ? 1u : 0u].index : (params.sample ? 0 : -1), std::memory_order_relaxed);
 }
 
 void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int num)
@@ -396,6 +443,7 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
     const bool serial = params.filterRouting->load () < .5f, sampleLoop = params.sampleLoop->load () >= .5f;
     const float regionStart = params.sampleStart->load (), regionEnd = params.sampleEnd->load ();
     selectSample (false);
+    const auto grainInputs = grainSources ();
     for (int i = 0; i < num; ++i)
     {
         const float envelopeValue = adsr.getNextSample ();
@@ -525,7 +573,12 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         const float sampleGain = effective (bw::kSampleLevelDestination, sampleAmplitude.getNextValue ()) * sampleGate;
         const float sampleSemitones = effective (bw::kSamplePitchDestination, samplePitch.getNextValue ()) + pitchBend;
         const float currentSamplePan = juce::jlimit (-1.0f, 1.0f, effective (bw::kSamplePanDestination, samplePan.getNextValue ()));
-        if (sampleGate > 0 || swapLeft > 0)
+        const float grainMix = granularMix.getNextValue ();
+        const bw::GrainControls grainControls { effective (bw::kGrainDensityDestination, grainDensity.getNextValue ()),
+            effective (bw::kGrainSizeDestination, grainSize.getNextValue ()), effective (bw::kGrainPositionDestination, grainPosition.getNextValue ()),
+            grainScan.getNextValue (), grainSpread.getNextValue () };
+        const float grainSemitones = effective (bw::kGrainPitchDestination, grainPitch.getNextValue ());
+        if (sampleGate > 0 || swapLeft > 0 || granular.activeCount () > 0)
         {
             if (sampleSemitones != cachedSampleSemitones || sampleRoot != cachedSampleRoot)
             {
@@ -540,20 +593,33 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
                 sampleLeftGain = std::cos (angle) * juce::MathConstants<float>::sqrt2;
                 sampleRightGain = std::sin (angle) * juce::MathConstants<float>::sqrt2;
             }
-            auto play = [&] (bw::SamplePlayer& head, const bw::Sample& source, const bw::SampleZone* zone)
+            auto play = [&] (std::array<SampleLayer, 2>& set)
             {
-                const double ratio = zone ? sampleRatio * std::exp2 ((sampleRoot - zone->rootKey) / 12.0) : sampleRatio;
-                return head.nextStereo (source, source.region (zone ? zone->start : regionStart, zone ? zone->end : regionEnd),
-                                        zone ? zone->loop : sampleLoop, ratio * source.rate);
+                std::pair<float, float> mixed {};
+                for (auto& layer : set)
+                {
+                    if (! layer.sample) continue;
+                    const auto& source = *layer.sample; const auto* zone = layer.zone;
+                    const double ratio = zone ? sampleRatio * std::exp2 ((sampleRoot - zone->rootKey) / 12.0) : sampleRatio;
+                    const auto value = layer.player.nextStereo (source, source.region (zone ? zone->start : regionStart, zone ? zone->end : regionEnd),
+                                                               zone ? zone->loop : sampleLoop, ratio * source.rate);
+                    mixed.first += value.first * layer.weight; mixed.second += value.second * layer.weight;
+                }
+                return mixed;
             };
-            auto [sampledL, sampledR] = playingSample != nullptr ? play (player, *playingSample, playingZone) : std::pair<float, float> { 0.0f, 0.0f };
+            auto [sampledL, sampledR] = play (layers);
             if (swapLeft > 0)
             {
                 const float t = (float) swapLeft / (float) swapLength;
-                const auto [fadeL, fadeR] = fadingSample != nullptr ? play (fadingPlayer, *fadingSample, fadingZone) : std::pair<float, float> { 0.0f, 0.0f };
-                sampledL = sampledL * (1.0f - t) + fadeL * t;
-                sampledR = sampledR * (1.0f - t) + fadeR * t;
-                if (--swapLeft == 0) { fadingSample = nullptr; fadingZone = nullptr; }
+                const auto [fadeL, fadeR] = play (fadingLayers);
+                sampledL += (fadeL - sampledL) * t; sampledR += (fadeR - sampledR) * t;
+                if (--swapLeft == 0) fadingLayers = {};
+            }
+            if (grainMix > 0 || granular.activeCount () > 0)
+            {
+                const auto cloud = granular.process (grainInputs, grainControls, fundamental * std::exp2 ((sampleSemitones + grainSemitones) / 12.0),
+                                                     params.grain.mode->load () >= .5f && sampleGate > 0);
+                sampledL += grainMix * (cloud.first - sampledL); sampledR += grainMix * (cloud.second - sampledR);
             }
             busL[sampleRoute] += sampledL * sampleGain * sampleLeftGain;
             busR[sampleRoute] += sampledR * sampleGain * sampleRightGain;
@@ -575,7 +641,7 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
             lastOut = { voiceOut (0, busL[0], busL[1], busL[2])*envelope, voiceOut (1, busR[0], busR[1], busR[2])*envelope };
             out.addSample (0, start+i, lastOut[0]); out.addSample (1, start+i, lastOut[1]);
         }
-        if (! adsr.isActive ()) { playingSample = fadingSample = nullptr; playingBank = nullptr; playingZone = fadingZone = nullptr; swapLeft = 0; clearCurrentNote (); break; }
+        if (! adsr.isActive ()) { layers = {}; fadingLayers = {}; playingBank = nullptr; swapLeft = 0; granular.reset (getSampleRate (), 1); clearCurrentNote (); break; }
     }
 }
 
@@ -592,6 +658,10 @@ WaveProcessor::WaveProcessor ()
         p ("filterType"), p ("filter2On"), p ("filter2Type"), p ("cutoff2"), p ("reso2"), p ("filterRouting"), p ("subRoute"), p ("noiseRoute"),
         p ("env2Attack"), p ("env2Decay"), p ("env2Sustain"), p ("env2Release"), p ("fmDepth"),
         p ("sampleOn"), p ("sampleLevel"), p ("samplePitch"), p ("sampleStart"), p ("sampleEnd"), p ("sampleLoop"), p ("sampleRoot"), p ("samplePan"), p ("sampleRoute") };
+    params.grain = { p ("sampleMode"), p ("grainDensity"), p ("grainSize"), p ("grainPosition"), p ("grainScan"), p ("grainSpreadPos"), p ("grainSeed"), p ("grainPitch") };
+    params.playback = &samplePlayback;
+    synth.sampleContext = &params;
+    samplePlayback.reset ();
     effectParams = { p ("distOn"), p ("distMode"), p ("distDrive"), p ("distMix"),
         p ("delayOn"), p ("delayTime"), p ("delaySync"), p ("delayDivision"), p ("delayFeedback"), p ("delayPingPong"), p ("delayMix"),
         p ("reverbOn"), p ("reverbSize"), p ("reverbDamping"), p ("reverbWidth"), p ("reverbMix"),
@@ -661,6 +731,7 @@ WaveProcessor::~WaveProcessor ()
 
 void WaveProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    synth.allNotesOff (0, false);
     processingRate = sampleRate;
     freePhases = {};
     synth.setCurrentPlaybackSampleRate (sampleRate);
@@ -694,6 +765,8 @@ void WaveProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
         params.userTables[i] = userSlots[i].acquire (buffer.getNumSamples ());
     params.sample = sampleSlot.acquire (buffer.getNumSamples ());
     params.sampleBank = sampleBankSlot.acquire (buffer.getNumSamples ());
+    const auto revision = sampleSequenceRevision.load (std::memory_order_acquire);
+    if (revision != seenSampleSequenceRevision) { samplePlayback.reset (); seenSampleSequenceRevision = revision; }
     params.activeSampleZone = &activeSampleZone;
     activeSampleZone.store (-1, std::memory_order_relaxed);
     params.sampleSwapSeconds = sampleSwapSeconds.load (std::memory_order_relaxed);
@@ -730,6 +803,18 @@ void WaveProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     for (size_t i = 0; i < userSlots.size (); ++i)
         if (allVoices ([i] (const WaveVoice& voice) { return voice.settled (i); })) userSlots[i].settle ();
     if (allVoices ([] (const WaveVoice& voice) { return voice.sampleSettled (); })) { sampleSlot.settle (); sampleBankSlot.settle (); }
+    int grainCount = 0; bool saturated = false;
+    for (int i = 0; i < synth.getNumVoices (); ++i)
+    {
+        const auto& voice = *static_cast<WaveVoice*> (synth.getVoice (i));
+        grainCount += voice.grainCount (); saturated |= voice.grainSaturated ();
+    }
+    const int displayIndex = modulation.latestVoice.load (std::memory_order_relaxed);
+    if (displayIndex >= 0 && displayIndex < synth.getNumVoices ())
+        static_cast<WaveVoice*> (synth.getVoice (displayIndex))->publishGrains (grainDisplay);
+    activeGrains.store (grainCount, std::memory_order_relaxed);
+    grainPoolSaturated.store (saturated, std::memory_order_relaxed);
+    if (grainCount == 0) grainDisplay.count.store (0, std::memory_order_relaxed);
     // Global FX destinations take macro sources only; per-voice sources have no single value here.
     std::array<float, 3> fxOffsets {};
     for (const auto& route : modulation.routes)
@@ -765,6 +850,14 @@ void WaveSynth::setMode (int newMode, float glideSeconds)
 
 void WaveSynth::noteOn (int channel, int note, float velocity)
 {
+    if (note < 0 || note > 127) return;
+    if (velocity <= 0) return noteOff (channel, note, 0, true);
+    if (sampleContext && sampleContext->playback)
+    {
+        auto& playback = *sampleContext->playback;
+        playback.current = playback.trigger (sampleContext->sampleBank, note, juce::jlimit (1, 127, juce::roundToInt (velocity * 127)));
+        heldTriggers[(size_t) note] = playback.current;
+    }
     if (mode == poly) return Synthesiser::noteOn (channel, note, velocity);
     const juce::ScopedLock sl (lock);
     forget (note);
@@ -788,6 +881,7 @@ void WaveSynth::allNotesOff (int channel, bool allowTailOff)
     const juce::ScopedLock sl (lock);
     heldCount = 0; current = -1; gate = false; pedal = false; // the base forgets the pedal too
     Synthesiser::allNotesOff (channel, allowTailOff);
+    if (sampleContext && sampleContext->playback) sampleContext->playback->reset ();
 }
 
 void WaveSynth::handleSustainPedal (int channel, bool isDown)
@@ -801,6 +895,7 @@ void WaveSynth::handleSustainPedal (int channel, bool isDown)
 
 void WaveSynth::play (int channel, int note)
 {
+    if (sampleContext && sampleContext->playback) sampleContext->playback->current = heldTriggers[(size_t) note];
     auto* voice = static_cast<WaveVoice*> (getVoice (0));
     const bool sounding = voice->isVoiceActive ();
     current = note;
@@ -883,7 +978,7 @@ struct UniqueAssetBytes
         seen.push_back (item);
         bytes += item->bytes ();
     }
-    void add (const bw::SampleBank* bank) { if (bank) for (const auto& z : bank->zones) add (z.sample.get ()); }
+    void add (const bw::SampleBank* bank) { if (bank) bank->forEachAsset ([this] (const bw::Sample* asset) { add (asset); }); }
     template <typename T>
     void add (const std::shared_ptr<const T>& item) { add (item.get ()); }
 };
@@ -1095,7 +1190,7 @@ bool WaveProcessor::isRequestCancelledLocked (uint64_t requestId) const noexcept
     return false;
 }
 
-uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory, int zoneIndex)
+uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory, int zoneIndex, int variantIndex)
 {
     const uint64_t requestId = latestSampleLoadId.fetch_add (1, std::memory_order_acq_rel) + 1;
     {
@@ -1111,12 +1206,12 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
     {
         WaveProcessor& processor;
         uint64_t requestId;
-        int zoneIndex;
+        int zoneIndex, variantIndex;
         juce::File file;
         SampleReaderFactory readerFactory;
 
-        LoadJob (WaveProcessor& p, uint64_t id, const juce::File& f, SampleReaderFactory rf, int zone)
-            : juce::ThreadPoolJob ("SampleLoad"), processor (p), requestId (id), zoneIndex (zone), file (f), readerFactory (std::move (rf))
+        LoadJob (WaveProcessor& p, uint64_t id, const juce::File& f, SampleReaderFactory rf, int zone, int variant)
+            : juce::ThreadPoolJob ("SampleLoad"), processor (p), requestId (id), zoneIndex (zone), variantIndex (variant), file (f), readerFactory (std::move (rf))
         {
             processor.activeSampleJobs.fetch_add (1, std::memory_order_acq_rel);
             processor.sampleLoadIdleEvent.reset ();
@@ -1137,7 +1232,7 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
 
             if (shouldCancel ())
             {
-                processor.completeSampleLoad (requestId, nullptr, file, "Sample load cancelled", zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample load cancelled", zoneIndex, variantIndex);
                 return jobHasFinished;
             }
 
@@ -1155,27 +1250,27 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
 
             if (reader == nullptr)
             {
-                processor.completeSampleLoad (requestId, nullptr, file, "Could not read the audio file", zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, "Could not read the audio file", zoneIndex, variantIndex);
                 return jobHasFinished;
             }
             if (reader->sampleRate <= 0.0 || ! std::isfinite (reader->sampleRate))
             {
-                processor.completeSampleLoad (requestId, nullptr, file, "Sample has an invalid sample rate", zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample has an invalid sample rate", zoneIndex, variantIndex);
                 return jobHasFinished;
             }
             if (reader->numChannels == 0 || reader->numChannels > bw::kMaxSampleChannels)
             {
-                processor.completeSampleLoad (requestId, nullptr, file, "Sample has an unsupported channel count", zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample has an unsupported channel count", zoneIndex, variantIndex);
                 return jobHasFinished;
             }
             if (reader->lengthInSamples <= 0)
             {
-                processor.completeSampleLoad (requestId, nullptr, file, "Sample is empty", zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample is empty", zoneIndex, variantIndex);
                 return jobHasFinished;
             }
             if ((uint64_t) reader->lengthInSamples > (uint64_t) bw::kMaxSampleFrames)
             {
-                processor.completeSampleLoad (requestId, nullptr, file, "Sample exceeds 60 seconds", zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, "Sample exceeds 60 seconds", zoneIndex, variantIndex);
                 return jobHasFinished;
             }
 
@@ -1198,7 +1293,7 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
             // Completion takes extraStateMutex itself, so report failures after releasing it.
             if (error.isNotEmpty ())
             {
-                processor.completeSampleLoad (requestId, nullptr, file, error, zoneIndex);
+                processor.completeSampleLoad (requestId, nullptr, file, error, zoneIndex, variantIndex);
                 return jobHasFinished;
             }
 
@@ -1229,12 +1324,12 @@ uint64_t WaveProcessor::startSampleLoad (const juce::File& file, SampleReaderFac
                     reservationBytes);
             }
 
-            processor.completeSampleLoad (requestId, std::move (loaded), file, error, zoneIndex);
+            processor.completeSampleLoad (requestId, std::move (loaded), file, error, zoneIndex, variantIndex);
             return jobHasFinished;
         }
     };
 
-    sampleLoadPool.addJob (new LoadJob (*this, requestId, file, std::move (readerFactory), zoneIndex), true);
+    sampleLoadPool.addJob (new LoadJob (*this, requestId, file, std::move (readerFactory), zoneIndex, variantIndex), true);
     return requestId;
 }
 
@@ -1271,7 +1366,7 @@ void WaveProcessor::setRestoreReaderFactory (SampleReaderFactory factory)
     restoreReaderFactory = std::move (factory);
 }
 
-bool WaveProcessor::completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample> loaded, const juce::File& path, const juce::String& error, int zoneIndex)
+bool WaveProcessor::completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample> loaded, const juce::File& path, const juce::String& error, int zoneIndex, int variantIndex)
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
     const bool isLatest = (requestId == latestSampleLoadId.load (std::memory_order_acquire));
@@ -1315,8 +1410,11 @@ bool WaveProcessor::completeSampleLoad (uint64_t requestId, std::shared_ptr<cons
         if (! current || zoneIndex >= (int) current->zones.size ())
         { lastSampleLoadError = "Zone no longer exists"; sampleLoadingFlag.store (false); return false; }
         auto updated = std::make_shared<bw::SampleBank> (*current);
-        updated->zones[(size_t) zoneIndex].sample = std::move (loaded);
-        updated->zones[(size_t) zoneIndex].path = path;
+        auto& zone = updated->zones[(size_t) zoneIndex];
+        if (variantIndex < 0 || variantIndex >= zone.numVariants)
+        { lastSampleLoadError = "Variant no longer exists"; sampleLoadingFlag.store (false); return false; }
+        if (variantIndex == 0) { zone.sample = std::move (loaded); zone.path = path; zone.variants[0] = {}; }
+        else zone.variants[(size_t) variantIndex] = { std::move (loaded), path, false };
         sampleBankSlot.publish (std::move (updated));
     }
     else
@@ -1399,7 +1497,12 @@ void WaveProcessor::publishSample (std::shared_ptr<const bw::Sample> loaded, con
 std::shared_ptr<const bw::Sample> WaveProcessor::sample () const
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
-    if (const auto bank = sampleBankSlot.get (); bank && ! bank->zones.empty ()) return bank->zones[0].sample;
+    if (const auto bank = sampleBankSlot.get (); bank && ! bank->zones.empty ())
+    {
+        const auto& z = bank->zones[0];
+        if (z.variants[0].missing) return {};
+        return z.variants[0].sample ? z.variants[0].sample : z.sample;
+    }
     return sampleSlot.get ();
 }
 bool WaveProcessor::sampleSettled ()
@@ -1412,7 +1515,7 @@ bool WaveProcessor::sampleSettled ()
 juce::File WaveProcessor::samplePath () const
 {
     std::lock_guard<std::mutex> lock (extraStateMutex);
-    if (const auto bank = sampleBankSlot.get (); bank && ! bank->zones.empty ()) return bank->zones[0].path;
+    if (const auto bank = sampleBankSlot.get (); bank && ! bank->zones.empty ()) return bank->zones[0].pathForVariant (0);
     return sampleFile;
 }
 bool WaveProcessor::sampleMissing () const
@@ -1451,7 +1554,7 @@ static bool sameCurve (const bw::LfoCurve& a, const bw::LfoCurve& b)
 }
 int WaveProcessor::matchingFactoryPreset () const
 {
-    if (sample () != nullptr || samplePath () != juce::File () || sampleLoading ()) return -1; // factory presets carry no sample
+    if (sampleZonesMapped () || sample () != nullptr || samplePath () != juce::File () || sampleLoading ()) return -1; // factory presets carry no sample
     const auto& parameters = getParameters ();
     std::array<bw::LfoCurve, 2> curves { getLfoCurve (0), getLfoCurve (1) };
     std::array<juce::String, 4> macros { getMacroName (0), getMacroName (1), getMacroName (2), getMacroName (3) };
@@ -1781,6 +1884,7 @@ bool WaveProcessor::restoreState (const juce::XmlElement& xml)
     for (auto name : { "MODULATION", "USERTABLES", "SAMPLE", "SAMPLE_BANK" })
         if (const auto child = state.getChildWithName (name); child.isValid ()) state.removeChild (child, nullptr);
     apvts.replaceState (state);
+    sampleSequenceRevision.fetch_add (1, std::memory_order_release);
     return true;
 }
 void WaveProcessor::setStateInformation (const void* data, int size)

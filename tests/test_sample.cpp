@@ -1328,6 +1328,280 @@ void testMultisampleTwoZonesAndLegato ()
 }
 } // namespace
 
+namespace
+{
+std::shared_ptr<const bw::Sample> engineFixture (double hz = 0, int frames = 16384, double rate = 48000)
+{
+    auto sample = std::make_shared<bw::Sample> (); sample->rate = rate; sample->data.resize ((size_t) frames);
+    for (int i = 0; i < frames; ++i) sample->data[(size_t) i] = hz > 0 ? .5f * (float) std::sin (juce::MathConstants<double>::twoPi * hz * i / rate) : .5f;
+    sample->updateHash (); return sample;
+}
+void testVelocityLayersAndCrossfadeLaws ()
+{
+    const auto sample = engineFixture (375);
+    bw::SampleBank bank; bank.zones = { { sample, {}, 0, 127, 60, 0, 1, true }, { sample, {}, 0, 127, 60, 0, 1, true } };
+    bank.zones[0].highVel = 63; bank.zones[1].lowVel = 64;
+    for (auto& z : bank.zones) z.crossfadeVel = 12;
+    assert (bank.valid ());
+    assert (bank.selectVelocityLayers (60, 0).zones[0] == -1);
+    double worstRms = 0;
+    for (auto law : { bw::VelocityCrossfadeLaw::linear, bw::VelocityCrossfadeLaw::equalPower })
+    {
+        for (auto& z : bank.zones) z.crossfadeLaw = law;
+        for (int velocity = 1; velocity <= 127; ++velocity)
+        {
+            const auto selected = bank.selectVelocityLayers (60, velocity);
+            const double a = selected.weights[0], b = selected.weights[1];
+            if (law == bw::VelocityCrossfadeLaw::linear)
+            {
+                assert (std::abs (a + b - 1) < 1.0e-6);
+                assert (20 * std::log10 (a + b) <= .1);
+            }
+            else
+            {
+                double energy = 0;
+                for (int n = 0; n < 1024; ++n)
+                {
+                    const double x = a * std::sin (juce::MathConstants<double>::twoPi * 8 * n / 1024)
+                                   + b * std::sin (juce::MathConstants<double>::twoPi * 13 * n / 1024);
+                    energy += x * x;
+                }
+                worstRms = std::max (worstRms, std::abs (10 * std::log10 (energy / 512)));
+                assert (worstRms < .001);
+            }
+        }
+    }
+    for (auto& z : bank.zones) z.crossfadeLaw = bw::VelocityCrossfadeLaw::linear;
+    Rig layered, baseline;
+    for (auto* r : { &layered, &baseline }) { sampleOnly (*r); r->set ("sampleRoute", 2); }
+    assert (layered.processor.setSampleBank (bank).isEmpty ());
+    auto single = bank; single.zones.resize (1); single.zones[0].highVel = 127; single.zones[0].crossfadeVel = 0;
+    assert (baseline.processor.setSampleBank (single).isEmpty ());
+    for (int velocity = 1; velocity <= 127; ++velocity)
+    {
+        for (auto* r : { &layered, &baseline }) { r->processor.prepareToPlay (48000, 64); r->send (on (60, (float) velocity / 127)); }
+        const auto a = layered.run (.004), b = baseline.run (.004);
+        double diff = 0, reference = 0;
+        for (size_t n = 0; n < a.size (); ++n) { diff += (a[n] - b[n]) * (a[n] - b[n]); reference += b[n] * b[n]; }
+        assert (diff / std::max (reference, 1.0e-20) < 1.0e-10);
+    }
+    juce::String error;
+    const auto portable = bw::deserializeSampleBank (bw::serializeSampleBank (bank), error);
+    assert (portable && portable->zones[0].crossfadeVel == 12 && portable->zones[1].lowVel == 64);
+    auto bad = bank; bad.zones.push_back (bank.zones[0]); assert (! bad.valid ());
+    std::cout << "ok: all 127 velocities, linear null, equal-power RMS variation dB=" << worstRms << std::endl;
+}
+void testRoundRobinSequenceAndDeterminism ()
+{
+    bw::SampleBank bank; bank.zones.push_back ({ engineFixture (440), {}, 0, 60, 60, 0, 1, true });
+    bank.zones.push_back ({ engineFixture (220), {}, 61, 127, 60, 0, 1, true });
+    auto& zone = bank.zones[0]; zone.numVariants = 4;
+    for (int v = 1; v < 4; ++v) zone.variants[(size_t) v].sample = engineFixture (v == 1 ? 550 : v == 2 ? 660 : 880);
+    Rig r; sampleOnly (r); r.set ("sampleRoute", 2); assert (r.processor.setSampleBank (bank).isEmpty ());
+    for (double hz : { 440.0, 550.0, 660.0, 880.0 })
+    {
+        r.send (on (60)); const auto audio = r.run (.1);
+        assert (std::abs (frequency (audio) / hz - 1) < .005);
+        r.send (off (60)); r.run (.1);
+    }
+    for (int i = 0; i < 100; ++i)
+    {
+        r.send (on (60)); r.run (.001);
+        assert (r.processor.samplePlayback.lastVariant[0].load () == i % 4);
+        r.send (off (60)); r.send (pedal ((i % 2) != 0)); r.send (on (72)); r.send (off (72)); r.send (on (60, 0)); r.run (.001);
+        assert (r.processor.samplePlayback.lastVariant[0].load () == i % 4);
+    }
+    r.send (juce::MidiMessage::allNotesOff (1)); r.run (.1); r.send (on (60)); r.run (.01);
+    assert (r.processor.samplePlayback.lastVariant[0].load () == 0);
+    bank.zones[0].variants[1] = { nullptr, juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("missing-rr.wav"), true };
+    assert (r.processor.setSampleBank (bank).isEmpty ()); r.processor.prepareToPlay (48000, 64);
+    r.send (on (60)); r.run (.01); r.send (off (60)); r.run (.1); r.send (on (60));
+    assert (silent (r.run (.02))); assert (r.processor.samplePlayback.lastVariant[0].load () == 1);
+    juce::MemoryBlock state; r.processor.getStateInformation (state);
+    auto render = [&] ()
+    {
+        Rig restored; restored.processor.setStateInformation (state.getData (), (int) state.getSize ()); restored.processor.prepareToPlay (48000, 64);
+        assert (restored.processor.sampleBank ()->zones[0].numVariants == 4);
+        assert (restored.processor.sampleBank ()->zones[0].variants[1].missing);
+        std::vector<float> audio;
+        for (int i = 0; i < 8; ++i) { restored.send (on (60)); auto chunk = restored.run (.015); audio.insert (audio.end (), chunk.begin (), chunk.end ()); restored.send (off (60)); restored.run (.06); }
+        return audio;
+    };
+    assert (render () == render ());
+    std::cout << "ok: 100 round-robin notes, independent zones, missing slot and repeatable restore" << std::endl;
+}
+void testGranularCloudPoolAndRipple ()
+{
+    const auto dc = engineFixture ();
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1);
+        bw::GrainSources sources { bw::GrainSource { dc.get (), 64, 4096, 1, 1 }, {} };
+        bw::GrainControls controls;
+        double lo = 1, hi = 0;
+        for (int n = 0; n < (int) (rate * .3); ++n)
+        {
+            const auto before = gAudioHeapOps.load ();
+            std::pair<float, float> value;
+            { ScopedAudioHeapGuard guard; value = engine.process (sources, controls, 1); }
+            assert (before == gAudioHeapOps.load ()); assert (engine.activeCount () <= 32);
+            if (n > (int) (rate * .15)) { lo = std::min (lo, (double) value.first); hi = std::max (hi, (double) value.first); }
+        }
+        assert (20 * std::log10 (hi / lo) < .1); assert (std::abs (hi - .5) < 1.0e-6);
+    }
+    std::array<bw::GranularVoiceEngine, 16> voices;
+    for (auto& voice : voices) voice.reset (8000, 9);
+    bw::GrainSources sources { bw::GrainSource { dc.get (), 10, 100, 1, 1 }, {} };
+    bw::GrainControls dense { 100, 500, 1, 2, 1 };
+    int maximum = 0;
+    for (int n = 0; n < 4800; ++n)
+    {
+        int count = 0;
+        for (auto& voice : voices) { const auto value = voice.process (sources, dense, 1); assert (std::isfinite (value.first) && std::abs (value.first) <= .500001f); if (n > 1200) assert (std::abs (value.first - .5f) < 1.0e-6f); count += voice.activeCount (); }
+        maximum = std::max (maximum, count); assert (count <= 512);
+    }
+    assert (maximum == 512); for (auto& voice : voices) assert (voice.saturated);
+    auto bounded = std::make_shared<bw::Sample> (); bounded->data.assign (1024, 100); std::fill (bounded->data.begin () + 101, bounded->data.begin () + 200, .5f);
+    bw::GranularVoiceEngine edge; edge.reset (8000, 1);
+    sources[0] = { bounded.get (), 100.5, 200, 1, 1 };
+    for (int i = 0; i < 1600; ++i) { const auto value = edge.process (sources, dense, 4); assert (value.first <= .50001f); }
+    std::cout << "ok: Hann DC ripple <0.1 dB, region bounds, 32/512 caps and allocation-free engine" << std::endl;
+}
+void testGranularDensityDurationAndBlockInvariance ()
+{
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+        for (double density : { 1.0, 37.3, 100.0 })
+        {
+            bw::GranularScheduler scheduler; int events = 0;
+            for (int n = 0; n < (int) (rate * 10); ++n) if (scheduler.tick (rate, density)) ++events;
+            assert (std::abs (events / (density * 10) - 1) <= .01);
+        }
+    const auto sample = engineFixture (317, 8192, 8000);
+    auto render = [&] (int block)
+    {
+        bw::GranularVoiceEngine engine; engine.reset (8000, 1234);
+        bw::GrainSources sources { bw::GrainSource { sample.get (), 0, 8192, 1, 1 }, {} };
+        bw::GrainControls controls { 37.3f, 93, .3f, -.4f, .2f };
+        std::vector<float> audio; std::vector<int> events;
+        for (int base = 0; base < 8000; base += block)
+            for (int n = base; n < std::min (base + block, 8000); ++n)
+            {
+                const auto before = engine.spawned; audio.push_back (engine.process (sources, controls, 1).first);
+                if (engine.spawned != before) events.push_back (n);
+            }
+        return std::make_pair (audio, events);
+    };
+    const auto reference = render (64);
+    for (int block : { 37, 128, 512 }) assert (render (block) == reference);
+    for (float size : { 5.0f, 500.0f }) for (float density : { 1.0f, 100.0f })
+    {
+        bw::GranularVoiceEngine engine; engine.reset (8000, 1);
+        bw::GrainSources sources { bw::GrainSource { sample.get (), 0, 8192, 1, 1 }, {} };
+        for (int n = 0; n < 1600; ++n) assert (std::isfinite (engine.process (sources, { density, size, .5f, 2, 1 }, .25).first));
+    }
+    bw::GranularVoiceEngine latched; latched.reset (8000, 1);
+    const bw::GrainSources latchedSources { bw::GrainSource { sample.get (), 0, 8192, 1, 1 }, {} };
+    for (int n = 0; n < 100; ++n) latched.process (latchedSources, { 1, 500, .1f, 0, 0 }, 1);
+    bw::GrainDisplaySnapshot before, after; latched.publish (before);
+    latched.process (latchedSources, { 100, 5, .8f, 0, 0 }, 2); latched.publish (after);
+    assert (latched.spawned == 1);
+    assert (std::abs ((after.grains[0].normPos.load () - before.grains[0].normPos.load ()) * 8192 - 2) < .001);
+    assert (std::abs (after.grains[0].normPhase.load () - before.grains[0].normPhase.load () - 1.0f / 4000) < 1.0e-6);
+    bw::GranularVoiceEngine invalid; invalid.reset (std::numeric_limits<double>::quiet_NaN (), 1);
+    const float nan = std::numeric_limits<float>::quiet_NaN ();
+    for (int i = 0; i < 100; ++i) assert (std::isfinite (invalid.process (latchedSources, { nan, nan, nan, nan, nan }, nan).first));
+    std::cout << "ok: 10-second density accuracy and bit-identical 37/64/128/512 scheduling" << std::endl;
+}
+void testGranularModulationAndPortableRoundTrip ()
+{
+    const auto file = writeTone ("portable-grains", 8000, .25, 317);
+    Rig setup (8000); sampleOnly (setup); setup.set ("sampleRoute", 2); setup.set ("sampleMode", 1);
+    setup.set ("grainSeed", 42); setup.set ("grainSpreadPos", .2f); setup.set ("grainScan", .3f);
+    assert (setup.processor.loadSample (file).isEmpty ());
+    sampleRoute (setup, bw::kGrainPositionDestination, .2f); setup.set ("macro1", .25f);
+    const auto preset = folder.getChildFile ("granular-portable.bwpreset"); assert (setup.processor.savePreset (preset));
+    juce::MemoryBlock state; setup.processor.getStateInformation (state); file.deleteFile ();
+    auto render = [&] (int block, bool withEditor, bool usePreset = false)
+    {
+        Rig r (8000);
+        if (usePreset) assert (r.processor.loadPreset (preset)); else r.processor.setStateInformation (state.getData (), (int) state.getSize ());
+        r.processor.prepareToPlay (8000, block);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (withEditor ? r.processor.createEditor () : nullptr);
+        r.send (on (60)); return renderChecked (r.processor, r.pending, 4000, block);
+    };
+    const auto reference = render (64, false);
+    assert (reference == render (64, true));
+    assert (reference == render (64, false, true));
+    for (int block : { 37, 128, 512 })
+    {
+        const auto audio = render (block, false); double error = 0;
+        for (size_t n = 0; n < audio.size (); ++n) error += (audio[n] - reference[n]) * (audio[n] - reference[n]);
+        assert (std::sqrt (error / audio.size ()) < 3.1623e-5); // -90 dBFS.
+    }
+    Rig stress (8000); stress.processor.setStateInformation (state.getData (), (int) state.getSize ());
+    stress.set ("grainDensity", 100); stress.set ("grainSize", 500);
+    for (int note = 48; note < 64; ++note) stress.send (on (note));
+    renderChecked (stress.processor, stress.pending, 2800, 64);
+    assert (stress.processor.activeGrains.load () == 512 && stress.processor.grainPoolSaturated.load ());
+    for (int destination : { bw::kGrainPositionDestination, bw::kGrainSizeDestination, bw::kGrainDensityDestination, bw::kGrainPitchDestination })
+    {
+        sampleRoute (stress, destination, 1, true);
+        for (int n = 0; n < 4; ++n) { stress.set ("macro1", (float) (n % 2)); renderChecked (stress.processor, stress.pending, 256, 37); }
+    }
+    const auto replacement = writeTone ("grain-swap", 8000, .25, 550);
+    stress.processor.setSampleSwapSeconds (.001f); assert (stress.processor.loadSample (replacement).isEmpty ());
+    renderChecked (stress.processor, stress.pending, 64, 64); assert (! stress.processor.sampleSettled ());
+    stress.set ("sampleMode", 0); renderChecked (stress.processor, stress.pending, 4800, 64);
+    assert (stress.processor.sampleSettled ());
+    assert (stress.processor.assetMemoryBytes () <= bw::kMaxAssetMemoryBytes);
+    std::cout << "ok: granular UI invariance, portable null, 16-voice automation and retained grains" << std::endl;
+}
+void testLayersAndGranularUI ()
+{
+    Rig r; sampleOnly (r);
+    bw::SampleBank bank; bank.zones.push_back ({ engineFixture (440), {}, 0, 127, 60, 0, 1, true });
+    assert (r.processor.setSampleBank (bank).isEmpty ());
+    std::unique_ptr<juce::AudioProcessorEditor> editor (r.processor.createEditor ());
+    sampleControl (*editor, "SAMPLE")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    auto* panel = sampleControl (*editor, "Sample source"); assert (panel);
+    sampleControl (*editor, "ADD LAYER")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    assert (r.processor.sampleBank ()->zones.size () == 2);
+    auto* law = dynamic_cast<juce::ComboBox*> (sampleControl (*editor, "Velocity crossfade law")); assert (law);
+    law->setSelectedItemIndex (1, juce::sendNotificationSync);
+    assert (r.processor.sampleBank ()->zones[0].crossfadeLaw == bw::VelocityCrossfadeLaw::equalPower);
+    assert (r.processor.undo ()); assert (r.processor.sampleBank ()->zones[0].crossfadeLaw == bw::VelocityCrossfadeLaw::linear);
+    assert (r.processor.redo ()); panel->visibilityChanged ();
+    auto* count = dynamic_cast<juce::Slider*> (sampleControl (*editor, "Round robin count")); assert (count);
+    count->setValue (4, juce::sendNotificationSync); panel->visibilityChanged ();
+    auto* choice = dynamic_cast<juce::ComboBox*> (sampleControl (*editor, "Round robin variant")); assert (choice);
+    assert (choice->getNumItems () == 4); choice->setSelectedItemIndex (1, juce::sendNotificationSync);
+    assert (choice->getText ().contains ("MISSING"));
+    assert (sampleControl (*editor, "RELINK")->isEnabled ());
+    const auto file = writeTone ("rr-relink", 48000, .1, 550);
+    r.processor.startSampleLoad (file, {}, 1, 1); assert (r.processor.waitForSampleLoad (5000));
+    assert (r.processor.sampleBank ()->zones.size () == 2 && r.processor.sampleBank ()->zones[1].sampleForVariant (1));
+    sampleControl (*editor, "Sample playback mode")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    assert (r.processor.apvts.getRawParameterValue ("sampleMode")->load () > .5f);
+    int slot = 1;
+    for (const auto* title : { "POSITION", "GRAIN SIZE", "DENSITY", "GRAIN PITCH" })
+    {
+        auto* dial = dynamic_cast<bw::ui::Dial*> (sampleControl (*panel, title)); assert (dial && dial->onModulationDrop);
+        dial->onModulationDrop (3, dial->parameterId ());
+        assert ((int) r.processor.apvts.getRawParameterValue ("mod" + juce::String (slot) + "Destination")->load () == 26 + slot);
+        ++slot;
+    }
+    panel->visibilityChanged ();
+    sampleControl (*editor, "SAMPLE")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    panel->visibilityChanged ();
+    auto stream = juce::File::getCurrentWorkingDirectory ().getChildFile ("build/granular-layers.png").createOutputStream ();
+    if (stream) { stream->setPosition (0); stream->truncate (); juce::PNGImageFormat ().writeImageToStream (editor->createComponentSnapshot (editor->getLocalBounds ()), *stream); }
+    // Splitting a key range carries all its velocity layers into the new range.
+    sampleControl (*editor, "ADD ZONE")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    assert (r.processor.sampleBank ()->zones.size () == 4 && r.processor.sampleBank ()->valid ());
+    std::cout << "ok: velocity/RR UI, undo/redo, granular route binding and layered key split" << std::endl;
+}
+} // namespace
+
 int main()
 {
 #ifdef _WIN32
@@ -1336,6 +1610,12 @@ int main()
     _set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     juce::ScopedJuceInitialiser_GUI init;
+    testVelocityLayersAndCrossfadeLaws ();
+    testRoundRobinSequenceAndDeterminism ();
+    testGranularCloudPoolAndRipple ();
+    testGranularDensityDurationAndBlockInvariance ();
+    testGranularModulationAndPortableRoundTrip ();
+    testLayersAndGranularUI ();
     testTranspositionAliasingAndPassband ();
     testSampleModulation ();
     testMultisampleTwoZonesAndLegato ();
