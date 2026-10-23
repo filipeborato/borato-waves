@@ -406,6 +406,12 @@ struct SampleZone
     // Slot 0 falls back to the original sample/path for compatibility with single-sample callers.
     std::array<SampleVariant, 4> variants {};
     int numVariants = 1;
+    // Loop window (fractions of the region when linked, else of the file), loop mode and direction.
+    int loopMode = 0; // LoopMode
+    float loopStart = 0, loopEnd = 1;
+    bool loopLinked = true, reverse = false;
+    // Per-zone fine tune (cents), equal-power pan (-1..1) and gain (dB), as imported from SFZ tune/pan/volume.
+    float tuneCents = 0, pan = 0, gainDb = 0;
     const Sample* sampleForVariant (int index) const noexcept
     {
         if (index < 0 || index >= numVariants || variants[(size_t) index].missing) return nullptr;
@@ -415,9 +421,34 @@ struct SampleZone
     juce::File pathForVariant (int index) const
     { return index == 0 && variants[0].path == juce::File () ? path : variants[(size_t) index].path; }
 };
+// Manual slices of one sample: marker frames start each slice (the first is always 0), slice i plays on note
+// root + i, from its marker to the next marker (single) or to the end of the file (play to end).
+constexpr int kMaxSlices = kMaxSampleZones;
+struct SliceMap
+{
+    std::vector<int> markers;
+    int root = 60;
+    bool playToEnd = false;
+};
+// Sorted, unique slice starts: 0 first, each at least kMinSampleRegion frames after the previous one and
+// before the file end; markers too close to a kept one, or past the cap, are dropped.
+inline std::vector<int> sanitiseSliceMarkers (std::vector<int> frames, int numFrames)
+{
+    frames.push_back (0);
+    std::sort (frames.begin (), frames.end ());
+    std::vector<int> kept;
+    for (int f : frames)
+        if (f >= 0 && f <= numFrames - kMinSampleRegion && (kept.empty () || f >= kept.back () + kMinSampleRegion) && (int) kept.size () < kMaxSlices)
+            kept.push_back (f);
+    return kept;
+}
+
 struct SampleBank
 {
     std::vector<SampleZone> zones;
+    // Set when the zones were generated from slices of zones[0].sample; kept for editing the markers again.
+    bool sliced = false;
+    SliceMap slices;
     int findZone (int note) const noexcept
     {
         for (size_t i = 0; i < zones.size (); ++i)
@@ -444,7 +475,10 @@ struct SampleBank
                 || ! std::isfinite (z.start) || ! std::isfinite (z.end) || z.start < 0 || z.end > 1 || z.start >= z.end
                 || z.lowVel < 1 || z.highVel > 127 || z.lowVel > z.highVel || z.crossfadeVel < 0 || z.crossfadeVel > 63
                 || (z.crossfadeLaw != VelocityCrossfadeLaw::linear && z.crossfadeLaw != VelocityCrossfadeLaw::equalPower)
-                || z.numVariants < 1 || z.numVariants > 4) return false;
+                || z.numVariants < 1 || z.numVariants > 4 || z.loopMode < 0 || z.loopMode > 3
+                || ! std::isfinite (z.loopStart) || ! std::isfinite (z.loopEnd) || z.loopStart < 0 || z.loopEnd > 1 || z.loopStart > z.loopEnd
+                || ! std::isfinite (z.tuneCents) || std::abs (z.tuneCents) > 2400 || ! std::isfinite (z.pan) || std::abs (z.pan) > 1
+                || ! std::isfinite (z.gainDb) || z.gainDb < -144 || z.gainDb > 24) return false;
             for (int v = 0; v < z.numVariants; ++v)
                 if (const auto* asset = z.sampleForVariant (v))
                     if (asset->numFrames () < kMinSampleRegion || asset->numFrames () > kMaxSampleFrames
@@ -520,6 +554,10 @@ inline juce::ValueTree serializeSampleBank (const SampleBank& bank)
         zone.setProperty ("lowVel", z.lowVel, nullptr); zone.setProperty ("highVel", z.highVel, nullptr);
         zone.setProperty ("crossfadeVel", z.crossfadeVel, nullptr); zone.setProperty ("law", (int) z.crossfadeLaw, nullptr);
         zone.setProperty ("numVariants", z.numVariants, nullptr);
+        zone.setProperty ("loopMode", z.loopMode, nullptr); zone.setProperty ("loopStart", z.loopStart, nullptr);
+        zone.setProperty ("loopEnd", z.loopEnd, nullptr); zone.setProperty ("loopLink", z.loopLinked, nullptr);
+        zone.setProperty ("reverse", z.reverse, nullptr);
+        zone.setProperty ("tune", z.tuneCents, nullptr); zone.setProperty ("pan", z.pan, nullptr); zone.setProperty ("gain", z.gainDb, nullptr);
         for (int v = 0; v < z.numVariants; ++v)
         {
             juce::ValueTree node = v == 0 ? zone : juce::ValueTree ("VARIANT");
@@ -544,18 +582,30 @@ inline juce::ValueTree serializeSampleBank (const SampleBank& bank)
         }
         tree.addChild (zone, -1, nullptr);
     }
+    if (bank.sliced)
+    {
+        juce::ValueTree slices ("SLICES");
+        juce::StringArray markers;
+        for (int f : bank.slices.markers) markers.add (juce::String (f));
+        slices.setProperty ("markers", markers.joinIntoString (","), nullptr);
+        slices.setProperty ("root", bank.slices.root, nullptr); slices.setProperty ("playToEnd", bank.slices.playToEnd, nullptr);
+        tree.addChild (slices, -1, nullptr);
+    }
     return tree;
 }
 inline std::shared_ptr<const SampleBank> deserializeSampleBank (const juce::ValueTree& tree, juce::String& error)
 {
     const int version = tree.getProperty ("version", 0);
-    if ((version != 1 && version != 2) || tree.getNumChildren () < 1 || tree.getNumChildren () > kMaxSampleZones)
+    const auto slicesNode = tree.getChildWithName ("SLICES");
+    const int zoneCount = tree.getNumChildren () - (slicesNode.isValid () ? 1 : 0);
+    if ((version != 1 && version != 2) || zoneCount < 1 || zoneCount > kMaxSampleZones)
     { error = "Invalid sample bank header"; return {}; }
     auto bank = std::make_shared<SampleBank> ();
     std::array<std::shared_ptr<const Sample>, kMaxSampleZones * 4> assets {};
     size_t remaining = kMaxAssetMemoryBytes;
     for (const auto& node : tree)
     {
+        if (node == slicesNode) continue;
         if (! node.hasType ("ZONE")) { error = "Invalid sample zone"; return {}; }
         SampleZone z;
         auto integer = [&] (const char* key, int fallback, int lo, int hi, int& out)
@@ -568,10 +618,14 @@ inline std::shared_ptr<const SampleBank> deserializeSampleBank (const juce::Valu
         if (! integer ("low", -1, 0, 127, z.lowKey) || ! integer ("high", -1, 0, 127, z.highKey)
             || ! integer ("root", -1, 0, 127, z.rootKey) || ! integer ("lowVel", 1, 1, 127, z.lowVel)
             || ! integer ("highVel", 127, 1, 127, z.highVel) || ! integer ("crossfadeVel", 0, 0, 63, z.crossfadeVel)
-            || ! integer ("law", 0, 0, 1, law) || ! integer ("numVariants", 1, 1, 4, z.numVariants))
+            || ! integer ("law", 0, 0, 1, law) || ! integer ("numVariants", 1, 1, 4, z.numVariants)
+            || ! integer ("loopMode", 0, 0, 3, z.loopMode))
         { error = "Invalid layer or variant header"; return {}; }
         z.crossfadeLaw = (VelocityCrossfadeLaw) law;
         z.start = node.getProperty ("start", -1.0f); z.end = node.getProperty ("end", -1.0f); z.loop = node.getProperty ("loop", false);
+        z.loopStart = node.getProperty ("loopStart", 0.0f); z.loopEnd = node.getProperty ("loopEnd", 1.0f);
+        z.loopLinked = node.getProperty ("loopLink", true); z.reverse = node.getProperty ("reverse", false);
+        z.tuneCents = node.getProperty ("tune", 0.0f); z.pan = node.getProperty ("pan", 0.0f); z.gainDb = node.getProperty ("gain", 0.0f);
         int variantChildren = 0;
         for (const auto& child : node)
             if (child.hasType ("VARIANT")) ++variantChildren;
@@ -613,6 +667,40 @@ inline std::shared_ptr<const SampleBank> deserializeSampleBank (const juce::Valu
         bank->zones.push_back (std::move (z));
     }
     if (! bank->valid ()) { error = "Invalid or overlapping key/velocity ranges"; return {}; }
+    if (slicesNode.isValid ())
+    {
+        const auto* asset = bank->zones[0].sample.get ();
+        std::vector<int> markers;
+        for (const auto& token : juce::StringArray::fromTokens (slicesNode.getProperty ("markers").toString (), ",", ""))
+            if (token.trim ().containsOnly ("0123456789") && token.trim ().isNotEmpty () && token.length () <= 9) markers.push_back (token.getIntValue ());
+        const int root = slicesNode.getProperty ("root", -1);
+        if (! asset || root < 0 || root > 127) { error = "Invalid slice map"; return {}; }
+        bank->sliced = true;
+        bank->slices = { sanitiseSliceMarkers (std::move (markers), asset->numFrames ()), root, (bool) slicesNode.getProperty ("playToEnd", false) };
+    }
+    return bank;
+}
+
+// Zones for slices of `sample`; refuses maps that would run past MIDI note 127.
+inline std::shared_ptr<const SampleBank> buildSliceBank (std::shared_ptr<const Sample> sample, const juce::File& path, SliceMap map, juce::String& error)
+{
+    if (! sample || sample->numFrames () < kMinSampleRegion) { error = "Load a sample before slicing"; return {}; }
+    map.markers = sanitiseSliceMarkers (std::move (map.markers), sample->numFrames ());
+    const int count = (int) map.markers.size ();
+    if (map.root < 0 || map.root + count - 1 > 127) { error = "Slices from the root note run past MIDI note 127"; return {}; }
+    auto bank = std::make_shared<SampleBank> ();
+    const double frames = sample->numFrames ();
+    for (int i = 0; i < count; ++i)
+    {
+        SampleZone zone;
+        zone.sample = sample; zone.path = path;
+        zone.lowKey = zone.highKey = zone.rootKey = map.root + i;
+        zone.start = (float) (map.markers[(size_t) i] / frames);
+        zone.end = map.playToEnd || i + 1 == count ? 1.0f : (float) (map.markers[(size_t) i + 1] / frames);
+        bank->zones.push_back (std::move (zone));
+    }
+    bank->sliced = true; bank->slices = std::move (map);
+    if (! bank->valid ()) { error = "Invalid slice map"; return {}; }
     return bank;
 }
 
@@ -655,53 +743,132 @@ struct SamplePlaybackState
     }
 };
 
-// One voice's read head. The region (frames) is taken at reset and, in a loop, again at each wrap, so
-// moving start/end never jumps the head: a loop pass ends no sooner than one fade after the wrap.
-// Loop: the last `fade` frames crossfade into the frames one period earlier, so the wrap never steps.
-// One-shot: the last `fade` frames fade out, then the head stops.
+// How a voice plays its region: direction, an inner loop window and its mode, and the loop/edge fades.
+// Linked loop points are fractions of the region (they move with start/end); unlinked ones are fractions of
+// the file, clamped into the region. Defaults reproduce the original whole-region forward loop.
+enum class LoopMode { forward = 0, reverse, pingPong, tailed };
+inline juce::StringArray loopModeNames () { return { "Forward", "Reverse", "Ping-Pong", "Tailed" }; }
+struct PlaybackSettings
+{
+    bool loop = false, reverse = false, linked = true;
+    LoopMode mode = LoopMode::forward;
+    float loopStart = 0, loopEnd = 1;
+    float crossfadeSeconds = .01f, fadeInSeconds = 0, fadeOutSeconds = .01f;
+};
+
+// One voice's read head, in play-order coordinates v (0 at the start of the region in the play direction, so
+// reverse mirrors everything). Geometry is taken at the first read and again at every wrap or bounce, so moving
+// start/end/loop points never jumps the head: a loop pass ends no sooner than one crossfade after the wrap.
+// Forward loop: the last `xf` frames before the loop end crossfade into the frames one period earlier, so the
+// wrap never steps; Reverse loop: after reaching the loop end it bounces once, then loops backwards with the
+// mirrored crossfade; Ping-Pong bounces at both loop ends; Tailed loops forwards until a release is seen on
+// entering the crossfade (or at the loop end without one), then plays on to the region end.
+// Without a loop (or in the tail) the last fade-out frames fade, then the head stops.
 struct SamplePlayer
 {
-    double position = 0, from = 0, to = 0;
-    bool finished = false;
+    double position = 0; // file frame of the head
+    bool finished = false, tail = false;
 
-    void reset (std::pair<double, double> region) noexcept { std::tie (from, to) = region; position = from; finished = false; }
-
-    std::pair<float, float> nextStereo (const Sample& sample, std::pair<double, double> region, bool loop, double increment) noexcept
+    void reset (std::pair<double, double> region) noexcept
     {
-        if (finished) return { 0.0f, 0.0f };
-        const double maxFade = sample.rate * 0.01;
-        if (position >= to)
-        {
-            if (! loop) { finished = true; return { 0.0f, 0.0f }; }
-            const double period = to - from - std::min (maxFade, (to - from) * 0.5);
-            position -= period * (std::floor ((position - to) / period) + 1);
-            from = region.first;
-            to = std::min ((double) sample.data.size(), std::max (region.second, position + maxFade));
-        }
-        const double fade = std::min (maxFade, (to - from) * 0.5), period = to - from - fade;
-        auto [outL, outR] = sample.readFilteredStereo (position, increment);
-        if (const double into = position - (to - fade); into > 0)
-        {
-            const float t = (float) std::min (1.0, into / fade);
-            if (loop)
-            {
-                const auto [wrapL, wrapR] = sample.readFilteredStereo (position - period, increment);
-                outL += t * (wrapL - outL);
-                outR += t * (wrapR - outR);
-            }
-            else
-            {
-                outL *= (1.0f - t);
-                outR *= (1.0f - t);
-            }
-        }
-        position += increment;
-        return { outL, outR };
+        std::tie (from, to) = region; position = from; v = 0; travelled = 0; direction = 1;
+        finished = tail = captured = inZone = false;
     }
 
+    std::pair<float, float> nextStereo (const Sample& sample, std::pair<double, double> region, const PlaybackSettings& s,
+                                        double increment, bool released = false) noexcept
+    {
+        if (finished) return { 0.0f, 0.0f };
+        if (! captured) capture (sample, region, s);
+        const bool looping = s.loop && ! tail;
+        if (! looping) direction = 1; // a loop switched off mid-bounce plays on towards the end
+        if (looping && s.mode == LoopMode::pingPong)
+        {
+            if (direction > 0 && v >= vb) { v = std::max (va, 2 * (vb - 1) - v); direction = -1; capture (sample, region, s); }
+            else if (direction < 0 && v < va) { v = std::min (vb - 1, 2 * va - v); direction = 1; capture (sample, region, s); }
+        }
+        else if (looping && s.mode == LoopMode::reverse)
+        {
+            if (direction > 0 && v >= vb) { v = std::max (va, 2 * (vb - 1) - v); direction = -1; capture (sample, region, s); }
+            else if (direction < 0 && v < va) { v += period * (std::floor ((va - v) / period) + 1); inZone = false; capture (sample, region, s); }
+        }
+        else if (looping)
+        {
+            if (! inZone && v >= vb - xf)
+            {
+                inZone = true;
+                if (s.mode == LoopMode::tailed && released) tail = true;
+            }
+            if (! tail && v >= vb) { v -= period * (std::floor ((v - vb) / period) + 1); inZone = false; capture (sample, region, s); }
+        }
+        if (direction > 0 && v >= length) { finished = true; return { 0.0f, 0.0f }; }
+
+        auto read = [&] (double at) { return sample.readFilteredStereo (fileAt (at), increment); };
+        auto [outL, outR] = read (v);
+        const bool wrapping = s.loop && ! tail && s.mode != LoopMode::pingPong && xf > 0;
+        if (wrapping && direction > 0 && s.mode != LoopMode::reverse && v > vb - xf)
+        {
+            const float t = (float) std::min (1.0, (v - (vb - xf)) / xf);
+            const auto [wrapL, wrapR] = read (v - period);
+            outL += t * (wrapL - outL); outR += t * (wrapR - outR);
+        }
+        else if (wrapping && direction < 0 && v < va + xf)
+        {
+            const float t = (float) std::min (1.0, ((va + xf) - v) / xf);
+            const auto [wrapL, wrapR] = read (v + period);
+            outL += t * (wrapL - outL); outR += t * (wrapR - outR);
+        }
+        float gain = 1;
+        if (fadeIn > 0 && travelled < fadeIn) gain *= (float) (travelled / fadeIn);
+        if ((! s.loop || tail) && fadeOut > 0 && v > length - fadeOut) gain *= (float) std::max (0.0, (length - v) / fadeOut);
+        v += direction * increment; travelled += increment;
+        position = fileAt (v);
+        return { outL * gain, outR * gain };
+    }
+    std::pair<float, float> nextStereo (const Sample& sample, std::pair<double, double> region, bool loop, double increment) noexcept
+    {
+        PlaybackSettings settings; settings.loop = loop;
+        return nextStereo (sample, region, settings, increment);
+    }
     float next (const Sample& sample, std::pair<double, double> region, bool loop, double increment) noexcept
     {
         return nextStereo (sample, region, loop, increment).first;
     }
+
+private:
+    double fileAt (double at) const noexcept { return reverse ? (to - 1) - at : from + at; }
+    void capture (const Sample& sample, std::pair<double, double> region, const PlaybackSettings& s) noexcept
+    {
+        const double file = fileAt (v), frames = (double) sample.numFrames ();
+        if (! captured) reverse = s.reverse;
+        from = juce::jlimit (0.0, frames, std::min (region.first, region.second));
+        to = juce::jlimit (from, frames, std::max (region.first, region.second));
+        const double span = to - from;
+        auto fraction = [] (float value, float fallback) { return std::isfinite (value) ? juce::jlimit (0.0f, 1.0f, value) : fallback; };
+        double ls = s.linked ? from + fraction (s.loopStart, 0) * span : fraction (s.loopStart, 0) * frames;
+        double le = s.linked ? from + fraction (s.loopEnd, 1) * span : fraction (s.loopEnd, 1) * frames;
+        ls = juce::jlimit (from, to, ls); le = juce::jlimit (from, to, le);
+        if (ls > le) std::swap (ls, le);
+        if (le - ls < kMinSampleRegion) { le = std::min (to, ls + kMinSampleRegion); ls = std::max (from, le - kMinSampleRegion); }
+        if (captured) v = reverse ? (to - 1) - file : file - from;
+        captured = true;
+        va = reverse ? to - le : ls - from; vb = reverse ? to - ls : le - from;
+        auto seconds = [&] (float value, float fallback) { return (std::isfinite (value) ? juce::jlimit (0.0f, 2.0f, value) : fallback) * sample.rate; };
+        xf = std::min (seconds (s.crossfadeSeconds, .01f), (vb - va) * .5);
+        // After a forward wrap the pass ends no sooner than one crossfade later, even if the end moved before it.
+        if (! reverse && direction > 0 && s.loop && s.mode != LoopMode::pingPong && vb < v + xf)
+        {
+            vb = std::min (v + xf, frames - from);
+            to = std::max (to, from + vb);
+        }
+        period = std::max (1.0, vb - va - xf);
+        length = to - from;
+        fadeIn = std::min (seconds (s.fadeInSeconds, 0), length * .5);
+        fadeOut = std::min (seconds (s.fadeOutSeconds, .01f), length * .5);
+    }
+
+    double from = 0, to = 0, v = 0, va = 0, vb = 0, xf = 0, period = 1, length = 0, fadeIn = 0, fadeOut = 0, travelled = 0;
+    int direction = 1;
+    bool reverse = false, captured = false, inZone = false;
 };
 } // namespace bw

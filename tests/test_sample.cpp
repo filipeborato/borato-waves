@@ -1600,6 +1600,485 @@ void testLayersAndGranularUI ()
     assert (r.processor.sampleBank ()->zones.size () == 4 && r.processor.sampleBank ()->valid ());
     std::cout << "ok: velocity/RR UI, undo/redo, granular route binding and layered key split" << std::endl;
 }
+
+// A ramp whose value is its frame index identifies every frame the head reads.
+std::vector<int> playedFrames (const bw::Sample& ramp, std::pair<double, double> region, const bw::PlaybackSettings& s,
+                               int count, int releaseAt = -1, double increment = 1)
+{
+    bw::SamplePlayer player; player.reset (region);
+    std::vector<int> frames;
+    for (int i = 0; i < count && ! player.finished; ++i)
+    {
+        const auto value = player.nextStereo (ramp, region, s, increment, releaseAt >= 0 && i >= releaseAt).first;
+        if (! player.finished) frames.push_back ((int) std::lround (value));
+    }
+    return frames;
+}
+std::vector<int> span (int first, int last) // inclusive, either direction
+{
+    std::vector<int> result;
+    for (int f = first; ; f += first <= last ? 1 : -1) { result.push_back (f); if (f == last) break; }
+    return result;
+}
+std::vector<int> join (std::initializer_list<std::vector<int>> parts)
+{
+    std::vector<int> result;
+    for (const auto& p : parts) result.insert (result.end (), p.begin (), p.end ());
+    return result;
+}
+
+void testRegionLoopDirectionsAndTailedRelease ()
+{
+    bw::Sample ramp; ramp.rate = 48000;
+    for (int i = 0; i < 400; ++i) ramp.data.push_back ((float) i);
+    const std::pair<double, double> region { 100, 300 };
+    bw::PlaybackSettings exact; exact.crossfadeSeconds = 0; exact.fadeOutSeconds = 0;
+    auto loopWith = [&] (bw::LoopMode mode) { auto s = exact; s.loop = true; s.mode = mode; s.linked = false; s.loopStart = 150 / 400.0f; s.loopEnd = 250 / 400.0f; return s; };
+
+    // One-shot in both directions plays the region once, frame by frame, then stops.
+    assert (playedFrames (ramp, region, exact, 1000) == span (100, 299));
+    auto reverse = exact; reverse.reverse = true;
+    assert (playedFrames (ramp, region, reverse, 1000) == span (299, 100));
+    // Forward, Reverse and Ping-Pong loops over the inner window [150, 250).
+    assert (playedFrames (ramp, region, loopWith (bw::LoopMode::forward), 350) == join ({ span (100, 249), span (150, 249), span (150, 249) }));
+    assert (playedFrames (ramp, region, loopWith (bw::LoopMode::reverse), 450) == join ({ span (100, 249), span (248, 150), span (249, 150), span (249, 150), span (249, 249) }));
+    assert (playedFrames (ramp, region, loopWith (bw::LoopMode::pingPong), 450) == join ({ span (100, 249), span (248, 150), span (151, 249), span (248, 150), span (151, 153) }));
+    // Reverse direction mirrors the loop: from the region end down to the window, then cycling through it.
+    auto mirrored = loopWith (bw::LoopMode::forward); mirrored.reverse = true;
+    assert (playedFrames (ramp, region, mirrored, 350) == join ({ span (299, 150), span (249, 150), span (249, 150) }));
+    // Linked points are fractions of the region: [0.25, 0.75] of [100, 300) is [150, 250).
+    auto linked = loopWith (bw::LoopMode::forward); linked.linked = true; linked.loopStart = .25f; linked.loopEnd = .75f;
+    assert (playedFrames (ramp, region, linked, 350) == playedFrames (ramp, region, loopWith (bw::LoopMode::forward), 350));
+    // Tailed: loops while held; the release seen at the next loop end lets it play on to the region end.
+    const auto tailed = loopWith (bw::LoopMode::tailed);
+    assert (playedFrames (ramp, region, tailed, 600) == playedFrames (ramp, region, loopWith (bw::LoopMode::forward), 600));
+    assert (playedFrames (ramp, region, tailed, 1000, 200) == join ({ span (100, 249), span (150, 249), span (250, 299) }));
+    assert (playedFrames (ramp, region, tailed, 1000, 0) == span (100, 299)); // released before the first loop end
+    // With a crossfade the decision is taken on entering it: a release inside the crossfade completes that wrap.
+    auto faded = tailed; faded.crossfadeSeconds = 10 / 48000.0f;
+    const auto tail = playedFrames (ramp, region, faded, 1000, 245);
+    assert (tail.size () > 200 && tail.back () == 299);
+
+    // Crossed points, minimum windows, extreme increments and every mode never read outside the asset.
+    for (int mode = 0; mode < 4; ++mode)
+        for (bool reversed : { false, true })
+            for (double increment : { .37, 1.0, 7.5, 63.0 })
+                for (auto [a, b] : { std::pair<float, float> { .9f, .1f }, { .5f, .5f }, { 0.0f, 1.0f }, { 1.0f, 1.0f } })
+                {
+                    auto s = exact; s.loop = true; s.mode = (bw::LoopMode) mode; s.reverse = reversed; s.loopStart = a; s.loopEnd = b;
+                    s.linked = mode % 2 == 0; s.crossfadeSeconds = .001f; s.fadeOutSeconds = .001f;
+                    bw::SamplePlayer player; const std::pair<double, double> tiny { 200, 264 };
+                    for (const auto& r : { region, tiny })
+                    {
+                        player.reset (r);
+                        for (int i = 0; i < 2000 && ! player.finished; ++i)
+                        {
+                            const float v = player.nextStereo (ramp, r, s, increment, i > 1000).first;
+                            assert (std::isfinite (v) && v >= 0 && v <= 399);
+                        }
+                    }
+                }
+
+    // A -12 dBFS sine looped over whole periods: the crossfaded wrap leaves no residue against the continuous sine.
+    bw::Sample tone; tone.rate = 48000;
+    for (int i = 0; i < 48000; ++i) tone.data.push_back (.25f * (float) std::sin (juce::MathConstants<double>::twoPi * 480 * i / 48000.0));
+    for (float crossfadeMs : { 0.0f, 10.0f })
+    {
+        bw::PlaybackSettings s; s.loop = true; s.linked = false; s.crossfadeSeconds = crossfadeMs * .001f;
+        // Period of the loop is (length - crossfade), a multiple of the 100-frame sine period.
+        const double length = 10000 + crossfadeMs * 48;
+        s.loopStart = 1000 / 48000.0f; s.loopEnd = (float) ((1000 + length) / 48000.0);
+        bw::SamplePlayer player; player.reset ({ 0, 48000 });
+        double worst = 0;
+        for (int i = 0; i < 96000; ++i)
+        {
+            const float v = player.nextStereo (tone, { 0, 48000 }, s, 1).first;
+            worst = std::max (worst, std::abs (v - .25 * std::sin (juce::MathConstants<double>::twoPi * 480 * i / 48000.0)));
+        }
+        std::cout << "loop wrap residue (" << crossfadeMs << " ms crossfade): " << 20 * std::log10 (std::max (worst, 1e-12)) << " dBFS" << std::endl;
+        assert (20 * std::log10 (std::max (worst, 1e-12)) < -50);
+    }
+
+    // Processor: Tailed leaves the loop after note-off (and only after the pedal lifts) while the release still runs.
+    const auto file = writeTone ("tailed", 48000, 1, 440);
+    auto tailedRig = [&] (bool tailMode)
+    {
+        auto r = std::make_unique<Rig> ();
+        sampleOnly (*r); r->set ("release", 4); r->set ("sampleLoop", 1); r->set ("sampleLoopMode", tailMode ? 3.0f : 0.0f);
+        r->set ("sampleLoopLink", 0); r->set ("sampleLoopStart", .1f); r->set ("sampleLoopEnd", .2f);
+        assert (r->processor.loadSample (file).isEmpty ());
+        return r;
+    };
+    for (bool tailMode : { false, true })
+    {
+        auto r = tailedRig (tailMode);
+        r->send (on (60)); r->run (1);       // well past the region's natural end: still looping
+        r->send (off (60));
+        const auto after = r->run (1.5);     // the tail plays .2 -> 1 of the file (0.8 s), then silence
+        assert (rms (after, 0, 4800) > .02);
+        const double late = rms (after, (size_t) (48000 * 1.0), after.size ());
+        assert (tailMode ? late < 1.0e-6 : late > .02); // after the filter the tail decays to (near) zero
+    }
+    {
+        auto r = tailedRig (true);
+        r->send (pedal (true)); r->send (on (60)); r->run (.5);
+        r->send (off (60)); auto held = r->run (1.2);
+        assert (rms (held, held.size () - 4800, held.size ()) > .02); // the pedal keeps it looping
+        r->send (pedal (false)); const auto after = r->run (1.5);
+        assert (rms (after, (size_t) (48000 * 1.0), after.size ()) < 1.0e-6);
+    }
+
+    // Zones keep their own loop window and mode through the portable bank format.
+    bw::SampleBank bank; bank.zones.push_back ({}); auto& z = bank.zones[0];
+    auto shared = std::make_shared<bw::Sample> (tone); shared->updateHash ();
+    z.sample = shared; z.loop = true; z.loopMode = 2; z.loopStart = .2f; z.loopEnd = .6f; z.loopLinked = false; z.reverse = true;
+    assert (bank.valid ());
+    juce::String error;
+    const auto restored = bw::deserializeSampleBank (bw::serializeSampleBank (bank), error);
+    assert (restored && restored->zones[0].loopMode == 2 && restored->zones[0].loopStart == .2f && restored->zones[0].loopEnd == .6f
+            && ! restored->zones[0].loopLinked && restored->zones[0].reverse);
+    // A bank saved before these fields existed restores the original forward whole-region loop.
+    auto legacyTree = bw::serializeSampleBank (bank);
+    for (auto key : { "loopMode", "loopStart", "loopEnd", "loopLink", "reverse" }) legacyTree.getChild (0).removeProperty (key, nullptr);
+    const auto legacy = bw::deserializeSampleBank (legacyTree, error);
+    assert (legacy && legacy->zones[0].loopMode == 0 && legacy->zones[0].loopStart == 0 && legacy->zones[0].loopEnd == 1
+            && legacy->zones[0].loopLinked && ! legacy->zones[0].reverse);
+    std::cout << "ok: region/loop windows, forward/reverse/ping-pong/tailed frame sequences, bounds, wrap residue, note-off/pedal tails and zone persistence" << std::endl;
+}
+
+void testManualSlicesSharedAssetAndUndo ()
+{
+    // Four 0.25 s segments at 300/500/700/900 Hz.
+    const std::array<double, 4> tones { 300, 500, 700, 900 };
+    juce::AudioBuffer<float> audio (1, 48000);
+    for (int i = 0; i < 48000; ++i) audio.setSample (0, i, .5f * (float) std::sin (juce::MathConstants<double>::twoPi * tones[(size_t) i / 12000] * i / 48000.0));
+    const auto file = writeFloatWav ("slices", 48000, audio);
+    Rig r; sampleOnly (r); r.set ("sampleRoute", 2);
+    assert (r.processor.loadSample (file).isEmpty ());
+    assert (r.processor.setSlices ({ 12000, 24000, 36000 }, 60, false).isEmpty ());
+    auto bank = r.processor.sampleBank ();
+    assert (bank->sliced && bank->zones.size () == 4 && (bank->slices.markers == std::vector<int> { 0, 12000, 24000, 36000 }));
+    // One shared asset, counted once, however many slices (and undo steps) reference it.
+    for (const auto& z : bank->zones) assert (z.sample == bank->zones[0].sample);
+    assert (r.processor.assetMemoryBytes () == bank->zones[0].sample->bytes ());
+
+    auto play = [&] (int note, double seconds)
+    {
+        r.send (on (note)); auto out = r.run (seconds); r.send (off (note)); r.run (.2);
+        return out;
+    };
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto out = play (60 + i, .4);
+        assert (std::abs (frequency (out, 480, 11000) / tones[(size_t) i] - 1) < .005);
+        assert (rms (out, (size_t) (48000 * .27), out.size ()) < 1.0e-6); // single slice stops at the next marker
+    }
+    assert (silent (play (64, .2)) && silent (play (59, .2))); // outside the slices
+    // Play to end: slice 1 runs through slices 2 and 3 to the end of the file.
+    assert (r.processor.setSlices ({ 12000, 24000, 36000 }, 60, true).isEmpty ());
+    const auto toEnd = play (61, .8);
+    assert (std::abs (frequency (toEnd, 480, 11000) / 500 - 1) < .005 && std::abs (frequency (toEnd, 25000, 35000) / 900 - 1) < .005);
+
+    // Markers at 0 and the end, beyond the end, and closer than the minimum region are dropped.
+    assert (r.processor.setSlices ({ 0, 48000, 47990, 10, 30000, 30030, -5 }, 60, false).isEmpty ());
+    assert ((r.processor.sampleBank ()->slices.markers == std::vector<int> { 0, 30000 }));
+    // Slices past MIDI 127 are refused and the current map stays.
+    assert (r.processor.setSlices ({ 12000, 24000, 36000 }, 126, false).isNotEmpty ());
+    assert ((r.processor.sampleBank ()->slices.markers == std::vector<int> { 0, 30000 }));
+
+    // Undo/redo step through the slice edits.
+    assert (r.processor.undo () && (r.processor.sampleBank ()->slices.markers == std::vector<int> { 0, 12000, 24000, 36000 }) && r.processor.sampleBank ()->slices.playToEnd);
+    assert (r.processor.redo () && (r.processor.sampleBank ()->slices.markers == std::vector<int> { 0, 30000 }));
+    assert (r.processor.assetMemoryBytes () == r.processor.sample ()->bytes ());
+
+    // Editing slices under a held note keeps the old bank alive until the voice lets go.
+    r.send (on (60)); renderChecked (r.processor, r.pending, 2400, 64);
+    assert (r.processor.setSlices ({ 6000, 18000 }, 60, false).isEmpty ());
+    renderChecked (r.processor, r.pending, 2400, 64);
+    r.send (off (60)); renderChecked (r.processor, r.pending, 9600, 64);
+    assert (r.processor.sampleSettled ());
+
+    // The portable state carries one copy of the audio and the slice map; the source file can go.
+    juce::MemoryBlock state; r.processor.getStateInformation (state); file.deleteFile ();
+    Rig restored; restored.processor.setStateInformation (state.getData (), (int) state.getSize ());
+    const auto back = restored.processor.sampleBank ();
+    assert (back && back->sliced && (back->slices.markers == std::vector<int> { 0, 6000, 18000 }) && back->slices.root == 60 && ! back->slices.playToEnd);
+    assert (back->zones.size () == 3 && back->zones[2].sample == back->zones[0].sample);
+    assert (restored.processor.assetMemoryBytes () == back->zones[0].sample->bytes ());
+    // Clearing slices returns to the single sample.
+    restored.processor.clearSlices ();
+    assert (! restored.processor.sampleZonesMapped () && restored.processor.sample () == back->zones[0].sample);
+    std::cout << "ok: manual slices on consecutive keys, single/to-end, marker limits, shared asset, undo/redo, live edit and portable state" << std::endl;
+}
+
+void testSfzSubsetImportAndDiagnostics ()
+{
+    // Note names and limits of the subset parser.
+    assert (bw::sfzNote ("c4") == 60 && bw::sfzNote ("F#3") == 54 && bw::sfzNote ("eb-1") == 3 && bw::sfzNote ("c-1") == 0);
+    assert (bw::sfzNote ("g9") == 127 && bw::sfzNote ("127") == 127 && bw::sfzNote ("128") < 0 && bw::sfzNote ("h4") < 0 && bw::sfzNote ("g#9") < 0);
+
+    const auto kit = folder.getChildFile ("sfz kit");
+    kit.deleteRecursively ();
+    const auto samples = kit.getChildFile ("Samples With Space");
+    samples.createDirectory ();
+    for (auto [name, hz] : { std::pair<const char*, double> { "low tone", 300 }, { "high tone", 600 }, { "loud", 450 } })
+        assert (writeTone (name, 48000, .5, hz).moveFileTo (samples.getChildFile (juce::String (name) + ".wav")));
+    assert (writeTone ("outside", 48000, .5, 200).moveFileTo (folder.getChildFile ("outside.wav")));
+    const auto sfz = kit.getChildFile ("kit.sfz");
+    assert (sfz.replaceWithText (
+        "// A small kit\n"
+        "<control> default_path=Samples With Space/\n"
+        "<global> volume=-6 amp_veltrack=50\n"
+        "<group> lokey=c3 hikey=b3 pitch_keycenter=c4\n"
+        "<region> sample=low tone.wav pan=-50\n"
+        "<group> key=72\n"
+        "<region> sample=high tone.wav lovel=1 hivel=63 loop_mode=loop_continuous loop_start=1000 loop_end=10999\n"
+        "<region> sample=loud.wav lovel=64 hivel=127 /* block\n comment */ tune=10 offset=2400 end=21599\n"
+        "<region> sample=missing file.wav key=80\n"
+        "<region> sample=../../outside.wav key=90\n"
+        "<curve> foo=1\n"
+        "#define $X 1\n"));
+
+    bw::SfzImportResult result;
+    const auto bank = bw::importSfzBank (sfz, result);
+    std::cout << "sfz diagnostics: " << result.summary () << std::endl;
+    assert (bank && result.error.isEmpty () && result.regions.size () == 4 && bank->zones.size () == 4);
+    assert (result.unsupported.contains ("amp_veltrack") && result.unsupported.contains ("<curve>") && result.unsupported.contains ("#define"));
+    assert (result.missingFiles.contains ("missing file.wav") && result.summary ().contains ("outside the SFZ folder"));
+    const auto& low = bank->zones[0]; const auto& soft = bank->zones[1]; const auto& loud = bank->zones[2]; const auto& missing = bank->zones[3];
+    assert (low.lowKey == 48 && low.highKey == 59 && low.rootKey == 60 && low.gainDb == -6 && low.pan == -.5f && ! low.loop);
+    assert (soft.lowKey == 72 && soft.highKey == 72 && soft.rootKey == 72 && soft.lowVel == 1 && soft.highVel == 63 && soft.loop
+            && soft.loopMode == (int) bw::LoopMode::forward && ! soft.loopLinked && soft.loopStart == 1000 / 24000.0f && soft.loopEnd == 11000 / 24000.0f);
+    assert (loud.lowVel == 64 && loud.tuneCents == 10 && loud.start == .1f && loud.end == .9f);
+    assert (missing.lowKey == 80 && missing.sampleForVariant (0) == nullptr && missing.variants[0].missing);
+    assert (low.sample != soft.sample && bank->zones[1].sample != loud.sample);
+
+    // The same map built by hand plays bit-identically.
+    bw::SampleBank manual;
+    auto asset = [&] (const char* name) { juce::String error; return bw::loadSample (samples.getChildFile (name), error); };
+    manual.zones.resize (4);
+    auto& m0 = manual.zones[0]; m0.sample = asset ("low tone.wav"); m0.lowKey = 48; m0.highKey = 59; m0.rootKey = 60; m0.gainDb = -6; m0.pan = -.5f;
+    auto& m1 = manual.zones[1]; m1.sample = asset ("high tone.wav"); m1.lowKey = m1.highKey = m1.rootKey = 72; m1.highVel = 63; m1.gainDb = -6;
+    m1.loop = true; m1.loopLinked = false; m1.loopStart = 1000 / 24000.0f; m1.loopEnd = 11000 / 24000.0f;
+    auto& m2 = manual.zones[2]; m2.sample = asset ("loud.wav"); m2.lowKey = m2.highKey = m2.rootKey = 72; m2.lowVel = 64; m2.gainDb = -6; m2.tuneCents = 10;
+    m2.start = .1f; m2.end = .9f;
+    auto& m3 = manual.zones[3]; m3.lowKey = m3.highKey = m3.rootKey = 80; m3.variants[0].missing = true;
+    assert (manual.valid ());
+    auto render = [] (Rig& r)
+    {
+        std::vector<float> all;
+        for (auto [note, velocity] : { std::pair<int, float> { 55, .8f }, { 72, .2f }, { 72, .9f }, { 80, .8f }, { 40, .8f } })
+        {
+            r.send (on (note, velocity)); auto a = r.run (.3); r.send (off (note)); auto b = r.run (.1);
+            all.insert (all.end (), a.begin (), a.end ()); all.insert (all.end (), b.begin (), b.end ());
+        }
+        return all;
+    };
+    Rig byHand; sampleOnly (byHand); assert (byHand.processor.setSampleBank (manual).isEmpty ());
+    Rig imported; sampleOnly (imported); assert (imported.processor.importSfz (sfz).isEmpty ());
+    assert (imported.processor.sfzDiagnostics ().contains ("UNSUPPORTED: amp_veltrack"));
+    const auto reference = render (byHand), audio = render (imported);
+    assert (audio == reference && rms (audio, 0, 14400) > .02);
+    // Notes 80 (missing sample) and 40 (no region) are silent.
+    const size_t perNote = (size_t) (48000 * .4);
+    assert (rms (audio, 3 * perNote, audio.size ()) < 1.0e-6);
+    assert (imported.processor.canUndo () && imported.processor.undoName () == "SFZ IMPORT");
+
+    // Background import with progress, then the portable state outlives the files.
+    Rig background; sampleOnly (background);
+    background.processor.startSfzImport (sfz);
+    assert (background.processor.waitForSampleLoad (30000) && background.processor.sampleZonesMapped ());
+    assert (background.processor.sampleLoadProgress () == 1.0f && background.processor.sfzDiagnostics ().contains ("MISSING: missing file.wav"));
+    juce::MemoryBlock state; background.processor.getStateInformation (state);
+    kit.deleteRecursively ();
+    Rig restored; sampleOnly (restored); restored.processor.setStateInformation (state.getData (), (int) state.getSize ());
+    sampleOnly (restored);
+    assert (render (restored) == reference);
+
+    // Limits and failures are reported, never half-imported as if complete.
+    const auto big = folder.getChildFile ("big.sfz");
+    assert (big.replaceWithText (juce::String::repeatedString ("// padding\n", 100000)));
+    bw::SfzImportResult tooBig; assert (! bw::importSfzBank (big, tooBig) && tooBig.error.contains ("1 MB"));
+    juce::String many = "<group> sample=x.wav\n";
+    for (int i = 0; i < 130; ++i) many << "<region> key=" << (i % 128) << "\n";
+    const auto parsed = bw::parseSfz (many, folder);
+    assert (parsed.regions.size () == 128 && parsed.summary ().contains ("more than 128 regions"));
+    const auto overlapping = folder.getChildFile ("overlap.sfz");
+    assert (writeTone ("overlap", 48000, .1, 300).existsAsFile ());
+    assert (overlapping.replaceWithText ("<region> sample=overlap.wav lokey=60 hikey=70\n<region> sample=overlap.wav lokey=65 hikey=75\n"));
+    bw::SfzImportResult overlap; assert (! bw::importSfzBank (overlapping, overlap) && overlap.error.contains ("Overlapping"));
+    const auto bad = bw::parseSfz ("<region> sample=a.wav lokey=zz hivel=300 loop_mode=sometimes\n", folder);
+    assert (bad.summary ().contains ("lokey=zz") && bad.summary ().contains ("hivel=300") && bad.summary ().contains ("loop_mode=sometimes"));
+    std::cout << "ok: SFZ subset (headers, precedence, spaces, notes, layers, loops, offsets), diagnostics, manual equivalence, background import, portability and limits" << std::endl;
+}
+
+void testGranularSyncDistributionsJumpStartAndKeyTrack ()
+{
+    constexpr double rate = 48000;
+    bw::Sample flat; flat.rate = rate; flat.data.assign (48000, .5f);
+    bw::GrainSources sources {}; sources[0] = { &flat, 0, 48000, 1.0 / 440, 1 };
+    // Sample indices at which the engine spawned grains while running `samples` frames.
+    auto spawnTimes = [&] (bw::GranularVoiceEngine& engine, const bw::GrainControls& c, int samples, auto clockAt)
+    {
+        std::vector<int> times;
+        for (int n = 0; n < samples; ++n)
+        {
+            const auto before = engine.spawned;
+            engine.process (sources, c, 440, true, clockAt (n));
+            for (auto k = before; k < engine.spawned; ++k) times.push_back (n);
+        }
+        return times;
+    };
+    bw::GrainControls synced; synced.densityMode = bw::GrainDensityMode::sync; synced.densityBeats = .25; synced.sizeMs = 5;
+
+    // Transport-locked events land on the 1/16 grid at 60/120/180 BPM within one sample.
+    for (double bpm : { 60.0, 120.0, 180.0 })
+    {
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1);
+        const double ppq0 = 3.1;
+        const auto times = spawnTimes (engine, synced, (int) (rate * 4), [&] (int n) { return bw::GrainClock { bpm, ppq0 + n * bpm / 60 / rate, true }; });
+        assert (times.front () == 0); // the note-on emits at once
+        for (size_t k = 1; k < times.size (); ++k)
+        {
+            const double grid = (std::floor (ppq0 / .25) + (double) k) * .25;
+            assert (std::abs (times[k] - (grid - ppq0) * 60 / bpm * rate) <= 1);
+        }
+        assert (std::abs ((double) times.size () - 1 - 4 * bpm / 60 / .25) <= 1);
+    }
+    // A tempo change, a stop (note-relative at the current tempo), play again and a seek.
+    {
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1);
+        double ppq = 0; std::vector<int> times;
+        for (int n = 0; n < (int) rate * 6; ++n)
+        {
+            const double bpm = n < rate * 2 ? 120 : 180;
+            const bool playing = n < rate * 3 || n >= rate * 4;
+            if (n == (int) rate * 5) ppq = 100.03; // seek
+            const auto before = engine.spawned;
+            engine.process (sources, synced, 440, true, { bpm, ppq, playing });
+            if (engine.spawned != before) times.push_back (n);
+            if (playing) ppq += bpm / 60 / rate;
+        }
+        auto inRange = [&] (double a, double b) { return (int) std::count_if (times.begin (), times.end (), [&] (int t) { return t >= a * rate && t < b * rate; }); };
+        assert (std::abs (inRange (0, 2) - 16) <= 1 && std::abs (inRange (2, 3) - 12) <= 1);  // 8 then 12 events per second
+        assert (std::abs (inRange (3, 4) - 12) <= 1);                                           // stopped: still 12/s from the note
+        const auto seek = std::find_if (times.begin (), times.end (), [&] (int t) { return t >= (int) rate * 5; });
+        assert (seek != times.end () && *seek == (int) rate * 5);                              // the jump crosses a grid line
+        assert (std::abs (*(seek + 1) - (rate * 5 + (100.25 - 100.03) * 60 / 180 * rate)) <= 1);
+    }
+
+    // Batch distributions over a 10 Hz event interval (4800 frames), four grains per event.
+    bw::GrainControls batched; batched.density = 10; batched.sizeMs = 5; batched.batch = 4;
+    const std::array<std::vector<int>, 3> expected { std::vector<int> { 0, 0, 0, 0 }, { 0, 1200, 2400, 3600 }, { 0, 320, 960, 2240 } };
+    for (int d = 0; d < 4; ++d)
+    {
+        batched.distribution = (bw::GrainDistribution) d;
+        bw::GranularVoiceEngine engine; engine.reset (rate, 7);
+        const auto times = spawnTimes (engine, batched, 9600, [] (int) { return bw::GrainClock {}; });
+        assert (times.size () == 8);
+        std::vector<int> first (times.begin (), times.begin () + 4);
+        std::sort (first.begin (), first.end ());
+        if (d < 3) for (size_t k = 0; k < 4; ++k) assert (std::abs (first[k] - expected[(size_t) d][k]) <= 1);
+        else
+        {
+            assert (first.front () >= 0 && first.back () < 4800 && first != expected[0]);
+            bw::GranularVoiceEngine again; again.reset (rate, 7);
+            assert (spawnTimes (again, batched, 9600, [] (int) { return bw::GrainClock {}; }) == times); // same seed, same offsets
+        }
+        for (int t : std::vector<int> (times.begin () + 4, times.end ())) assert (t >= 4800 && t < 9600);
+    }
+
+    // Jump-start fills the expected overlap (at most the pool) on the first sample.
+    for (int n : { 1, 4, 16, 31, 32 })
+    {
+        bw::GrainControls c; c.densityMode = bw::GrainDensityMode::overlap; c.overlap = (float) n; c.sizeMs = 200;
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1); engine.requestJumpStart ();
+        engine.process (sources, c, 440, true);
+        assert (engine.activeCount () == std::min (32, n + 1)); // jump-started grains plus the note-on emission
+    }
+    // Target overlap: mean occupancy over ten seconds within one grain of the request.
+    for (float n : { 2.0f, 4.0f, 8.0f, 32.0f })
+    {
+        bw::GrainControls c; c.densityMode = bw::GrainDensityMode::overlap; c.overlap = n; c.sizeMs = 100;
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1); engine.requestJumpStart ();
+        double sum = 0;
+        for (int s = 0; s < (int) rate * 10; ++s) { engine.process (sources, c, 440, true); sum += engine.activeCount (); }
+        std::cout << "target overlap " << n << ": mean " << sum / (rate * 10) << std::endl;
+        assert (std::abs (sum / (rate * 10) - n) <= 1);
+    }
+
+    // Lengths: key tracking by octaves, percent of the interval, BPM sync with dotted and triplet divisions.
+    bw::GrainControls tracked; tracked.sizeMs = 100; tracked.keyTrack = 1; tracked.root = 60;
+    for (auto [note, factor] : { std::pair<int, double> { 60, 1 }, { 72, .5 }, { 84, .25 }, { 48, 2 } })
+    {
+        tracked.note = note;
+        assert (std::abs (bw::resolveGrainTiming (tracked, 120).lengthMs - 100 * factor) < 1.0e-9);
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1);
+        int alive = 0;
+        for (int s = 0; s < (int) rate; ++s) { engine.process (sources, tracked, 440, s == 0); alive += engine.activeCount (); }
+        assert (alive == (int) std::round (rate * .1 * factor) - 1); // active after each call until its last sample
+    }
+    tracked.note = 72; tracked.keyTrack = .5f;
+    assert (std::abs (bw::resolveGrainTiming (tracked, 120).lengthMs - 100 / std::sqrt (2.0)) < 1.0e-6);
+    bw::GrainControls percent; percent.density = 10; percent.lengthMode = bw::GrainLengthMode::percent; percent.lengthPercent = 50;
+    assert (std::abs (bw::resolveGrainTiming (percent, 120).lengthMs - 50) < 1.0e-9);
+    bw::GrainControls lengthSync; lengthSync.lengthMode = bw::GrainLengthMode::sync;
+    for (auto [division, ms] : { std::pair<int, double> { 18, 125 }, { 19, 187.5 }, { 20, 125 * 2 / 3.0 } })
+    {
+        lengthSync.lengthBeats = bw::divisionBeats (division);
+        assert (std::abs (bw::resolveGrainTiming (lengthSync, 120).lengthMs - ms) < 1.0e-9);
+    }
+    // Dotted divides the synced event rate by 1.5, triplet multiplies it by 1.5.
+    bw::GrainControls rateSync; rateSync.densityMode = bw::GrainDensityMode::sync;
+    rateSync.densityBeats = bw::divisionBeats (18); const double straight = bw::resolveGrainTiming (rateSync, 120).eventHz;
+    rateSync.densityBeats = bw::divisionBeats (19); assert (std::abs (bw::resolveGrainTiming (rateSync, 120).eventHz - straight / 1.5) < 1.0e-9);
+    rateSync.densityBeats = bw::divisionBeats (20); assert (std::abs (bw::resolveGrainTiming (rateSync, 120).eventHz - straight * 1.5) < 1.0e-9);
+
+    // A looping grain that crosses the region end wraps inside it; without loop it holds the last frame.
+    for (bool loop : { false, true })
+    {
+        bw::GrainControls c; c.sizeMs = 500; c.position = .95f; c.loop = loop;
+        bw::GrainSources region {}; region[0] = { &flat, 1000, 2000, 1.0 / 440, 1 };
+        bw::GranularVoiceEngine engine; engine.reset (rate, 1);
+        bw::GrainDisplaySnapshot display;
+        float lowest = 1.0e9f, highest = 0;
+        for (int s = 0; s < 20000; ++s)
+        {
+            engine.process (region, c, 440, s == 0);
+            engine.publish (display);
+            if (display.count.load () == 0) continue;
+            const float at = display.grains[0].normPos.load () * 48000;
+            lowest = std::min (lowest, at); highest = std::max (highest, at);
+        }
+        assert (lowest >= 999.9f && highest <= 1999.1f);
+        assert (loop ? lowest < 1100 : lowest > 1900);
+    }
+
+    // Extremes: zero density clamps to 1 Hz; long synced grains saturate the pool predictably, finite throughout.
+    bw::GrainControls zero; zero.density = 0; zero.sizeMs = 5;
+    bw::GranularVoiceEngine slow; slow.reset (rate, 1);
+    assert (spawnTimes (slow, zero, (int) rate * 3, [] (int) { return bw::GrainClock {}; }).size () == 3);
+    bw::GrainControls dense; dense.densityMode = bw::GrainDensityMode::sync; dense.densityBeats = 1 / 16.0;
+    dense.lengthMode = bw::GrainLengthMode::sync; dense.lengthBeats = 4; dense.batch = 8; dense.distribution = bw::GrainDistribution::random;
+    bw::GranularVoiceEngine full; full.reset (rate, 1);
+    for (int s = 0; s < (int) rate * 2; ++s)
+    {
+        const auto out = full.process (sources, dense, 440, true, { 30.0 + s / rate * 150, s * 2.0 / rate, true });
+        assert (std::isfinite (out.first) && full.activeCount () <= 32);
+    }
+    assert (full.saturated && full.activeCount () == 32);
+
+    // The processor exposes and restores every new control.
+    Rig r; for (auto id : { "grainDensityMode", "grainDensityDivision", "grainOverlap", "grainLengthMode", "grainLengthDivision", "grainLengthPercent",
+                            "grainDistribution", "grainBatch", "grainJumpStart", "grainKeyTrack", "grainLoop" })
+        assert (r.processor.apvts.getParameter (id) != nullptr && r.processor.apvts.getParameter (id)->isAutomatable ());
+    r.set ("grainDensityMode", 2); r.set ("grainBatch", 3); r.set ("grainKeyTrack", 50); r.set ("grainJumpStart", 1);
+    juce::MemoryBlock state; r.processor.getStateInformation (state);
+    Rig restored; restored.processor.setStateInformation (state.getData (), (int) state.getSize ());
+    auto value = [&] (const char* id) { return restored.processor.apvts.getRawParameterValue (id)->load (); };
+    assert (value ("grainDensityMode") == 2 && value ("grainBatch") == 3 && value ("grainKeyTrack") == 50 && value ("grainJumpStart") == 1);
+    std::cout << "ok: grain BPM grid/tempo/stop/seek within 1 sample, batch distributions, jump-start, target overlap, key tracking, percent/dotted/triplet, grain loop and saturation" << std::endl;
+}
 } // namespace
 
 int main()
@@ -1610,6 +2089,10 @@ int main()
     _set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     juce::ScopedJuceInitialiser_GUI init;
+    testRegionLoopDirectionsAndTailedRelease ();
+    testManualSlicesSharedAssetAndUndo ();
+    testSfzSubsetImportAndDiagnostics ();
+    testGranularSyncDistributionsJumpStartAndKeyTrack ();
     testVelocityLayersAndCrossfadeLaws ();
     testRoundRobinSequenceAndDeterminism ();
     testGranularCloudPoolAndRipple ();

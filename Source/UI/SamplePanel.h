@@ -12,6 +12,11 @@ public:
     void paint (juce::Graphics&) override;
     void resized () override;
     void visibilityChanged () override { if (isVisible ()) timerCallback (); }
+    // Slice markers on the waveform: double-click adds, drag moves, right-click removes.
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
 private:
     void timerCallback () override;
     void choose (bool isRelink = false);
@@ -19,18 +24,33 @@ private:
     void editZone ();
     void addZone ();
     void addLayer ();
+    void toggleSlices ();
+    void commitSlices (std::vector<int> markers);
+    std::vector<int> sliceMarkers () const;
+    int markerAt (int x) const;
+    int frameAt (int x) const;
     std::shared_ptr<const bw::Sample> displayedSample () const;
     juce::ComboBox zoneChoice, velocityLaw, variantChoice;
     juce::Slider lowKey, highKey, zoneRoot, lowVelocity, highVelocity, velocityFade, variantCount;
-    Action addZoneButton, addLayerButton;
+    Action addZoneButton, addLayerButton, sliceButton;
+    juce::Slider sliceRoot;
+    juce::ComboBox sliceMode;
+    std::vector<int> draggedMarkers;
+    int draggedIndex = -1;
     int selectedZone = 0, displayedZone = -1, selectedVariant = 0;
     bool updatingZones = false;
     WaveProcessor& processor;
     Action load, relink, cancel, clear;
-    ParameterToggle enabled, loop;
-    ParameterChoice route, mode;
-    Dial level, pitch, root, pan, start, end;
+    ParameterToggle enabled, loop, freeze, loopLink, jumpStart, grainLoop;
+    ParameterChoice route, mode, loopMode, direction, densityMode, densityDivision, lengthMode, lengthDivision, distribution;
+    Dial level, pitch, root, pan, start, end, loopStart, loopEnd, loopFade, fadeIn, fadeOut;
     Dial density, size, position, scan, spread, grainPitch, seed;
+    Dial spectralPosition, spectralSpeed, spectralPitch;
+    Dial overlap, lengthPercent, batch, keyTrack;
+    Action timingPage;
+    bool showTiming = false;
+    int shownMode = -1;
+    void updatePages ();
     std::unique_ptr<juce::FileChooser> chooser;
     juce::String status;
     std::vector<float> overview, overviewRight; // peak per column of the loaded sample (L/mono and R)
