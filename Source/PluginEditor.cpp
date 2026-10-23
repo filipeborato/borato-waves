@@ -269,16 +269,21 @@ public:
         addChildComponent (matrix);
         addChildComponent (tableEditor);
         addChildComponent (samplePanel);
-        for (auto* child : getChildren())
-            if (auto* dial = dynamic_cast<Dial*> (child))
+        auto bindModulation = [this] (auto&& self, Component& parent) -> void
+        {
+            for (auto* child : parent.getChildren ())
             {
-                for (auto id : bw::destinationIds())
-                    if (dial->parameterId() == id)
-                    {
-                        dial->onModulationDrop = [this] (int source, const String& target) { assignModulation (source, target); };
-                        modulationDials.push_back (dial);
-                    }
+                self (self, *child);
+                if (auto* dial = dynamic_cast<Dial*> (child))
+                    for (auto id : bw::destinationIds ())
+                        if (dial->parameterId () == id)
+                        {
+                            dial->onModulationDrop = [this] (int source, const String& target) { assignModulation (source, target); };
+                            modulationDials.push_back (dial);
+                        }
             }
+        };
+        bindModulation (bindModulation, *this);
         // Page 3 (about) has no tab; the ABOUT button in the header opens it.
         const StringArray names { "SYNTH", "EFFECTS", "MATRIX", "EDITOR", "SAMPLE" };
         for (int i = 0; i < names.size(); ++i)

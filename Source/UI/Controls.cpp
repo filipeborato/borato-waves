@@ -54,6 +54,10 @@ String Dial::valueText() const
     }
     if (id == "compRatio") return String (plainValue, 1) + " : 1";
     if (id == "compAttack" || id == "compRelease") return String (plainValue, plainValue < 10 ? 1 : 0) + " ms";
+    if (id == "grainSize") return String (plainValue, 1) + " ms";
+    if (id == "grainDensity") return String (plainValue, 1) + " /s";
+    if (id == "grainScan") return String (plainValue, 2) + " x";
+    if (id == "grainSeed") return String (plainValue, 0);
     if (id == "delayTime") return String (plainValue, 0) + " ms";
     if (id == "attack" || id == "decay" || id == "release" || id == "glide")
         return plainValue < 1 ? String (plainValue * 1000, 0) + " ms" : String (plainValue, 2) + " s";

@@ -12,7 +12,7 @@ cmake --build build --config Debug --parallel 2
 ctest --test-dir build -C Debug --output-on-failure --parallel 1
 ```
 
-`BORATOWAVE_BUILD_TESTS` defaults to ON. Tests use assertions: run Debug, not Release. All 12 executables are registered with CTest, with a 30-minute timeout per test. On headless Linux use `xvfb-run --auto-servernum ctest --test-dir build --output-on-failure --parallel 1` after a Debug build. Run tests sequentially because some fixtures use shared temporary paths.
+`BORATOWAVE_BUILD_TESTS` defaults to ON. Tests use assertions: run Debug, not Release. All 13 executables are registered with CTest, with a 30-minute timeout per test. On headless Linux use `xvfb-run --auto-servernum ctest --test-dir build --output-on-failure --parallel 1` after a Debug build. Run tests sequentially because some fixtures use shared temporary paths.
 
 To build without a local JUCE checkout:
 
