@@ -142,7 +142,7 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     continuous ("grainSize", "Grain Size ms", 5, 500, 100);
     continuous ("grainPosition", "Grain Position", 0, 1, .5f);
     continuous ("grainScan", "Grain Scan", -2, 2, 0);
-    continuous ("grainSpreadPos", "Grain Position Spread", 0, 1, 0);
+    continuous ("grainSpreadPos", "Grain Position Spread", 0, 1, .05f);
     l.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "grainSeed", 1 }, "Grain Seed", 0, 65535, 1));
     continuous ("grainPitch", "Grain Pitch", -24, 24, 0);
     continuous ("spectralPos", "Spectral Position", 0, 1, 0);
@@ -168,6 +168,8 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     toggle ("grainJumpStart", "Grain Jump Start", false);
     continuous ("grainKeyTrack", "Grain Length Key Track", 0, 100, 0);
     toggle ("grainLoop", "Grain Loop", false);
+    continuous ("grainJitter", "Grain Timing Jitter", 0, 100, 20);
+    continuous ("grainPan", "Grain Pan Spread", 0, 100, 0);
     return l;
 }
 
@@ -541,6 +543,7 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         grainTiming.overlap = g.overlap->load (); grainTiming.lengthPercent = g.lengthPercent->load ();
         grainTiming.batch = index (g.batch, bw::kMaxGrainBatch);
         grainTiming.keyTrack = g.keyTrack->load () * .01f; grainTiming.loop = g.loop->load () >= .5f;
+        grainTiming.jitter = g.jitter->load () * .01f; grainTiming.panSpread = g.pan->load () * .01f;
         grainTiming.note = noteNumber;
         grainTiming.root = layers[0].zone ? layers[0].zone->rootKey : sampleRoot;
     }
@@ -778,7 +781,8 @@ WaveProcessor::WaveProcessor ()
         p ("sampleOn"), p ("sampleLevel"), p ("samplePitch"), p ("sampleStart"), p ("sampleEnd"), p ("sampleLoop"), p ("sampleRoot"), p ("samplePan"), p ("sampleRoute") };
     params.grain = { p ("sampleMode"), p ("grainDensity"), p ("grainSize"), p ("grainPosition"), p ("grainScan"), p ("grainSpreadPos"), p ("grainSeed"), p ("grainPitch"),
                      p ("grainDensityMode"), p ("grainDensityDivision"), p ("grainOverlap"), p ("grainLengthMode"), p ("grainLengthDivision"), p ("grainLengthPercent"),
-                     p ("grainDistribution"), p ("grainBatch"), p ("grainJumpStart"), p ("grainKeyTrack"), p ("grainLoop") };
+                     p ("grainDistribution"), p ("grainBatch"), p ("grainJumpStart"), p ("grainKeyTrack"), p ("grainLoop"),
+                     p ("grainJitter"), p ("grainPan") };
     params.spectralParams = { p ("spectralPos"), p ("spectralFreeze"), p ("spectralSpeed"), p ("spectralPitch") };
     params.region = { p ("sampleLoopMode"), p ("sampleDirection"), p ("sampleLoopStart"), p ("sampleLoopEnd"), p ("sampleLoopXfade"),
                       p ("sampleLoopLink"), p ("sampleFadeIn"), p ("sampleFadeOut") };

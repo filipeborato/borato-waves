@@ -94,11 +94,21 @@ The UI displays the last triggered slot. Mapping edits support undo/redo.
 
 ## Granular synthesis
 
-Select **Granular** in the Sample page. Defaults are 40 grains/s and 100 ms,
-giving four nominal overlapping grains. Controls are density 1..100 grains/s,
-size 5..500 ms, position 0..1, scan -2..2 times source speed, position spread
-0..1, pitch -24..24 semitones and integer seed 0..65535. Default position is
-0.5, seed 1; scan, spread and pitch default to zero. Old states use Sample mode.
+Select **Granular** with MODE at the top of the Sample page. Grains need a loaded
+sample and SAMPLE ON; the status line says which is missing. The sample (or its
+grains) is one more source: it sums with OSC A, OSC B, SUB and NOISE into its
+route, so the oscillators still sound unless switched off. The OSC A / OSC B
+toggles on the Sample page and the SOUNDING line show what is heard.
+
+Defaults are 40 grains/s and 100 ms, giving four nominal overlapping grains.
+Controls (GRAINS page) are density 1..100 grains/s, size 5..500 ms, position 0..1,
+position spread 0..1 (default 0.05), scan -2..2 times source speed, pitch -24..24
+semitones, timing jitter 0..100 % (default 20 %), pan spread 0..100 % (default 0)
+and integer seed 0..65535. POSITION is drawn on the waveform with its spread band;
+click or drag there to set it. Old states keep their saved values; their jitter
+and pan read the defaults. Controls that cannot affect the sound in the current
+mode are dimmed: the loop window, crossfade, fades and direction in Granular and
+Spectral, and on the TIMING page whatever the density and length modes ignore.
 
 Each voice has one static pool of 32 grains, including both velocity layers:
 16 voices are capped at 512 grains. A full pool refuses the new emission without
@@ -107,10 +117,16 @@ and a saturation flag retained until the voice resets. Existing grains retain
 their source assets through a sample swap and drain when granular mode is disabled.
 
 Grains use a 1,025-entry interpolated Hann window and the filtered sample reader.
-The mix is divided by `max(1, sum of active Hann windows)`: overlapping DC stays
-at unity while sparse clouds keep their individual envelopes. Reads clamp to
-the captured sample region, holding its final frame at the end. Scan wraps the
-emission cursor independently of pitch; position jitter clamps to the region.
+The mix is divided by `sqrt(max(1, sum of active Hann windows))`: overlapping
+grains of real material are decorrelated, so the cloud level holds within a
+fraction of a dB from 2 to 10 overlaps; perfectly correlated input (DC) rises by
+the square root of the window sum, about +12 dB for 32 grains. Sparse clouds
+keep their individual envelopes. Without G-LOOP a grain is moved back to end
+inside the region, and shortened when the region is shorter than the grain, so
+no grain holds the last frame. Scan wraps the emission cursor independently of
+pitch; position spread clamps to the region. Jitter delays each grain by a random
+[0, jitter x event interval) after its event; pan spread gives each grain a random
+equal-power pan. Both draw from the voice seed and are zero-cost when zero.
 
 Position, size and source selection are captured at birth. Density sets the next
 emission interval; changes do not reschedule an interval already underway.
@@ -145,10 +161,10 @@ other modes, events count from the note at the current tempo. PER EVENT emits
 exponential timing) or Random (uniform, from the voice seed). JUMP pre-populates
 round(event rate x grains per event x length) grains, at most 32, with ages spread
 across one length, so a sustained cloud sounds from the first sample.
-G-LOOP wraps a grain inside the region instead of holding its last frame. A full
+G-LOOP wraps a grain inside the region instead of fitting it before the end. A full
 pool keeps refusing new grains, including scheduled batch grains. The labels show
-the resolved events/s, length and expected occupancy at the root note. Default
-settings reproduce the original scheduling exactly.
+the resolved events/s, length and expected occupancy at the root note. With
+jitter at zero the timing defaults reproduce the original scheduling exactly.
 
 ## Region, loop window and direction
 
