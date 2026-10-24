@@ -6,6 +6,9 @@
 #include "Effects.h"
 #include "UserWavetable.h"
 #include "Sample.h"
+#include "Granular.h"
+#include "Spectral.h"
+#include "SfzImporter.h"
 #include "FactoryPresets.h"
 #include <array>
 
@@ -25,8 +28,21 @@ struct SynthParams
     // Written by the audio thread at block start; null when no user table or sample is loaded.
     std::array<const bw::Wavetable*, 2> userTables {};
     const bw::Sample* sample = nullptr;
+    const bw::SampleBank* sampleBank = nullptr;
+    std::atomic<int>* activeSampleZone = nullptr;
     float sampleSwapSeconds = 0.005f;
+    bw::SamplePlaybackState* playback = nullptr;
+    struct GrainParams { std::atomic<float> *mode, *density, *size, *position, *scan, *spread, *seed, *pitch,
+                         *densityMode, *densityDivision, *overlap, *lengthMode, *lengthDivision, *lengthPercent,
+                         *distribution, *batch, *jumpStart, *keyTrack, *loop; } grain {};
+    bw::GrainClock clock; // tempo and ppq at the start of the block; transport true while the host plays
+    struct SpectralParams { std::atomic<float> *position, *freeze, *speed, *pitch; } spectralParams {};
+    struct RegionParams { std::atomic<float> *loopMode, *direction, *loopStart, *loopEnd, *crossfade, *link, *fadeIn, *fadeOut; } region {};
+    const bw::SpectralData* spectral = nullptr;
+    std::atomic<float>* spectralCursor = nullptr; // display voice's read position, 0..1 of the sample, or -1
 };
+// sampleMode choices; Spectral was appended after Granular.
+enum SampleMode { kSampleModePlayback = 0, kSampleModeGranular = 1, kSampleModeSpectral = 2 };
 
 inline juce::StringArray routeNames() { return { "Filter 1", "Filter 2", "Direct" }; }
 
@@ -54,7 +70,12 @@ public:
     void legato (int note, float glideSeconds);
     // After a block: whether this voice reads only the current user table / sample.
     bool settled (size_t oscillator) const { return ! isVoiceActive () || oscillators[oscillator].settled (); }
-    bool sampleSettled () const { return ! isVoiceActive () || (swapLeft == 0 && fadingSample == nullptr && playingSample == params.sample); }
+    bool sampleSettled () const;
+    int grainCount () const noexcept { return granular.activeCount (); }
+    bool grainSaturated () const noexcept { return granular.saturated; }
+    void publishGrains (bw::GrainDisplaySnapshot& display) const noexcept { granular.publish (display); }
+    // Whether this voice reads only the current spectral analysis (or none).
+    bool spectralSettled () const noexcept { return ! isVoiceActive () || spectral.source () == nullptr || spectral.source () == params.spectral; }
 
 private:
     void glideTo (int note, float seconds);
@@ -122,9 +143,26 @@ private:
     int residualLeft = 0, residualLength = 240;
     // A replaced sample fades out over swapLength while the new one fades in from its start.
     juce::SmoothedValue<float> sampleAmplitude, sampleEnabled, samplePitch, samplePan;
-    const bw::Sample* playingSample = nullptr;
-    const bw::Sample* fadingSample = nullptr;
-    bw::SamplePlayer player, fadingPlayer;
+    struct SampleLayer
+    {
+        const bw::Sample* sample = nullptr;
+        const bw::SampleZone* zone = nullptr;
+        bw::SamplePlayer player;
+        float weight = 0, gainL = 1, gainR = 1; // weight times the zone's gain and pan
+        double tune = 1;                        // the zone's fine tune as a frequency ratio
+        int index = -1, variant = 0;
+    };
+    std::array<SampleLayer, 2> layers {}, fadingLayers {};
+    const bw::SampleBank* playingBank = nullptr;
+    bw::SampleTrigger sampleTrigger;
+    void selectSample (bool reset);
+    bw::GrainSources grainSources () const noexcept;
+    bw::GranularVoiceEngine granular;
+    juce::SmoothedValue<float> granularMix, grainDensity, grainSize, grainPosition, grainScan, grainSpread, grainPitch;
+    bw::SpectralVoicePlayer spectral;
+    juce::SmoothedValue<float> spectralMix, spectralPosition, spectralSpeed, spectralPitch;
+    void startSpectral () noexcept;
+    bw::SpectralControls spectralControls (float position, float speed, float semitones) const noexcept;
     int swapLeft = 0, swapLength = 240, cachedSampleRoot = -1;
     float cachedSampleSemitones = 10000, cachedSamplePan = 10000, sampleLeftGain = 1, sampleRightGain = 1;
     double sampleRatio = 1;
@@ -136,6 +174,7 @@ class WaveSynth : public juce::Synthesiser
 public:
     enum Mode { poly, mono, legato };
     void setMode (int newMode, float glideSeconds);
+    const SynthParams* sampleContext = nullptr;
     void noteOn (int channel, int note, float velocity) override;
     void noteOff (int channel, int note, float velocity, bool allowTailOff) override;
     void allNotesOff (int channel, bool allowTailOff) override;
@@ -150,9 +189,10 @@ private:
     bool gate = false, pedal = false;
     std::array<int, 128> held {};
     std::array<float, 128> velocities {};
+    std::array<bw::SampleTrigger, 128> heldTriggers {};
 };
 
-class WaveProcessor : public juce::AudioProcessor, private juce::AudioProcessorParameter::Listener
+class WaveProcessor : public juce::AudioProcessor, private juce::AudioProcessorParameter::Listener, private juce::AsyncUpdater
 {
 public:
     WaveProcessor ();
@@ -217,7 +257,7 @@ public:
     static constexpr size_t kMaxPendingSampleJobs = 2;
     juce::String loadSample (const juce::File& file);
     juce::String relinkSample (const juce::File& file);
-    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {});
+    uint64_t startSampleLoad (const juce::File& file, SampleReaderFactory readerFactory = {}, int zoneIndex = -1, int variantIndex = 0);
     void cancelSampleLoad (uint64_t requestId = 0);
     bool waitForSampleLoad (int timeoutMs = 5000);
     bool sampleLoading () const noexcept { return sampleLoadingFlag.load (std::memory_order_acquire); }
@@ -225,6 +265,24 @@ public:
     juce::String sampleLoadError () const;
     void setRestoreReaderFactory (SampleReaderFactory factory);
     void clearSample ();
+    std::shared_ptr<const bw::SampleBank> sampleBank () const;
+    bool sampleZonesMapped () const;
+    juce::String setSampleBank (const bw::SampleBank&, const juce::String& stepName = "SAMPLE ZONES");
+    // Slices of the current sample as zones on consecutive notes (one shared asset); an undoable "SLICE EDIT".
+    juce::String setSlices (std::vector<int> markers, int root, bool playToEnd);
+    // SFZ subset import (see SfzImporter.h). importSfz runs on the calling thread as an undoable step;
+    // startSfzImport decodes on the sample worker with progress and cancellation, like startSampleLoad.
+    // Either way the diagnostics (unsupported opcodes, missing files, warnings) stay readable afterwards.
+    juce::String importSfz (const juce::File&);
+    uint64_t startSfzImport (const juce::File&);
+    juce::String sfzDiagnostics () const;
+    void clearSlices ();
+    std::atomic<int> activeSampleZone { -1 };
+    bw::SamplePlaybackState samplePlayback;
+    bw::GrainDisplaySnapshot grainDisplay;
+    std::atomic<int> activeGrains { 0 };
+    std::atomic<float> currentBpm { 120 }; // host tempo when it reports one, else the internal BPM
+    std::atomic<bool> grainPoolSaturated { false };
     std::shared_ptr<const bw::Sample> sample () const;
     bool sampleSettled ();
     juce::File samplePath () const;
@@ -232,6 +290,17 @@ public:
     bool sampleMissing () const;
     std::atomic<unsigned> sampleRevision { 0 };
     void setSampleSwapSeconds (float seconds) noexcept { sampleSwapSeconds.store (juce::jmax (0.001f, seconds), std::memory_order_relaxed); }
+
+    // Spectral mode analyses the current sample (zone 1 of a bank) on the sample worker, within the asset budget,
+    // and publishes the analysis only when complete; until then voices keep the previous analysis. Leaving the
+    // mode releases the analysis. Called on mode changes and sample publication; safe from any non-audio thread.
+    enum class SpectralState { off, analyzing, ready, missing, refused };
+    void requestSpectralAnalysis ();
+    SpectralState spectralState () const;
+    float spectralProgress () const noexcept { return spectralProgressValue.load (std::memory_order_relaxed); }
+    juce::String spectralError () const;
+    std::shared_ptr<const bw::SpectralData> spectralData () const;
+    std::atomic<float> spectralCursor { -1 };
 
     // Aggregate asset memory budget (256 MiB across active assets, retired assets awaiting voices, and undo history).
     // Policy: loading a new asset first collects settled retired items, then evicts oldest undo steps if needed;
@@ -272,7 +341,9 @@ public:
 
 
 private:
-    void parameterValueChanged (int, float) override {}
+    void parameterValueChanged (int index, float) override;
+    void handleAsyncUpdate () override { requestSpectralAnalysis (); }
+    void completeSpectralAnalysis (uint64_t requestId, std::shared_ptr<const bw::SpectralData>, const juce::String& error);
     void parameterGestureChanged (int index, bool starting) override;
     struct Snapshot
     {
@@ -282,6 +353,7 @@ private:
         std::array<std::shared_ptr<const bw::Wavetable>, 2> tables;
         std::array<juce::String, 2> tableNames;
         std::shared_ptr<const bw::Sample> sample;
+        std::shared_ptr<const bw::SampleBank> sampleBank;
         juce::File samplePath;
     };
     struct Step { Snapshot before, after; std::vector<bool> parameters; juce::String name; };
@@ -298,9 +370,9 @@ private:
     bool replaying = false;
 
     void collectAssetsLocked ();
-    size_t nonEvictableAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr) const;
-    size_t totalAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr) const;
-    void evictHistoryForBudgetLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr);
+    size_t nonEvictableAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr, const bw::SampleBank* nextBank = nullptr) const;
+    size_t totalAssetBytesLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr, const bw::SampleBank* nextBank = nullptr) const;
+    void evictHistoryForBudgetLocked (const bw::Wavetable* nextTable = nullptr, const bw::Sample* nextSample = nullptr, const bw::SampleBank* nextBank = nullptr);
 
     std::unique_ptr<juce::XmlElement> createStateXml ();
     bool restoreState (const juce::XmlElement& xml);
@@ -310,9 +382,24 @@ private:
     std::array<juce::String, 2> userTableNames;
     juce::String publishCycles (int oscillator, const std::vector<std::vector<float>>& cycles, const juce::String& name);
     void publishSample (std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& editStepName = {});
-    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error);
+    bool completeSampleLoad (uint64_t requestId, std::shared_ptr<const bw::Sample>, const juce::File& path, const juce::String& error, int zoneIndex, int variantIndex);
     bool isRequestCancelledLocked (uint64_t requestId) const noexcept;
+    void completeSfzImport (uint64_t requestId, std::shared_ptr<const bw::SampleBank>, const bw::SfzImportResult&);
+    juce::String lastSfzDiagnostics;
+    std::shared_ptr<const bw::Sample> sampleLocked () const;
     bw::PublishSlot<bw::Sample> sampleSlot;
+    bw::PublishSlot<bw::SampleBank> sampleBankSlot;
+    bw::PublishSlot<bw::SpectralData> spectralSlot;
+    // Identity (content hash, frames) of the sample being analysed, or that was refused; 0 frames when none.
+    struct SpectralKey { uint64_t hash = 0; int frames = 0; bool operator== (const SpectralKey&) const = default; };
+    SpectralKey spectralPendingKey, spectralRefusedKey;
+    std::atomic<uint64_t> spectralRequestId { 0 };
+    std::atomic<float> spectralProgressValue { 0 };
+    juce::String spectralErrorText;
+    int sampleModeIndex = -1;
+    juce::RangedAudioParameter* sampleModeParameter = nullptr;
+    std::atomic<unsigned> sampleSequenceRevision { 0 };
+    unsigned seenSampleSequenceRevision = 0;
     juce::File sampleFile;
     std::atomic<float> sampleSwapSeconds { 0.005f };
     juce::ThreadPool sampleLoadPool { (int) kMaxPendingSampleJobs };

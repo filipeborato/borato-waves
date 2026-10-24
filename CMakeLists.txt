@@ -108,7 +108,12 @@ if(BORATOWAVE_BUILD_TESTS)
     target_include_directories(test_tuned_import PRIVATE Source)
     target_link_libraries(test_tuned_import PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)
 
-    foreach(test_name IN ITEMS wavetable interface sources modulation effects presets atelier voices sample table_editor history tuned_import)
+    juce_add_console_app(test_spectral)
+    target_sources(test_spectral PRIVATE tests/test_spectral.cpp)
+    target_include_directories(test_spectral PRIVATE Source)
+    target_link_libraries(test_spectral PRIVATE BoratoWave juce::juce_audio_utils juce::juce_dsp)
+
+    foreach(test_name IN ITEMS wavetable interface sources modulation effects presets atelier voices sample table_editor history tuned_import spectral)
         add_test(NAME ${test_name} COMMAND $<TARGET_FILE:test_${test_name}>)
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 1800)
     endforeach()

@@ -48,4 +48,4 @@ The tag must match the version declared in CMake. See [BUILDING.md](BUILDING.md)
 
 Under active development. Windows packages are not commercially signed; macOS packages are ad-hoc signed but not notarized. Testing in real DAWs and with physical audio devices complements the automated tests.
 
-Complete multisample, granular synthesis, and spectral resynthesis engines are not included in this release.
+Sample playback includes filtered transposition, velocity crossfades, up to four round-robin variants per zone, and portable banks with up to 128 zones. Granular synthesis provides density, size, scan, spread and modulation controls with a fixed 32-grain pool per voice. See [SAMPLING.md](SAMPLING.md) for mapping, measurements, and limits. Spectral resynthesis is not implemented.
