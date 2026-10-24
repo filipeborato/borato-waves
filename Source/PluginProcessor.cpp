@@ -1676,7 +1676,7 @@ void WaveProcessor::completeSfzImport (uint64_t requestId, std::shared_ptr<const
     evictHistoryForBudgetLocked (nullptr, nullptr, bank.get ());
     lastSampleLoadError.clear ();
     sampleBankSlot.publish (std::move (bank));
-    sampleSlot.publish (nullptr); sampleFile = {};
+    sampleSlot.publish (nullptr); sampleFile = juce::File ();
     sampleRevision.fetch_add (1, std::memory_order_relaxed);
 }
 
@@ -1712,7 +1712,7 @@ juce::String WaveProcessor::setSampleBank (const bw::SampleBank& bank, const juc
         sampleLoadingFlag.store (false);
         lastSampleLoadError.clear ();
         sampleBankSlot.publish (std::move (owned));
-        sampleSlot.publish (nullptr); sampleFile = {};
+        sampleSlot.publish (nullptr); sampleFile = juce::File ();
         sampleRevision.fetch_add (1, std::memory_order_relaxed);
     }
     updateHostDisplay (ChangeDetails {}.withNonParameterStateChanged (true));

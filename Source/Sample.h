@@ -662,7 +662,7 @@ inline std::shared_ptr<const SampleBank> deserializeSampleBank (const juce::Valu
                 remaining -= variant.sample->bytes ();
             }
             assets[index] = variant.sample;
-            if (v == 0) { z.sample = variant.sample; z.path = variant.path; variant.sample.reset (); variant.path = {}; }
+            if (v == 0) { z.sample = variant.sample; z.path = variant.path; variant.sample.reset (); variant.path = juce::File (); }
         }
         bank->zones.push_back (std::move (z));
     }
