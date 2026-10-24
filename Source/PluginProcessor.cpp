@@ -170,6 +170,29 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     toggle ("grainLoop", "Grain Loop", false);
     continuous ("grainJitter", "Grain Timing Jitter", 0, 100, 20);
     continuous ("grainPan", "Grain Pan Spread", 0, 100, 0);
+    choice ("spectralPhaseLock", { "Independent", "Rigid" }, 1);
+    choice ("spectralTransients", { "Off", "Reset" });
+    choice ("spectralOrder", { "1 > 2", "2 > 1" });
+    choice ("spectralStage1Type", bw::spectralStageNames ());
+    continuous ("spectralStage1Amount", "Spectral Stage 1 Amount", -1, 1, 0);
+    toggle ("spectralStage1Bypass", "Spectral Stage 1 Bypass", false);
+    choice ("spectralStage2Type", bw::spectralStageNames ());
+    continuous ("spectralStage2Amount", "Spectral Stage 2 Amount", -1, 1, 0);
+    toggle ("spectralStage2Bypass", "Spectral Stage 2 Bypass", false);
+    choice ("grainWindow", bw::grainWindowNames ());
+    continuous ("grainWindowAmount", "Grain Window Amount", 0, 1, 0);
+    continuous ("grainWindowSkew", "Grain Window Skew", .01f, .99f, .5f);
+    continuous ("grainDirectionSpread", "Grain Reverse Probability", 0, 1, 0);
+    continuous ("grainPitchSpread", "Grain Pitch Spread", 0, 24, 0);
+    continuous ("grainLengthSpread", "Grain Length Spread", 0, 1, 0);
+    continuous ("grainGainSpread", "Grain Gain Spread", 0, 1, 0);
+    continuous ("grainAmountSpread", "Grain Window Amount Spread", 0, 1, 0);
+    continuous ("grainSkewSpread", "Grain Window Skew Spread", 0, 1, 0);
+    continuous ("grainWarpSpread", "Grain Warp Spread", 0, 1, 0);
+    choice ("grainWarp1Type", bw::grainWarpNames ());
+    continuous ("grainWarp1Amount", "Grain Warp 1 Amount", -1, 1, 0);
+    choice ("grainWarp2Type", bw::grainWarpNames ());
+    continuous ("grainWarp2Amount", "Grain Warp 2 Amount", -1, 1, 0);
     return l;
 }
 
@@ -424,6 +447,13 @@ bw::SpectralControls WaveVoice::spectralControls (float position, float speed, f
     c.startFrame = bw::SpectralData::frameFor (juce::jlimit (0.0, length, std::min (a, b) * length));
     c.endFrame = bw::SpectralData::frameFor (juce::jlimit (0.0, length, std::max (a, b) * length));
     c.position = position; c.speed = speed;
+    const auto& sp = params.spectralParams;
+    const bool compare = params.spectralCompare->load (std::memory_order_relaxed);
+    c.phaseLock = compare || sp.phaseLock->load () >= .5f;
+    c.transientReset = ! compare && sp.transients->load () >= .5f;
+    c.reverseOrder = sp.order->load () >= .5f;
+    c.stages[0] = { (bw::SpectralStageType) juce::jlimit (0, 2, juce::roundToInt (sp.stage1Type->load ())), sp.stage1Amount->load (), compare || sp.stage1Bypass->load () >= .5f };
+    c.stages[1] = { (bw::SpectralStageType) juce::jlimit (0, 2, juce::roundToInt (sp.stage2Type->load ())), sp.stage2Amount->load (), compare || sp.stage2Bypass->load () >= .5f };
     c.freeze = params.spectralParams.freeze->load () >= .5f;
     c.loop = zone ? zone->loop : params.sampleLoop->load () >= .5f;
     const int root = zone ? zone->rootKey : juce::roundToInt (params.sampleRoot->load ());
@@ -544,6 +574,18 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
         grainTiming.batch = index (g.batch, bw::kMaxGrainBatch);
         grainTiming.keyTrack = g.keyTrack->load () * .01f; grainTiming.loop = g.loop->load () >= .5f;
         grainTiming.jitter = g.jitter->load () * .01f; grainTiming.panSpread = g.pan->load () * .01f;
+        grainTiming.window = (bw::GrainWindowType) index (g.window, 9);
+        grainTiming.windowAmount = g.windowAmount->load ();
+        grainTiming.windowSkew = g.windowSkew->load ();
+        grainTiming.directionSpread = g.directionSpread->load ();
+        grainTiming.pitchSpread = g.pitchSpread->load ();
+        grainTiming.lengthSpread = g.lengthSpread->load ();
+        grainTiming.gainSpread = g.gainSpread->load ();
+        grainTiming.amountSpread = g.amountSpread->load ();
+        grainTiming.skewSpread = g.skewSpread->load ();
+        grainTiming.warpSpread = g.warpSpread->load ();
+        grainTiming.warp[0] = { (bw::GrainWarpType) index (g.warp1Type, 2), g.warp1Amount->load () };
+        grainTiming.warp[1] = { (bw::GrainWarpType) index (g.warp2Type, 2), g.warp2Amount->load () };
         grainTiming.note = noteNumber;
         grainTiming.root = layers[0].zone ? layers[0].zone->rootKey : sampleRoot;
     }
@@ -736,7 +778,10 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
             if (spectralMode && ! spectral.source () && sampleGate > 0) startSpectral ();
             if (spectralAmount > 0 || ! spectral.idle ())
             {
-                const auto resynthesis = spectral.process (spectralControls (spectralPos, spectralRate, sampleSemitones + spectralSemitones));
+                auto controls = spectralControls (spectralPos, spectralRate, sampleSemitones + spectralSemitones);
+                controls.stages[0].amount = effective (bw::kSpectralStage1Destination, controls.stages[0].amount);
+                controls.stages[1].amount = effective (bw::kSpectralStage2Destination, controls.stages[1].amount);
+                const auto resynthesis = spectral.process (controls);
                 sampledL += spectralAmount * (resynthesis.first - sampledL); sampledR += spectralAmount * (resynthesis.second - sampledR);
             }
             if (! spectralMode && spectralAmount == 0 && spectral.source ()) spectral.reset (nullptr, {}, sampleRate);
@@ -782,8 +827,9 @@ WaveProcessor::WaveProcessor ()
     params.grain = { p ("sampleMode"), p ("grainDensity"), p ("grainSize"), p ("grainPosition"), p ("grainScan"), p ("grainSpreadPos"), p ("grainSeed"), p ("grainPitch"),
                      p ("grainDensityMode"), p ("grainDensityDivision"), p ("grainOverlap"), p ("grainLengthMode"), p ("grainLengthDivision"), p ("grainLengthPercent"),
                      p ("grainDistribution"), p ("grainBatch"), p ("grainJumpStart"), p ("grainKeyTrack"), p ("grainLoop"),
-                     p ("grainJitter"), p ("grainPan") };
-    params.spectralParams = { p ("spectralPos"), p ("spectralFreeze"), p ("spectralSpeed"), p ("spectralPitch") };
+                     p ("grainJitter"), p ("grainPan"), p ("grainWindow"), p ("grainWindowAmount"), p ("grainWindowSkew"), p ("grainDirectionSpread"), p ("grainPitchSpread"), p ("grainLengthSpread"), p ("grainGainSpread"), p ("grainAmountSpread"), p ("grainSkewSpread"), p ("grainWarpSpread"), p ("grainWarp1Type"), p ("grainWarp1Amount"), p ("grainWarp2Type"), p ("grainWarp2Amount") };
+    params.spectralParams = { p ("spectralPos"), p ("spectralFreeze"), p ("spectralSpeed"), p ("spectralPitch"), p ("spectralPhaseLock"), p ("spectralTransients"), p ("spectralStage1Type"), p ("spectralStage1Amount"), p ("spectralStage1Bypass"), p ("spectralStage2Type"), p ("spectralStage2Amount"), p ("spectralStage2Bypass"), p ("spectralOrder") };
+    params.spectralCompare = &spectralCompareBaseline;
     params.region = { p ("sampleLoopMode"), p ("sampleDirection"), p ("sampleLoopStart"), p ("sampleLoopEnd"), p ("sampleLoopXfade"),
                       p ("sampleLoopLink"), p ("sampleFadeIn"), p ("sampleFadeOut") };
     params.spectralCursor = &spectralCursor;

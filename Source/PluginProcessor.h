@@ -34,9 +34,10 @@ struct SynthParams
     bw::SamplePlaybackState* playback = nullptr;
     struct GrainParams { std::atomic<float> *mode, *density, *size, *position, *scan, *spread, *seed, *pitch,
                          *densityMode, *densityDivision, *overlap, *lengthMode, *lengthDivision, *lengthPercent,
-                         *distribution, *batch, *jumpStart, *keyTrack, *loop, *jitter, *pan; } grain {};
+                         *distribution, *batch, *jumpStart, *keyTrack, *loop, *jitter, *pan, *window, *windowAmount, *windowSkew, *directionSpread, *pitchSpread, *lengthSpread, *gainSpread, *amountSpread, *skewSpread, *warpSpread, *warp1Type, *warp1Amount, *warp2Type, *warp2Amount; } grain {};
+    std::atomic<bool>* spectralCompare = nullptr;
     bw::GrainClock clock; // tempo and ppq at the start of the block; transport true while the host plays
-    struct SpectralParams { std::atomic<float> *position, *freeze, *speed, *pitch; } spectralParams {};
+    struct SpectralParams { std::atomic<float> *position, *freeze, *speed, *pitch, *phaseLock, *transients, *stage1Type, *stage1Amount, *stage1Bypass, *stage2Type, *stage2Amount, *stage2Bypass, *order; } spectralParams {};
     struct RegionParams { std::atomic<float> *loopMode, *direction, *loopStart, *loopEnd, *crossfade, *link, *fadeIn, *fadeOut; } region {};
     const bw::SpectralData* spectral = nullptr;
     std::atomic<float>* spectralCursor = nullptr; // display voice's read position, 0..1 of the sample, or -1
@@ -300,6 +301,7 @@ public:
     float spectralProgress () const noexcept { return spectralProgressValue.load (std::memory_order_relaxed); }
     juce::String spectralError () const;
     std::shared_ptr<const bw::SpectralData> spectralData () const;
+    std::atomic<bool> spectralCompareBaseline { false };
     std::atomic<float> spectralCursor { -1 };
 
     // Aggregate asset memory budget (256 MiB across active assets, retired assets awaiting voices, and undo history).

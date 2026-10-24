@@ -2158,7 +2158,134 @@ void testGranularJitterPanAndLevel ()
 }
 } // namespace
 
-int main()
+void testGrainWindowEndpoints ()
+{
+    // Independent double evaluator of the ticket's formulas, not the production table builder.
+    const double pi = std::acos (-1.0);
+    for (int w = 0; w < 10; ++w)
+        for (int i = 0; i <= 4096; ++i)
+        {
+            const double t = i/4096.0, x = 2*t-1;
+            const double fade = std::pow (std::sin (pi*.5*std::min (1.0, std::min (t,1-t)/.02)), 2);
+            double expected = 0;
+            switch (w)
+            {
+                case 0: expected = std::pow (std::sin (pi*t), 2); break;
+                case 1: expected = 4*t*(1-t); break;
+                case 2: expected = std::exp (-(t-.5)*(t-.5)/(.18*.18*2))*fade; break;
+                case 3: expected = (.35875-.48829*std::cos (2*pi*t)+.14128*std::cos (4*pi*t)-.01168*std::cos (6*pi*t))*fade; break;
+                case 4: expected = x == 0 ? 1 : std::pow (std::sin (4*pi*x)/(4*pi*x),2); break;
+                case 5: expected = t < .25 ? std::pow (std::sin (2*pi*t),2) : t > .75 ? std::pow (std::sin (2*pi*(1-t)),2) : 1; break;
+                case 6: expected = 2*std::min (t,1-t); break;
+                case 7: expected = std::min (1.0,4*std::min (t,1-t)); break;
+                case 8: expected = std::exp (-6*t)*fade; break;
+                case 9: expected = std::exp (-6*(1-t))*fade; break;
+            }
+            if (i == 0 || i == 4096) expected = 0;
+            assert (std::abs (bw::evaluateGrainWindow ((bw::GrainWindowType) w,t)-expected) <= 1e-5);
+            assert (std::abs (bw::evaluateGrainWindow (bw::GrainWindowType::expDec,t)-bw::evaluateGrainWindow (bw::GrainWindowType::expDecRev,1-t)) <= 1e-6);
+        }
+    for (double skew : { .01, .5, .99 })
+    {
+        double previous = -1;
+        for (int i = 0; i <= 4096; ++i)
+        {
+            const double u = bw::applyGrainSkew (i/4096.0,skew);
+            assert (u >= previous && u >= 0 && u <= 1); previous = u;
+        }
+        assert (bw::applyGrainSkew (0,skew) == 0 && bw::applyGrainSkew (1,skew) == 1);
+    }
+    for (int w = 0; w < 10; ++w)
+        for (float skew : { .01f, .5f, .99f })
+            for (float amount : { 0.0f, .5f, 1.0f })
+            {
+                bw::Grain grain; grain.window = (bw::GrainWindowType) w; grain.windowAmount = amount; grain.windowSkew = skew;
+                grain.windowGain = bw::grainWindowGain (grain.window,amount,skew);
+                double energy = 0;
+                for (int n = 0; n <= 16384; ++n) { const double v = bw::grainWindow (grain,n/16384.0); energy += v*v/16384; }
+                assert (std::isfinite (energy) && std::abs (energy-.375) < .002);
+            }
+    bw::DeterministicRng a, b; double mean = 0, second = 0;
+    for (int i = 0; i < 10000; ++i)
+    {
+        const double v = a.next (); assert (v == b.next () && v >= 0 && v < 1);
+        mean += v/10000; second += v*v/10000;
+    }
+    assert (std::abs (mean-.5) < .015 && std::abs (second-mean*mean-1.0/12) < .005);
+    for (auto type : { bw::GrainWarpType::identity, bw::GrainWarpType::bend, bw::GrainWarpType::asym })
+        for (double amount : { -1.0, 0.0, 1.0 })
+        {
+            double previous = -1;
+            for (int i = 0; i <= 4096; ++i)
+            {
+                const double t = i/4096.0, u = bw::applyGrainWarp (t,type,amount);
+                assert (u >= previous && u >= 0 && u <= 1); previous = u;
+                if (amount == 0) assert (u == t);
+            }
+        }
+    auto sample = std::make_shared<bw::Sample> (); sample->rate = 48000;
+    for (int i = 0; i < 48000; ++i) sample->data.push_back ((float) (.3*std::sin (i*.043)));
+
+    bw::GrainSources sources {}; sources[0] = { sample.get (), 0, 48000, 1.0/440, 1 };
+    bw::GrainControls c; c.loop = true; c.spread = .2f;
+    bw::GranularVoiceEngine original, neutral, changed, repeat;
+    original.reset (48000,123); neutral.reset (48000,123); changed.reset (48000,123); repeat.reset (48000,123);
+    auto zeroWarp = c; zeroWarp.warp[0].type = bw::GrainWarpType::bend; zeroWarp.warp[1].type = bw::GrainWarpType::asym;
+    auto scattered = c; scattered.window = bw::GrainWindowType::expDec; scattered.windowAmount = 1;
+    scattered.directionSpread = .5f; scattered.pitchSpread = 24; scattered.lengthSpread = 1; scattered.gainSpread = 1;
+    scattered.amountSpread = scattered.skewSpread = scattered.warpSpread = scattered.panSpread = 1;
+    scattered.warp[0] = { bw::GrainWarpType::bend, .5f }; scattered.warp[1] = { bw::GrainWarpType::asym, -.5f };
+    double difference = 0;
+    for (int i = 0; i < 24000; ++i)
+    {
+        const auto base = original.process (sources,c,440), zero = neutral.process (sources,zeroWarp,440);
+        assert (base == zero);
+        const auto v = changed.process (sources,scattered,440), r = repeat.process (sources,scattered,440);
+        assert (v == r && std::isfinite (v.first) && std::isfinite (v.second));
+        difference += std::pow (v.first-base.first,2);
+    }
+    assert (difference > .01);
+    c.directionSpread = 1; original.reset (48000,123); double reverseEnergy = 0;
+    for (int n = 0; n < 10000; ++n) { const auto v = original.process (sources,c,440); reverseEnergy += v.first*v.first; }
+    assert (reverseEnergy > 1);
+    Rig rig; rig.set ("grainWindow",9); rig.set ("grainWindowAmount",.8f); rig.set ("grainWarp1Type",2);
+    rig.set ("spectralPhaseLock",0); rig.set ("spectralTransients",1); rig.set ("spectralStage1Type",1); rig.set ("spectralStage1Amount",.25f);
+    juce::MemoryBlock state; rig.processor.getStateInformation (state);
+    Rig restored; restored.processor.setStateInformation (state.getData (),(int) state.getSize ());
+    for (auto id : { "grainWindow", "grainWindowAmount", "grainWarp1Type", "spectralPhaseLock", "spectralTransients", "spectralStage1Type", "spectralStage1Amount" })
+        assert (rig.processor.apvts.getRawParameterValue (id)->load () == restored.processor.apvts.getRawParameterValue (id)->load ());
+
+    std::unique_ptr<juce::AudioProcessorEditor> editor (rig.processor.createEditor ());
+    sampleControl (*editor,"SAMPLE")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    auto* panel = sampleControl (*editor,"Sample source"); assert (panel);
+    auto snapshot = [&] (const char* name)
+    {
+        const auto file = juce::File::getCurrentWorkingDirectory ().getChildFile (juce::String ("build/")+name+".png");
+        assert (file.getParentDirectory ().createDirectory ().wasOk ());
+        auto stream = file.createOutputStream ();
+        assert (stream); stream->setPosition (0); stream->truncate ();
+        assert (juce::PNGImageFormat ().writeImageToStream (panel->createComponentSnapshot (panel->getLocalBounds ()),*stream));
+    };
+    rig.set ("sampleMode",kSampleModeGranular); panel->visibilityChanged ();
+    for (auto page : { "WINDOW", "SPREAD", "WARP" })
+    {
+        auto* button = sampleControl (*panel,juce::String (page)+" PAGE"); assert (button); button->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+        snapshot (page);
+    }
+    rig.set ("sampleMode",kSampleModeSpectral); panel->visibilityChanged ();
+    sampleControl (*panel,"STAGES")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+    for (auto title : { "STAGE 1 AMT", "STAGE 2 AMT" })
+    {
+        auto* dial = dynamic_cast<bw::ui::Dial*> (sampleControl (*panel,title));
+        assert (dial && dial->isVisible () && dial->getHeight () >= 80 && dial->onModulationDrop);
+        dial->onModulationDrop (3,dial->parameterId ());
+    }
+    snapshot ("STAGES");
+    sampleControl (*panel,"PLAYBACK")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey)); snapshot ("SPECTRAL");
+    std::cout << "ok: ten windows, skew, PRNG, warp identity and deterministic dispersed stereo grains\n";
+}
+
+int main (int argc, char**)
 {
 #ifdef _WIN32
     // Failed asserts print and exit instead of opening a modal dialog.
@@ -2166,6 +2293,8 @@ int main()
     _set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     juce::ScopedJuceInitialiser_GUI init;
+    testGrainWindowEndpoints ();
+    if (argc > 1) return 0;
     testRegionLoopDirectionsAndTailedRelease ();
     testManualSlicesSharedAssetAndUndo ();
     testSfzSubsetImportAndDiagnostics ();

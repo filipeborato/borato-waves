@@ -139,6 +139,159 @@ void testCancellation ()
     assert (data == nullptr && error.contains ("cancelled"));
 }
 
+void testSpectralStages ()
+{
+    bw::SpectralBuffer bins {}, scratch {};
+    bins[2*40] = 1; bins[2*100] = .5f; bins[0] = .1f; bins[2*(bw::kSpectralBins-1)] = .2f;
+    const auto original = bins;
+    bw::applySpectralStage (bins,scratch,{ bw::SpectralStageType::binShift,7.0f/64,false },48000.0/2048,0);
+    assert (bins[2*47] == 1 && bins[2*107] == .5f && bins[2*40] == 0 && bins[0] == .1f && bins[2*(bw::kSpectralBins-1)] == .2f);
+    bins = {}; bins[2*1020] = 1;
+    bw::applySpectralStage (bins,scratch,{ bw::SpectralStageType::binShift,7.0f/64,false },48000.0/2048,0);
+    for (float v : bins) assert (v == 0);
+    bins = {}; bins[2*40] = 1;
+    bw::applySpectralStage (bins,scratch,{ bw::SpectralStageType::binShift,7.5f/64,false },48000.0/2048,0);
+    assert (bins[2*47] == .5f && bins[2*48] == .5f);
+    bins = {}; for (int k : { 16,32,64,128,256,512 }) bins[2*(size_t) k] = 1;
+    bw::applySpectralStage (bins,scratch,{ bw::SpectralStageType::tilt,.5f,false },48000.0/2048,0);
+    for (int k : { 16,32,64,128,256,512 })
+        assert (std::abs (20*std::log10 (bins[2*(size_t) k])-6*std::log2 (k*48000.0/2048/1000)) <= .5);
+    auto first = original, second = original;
+    bw::SpectralStage shift { bw::SpectralStageType::binShift,.5f,false }, tilt { bw::SpectralStageType::tilt,1,false };
+    bw::applySpectralStage (first,scratch,shift,48000.0/2048,0); bw::applySpectralStage (first,scratch,tilt,48000.0/2048,0);
+    bw::applySpectralStage (second,scratch,tilt,48000.0/2048,0); bw::applySpectralStage (second,scratch,shift,48000.0/2048,0);
+    assert (std::abs (first[2*72]-second[2*72]) > .1);
+    const auto sample = makeSample (24000,sine (1500,.2)); const auto data = analyze (*sample);
+    auto c = whole (*data); c.stages[0] = { bw::SpectralStageType::binShift,7.0f/64,false };
+    bw::SpectralVoicePlayer player; player.reset (data.get (),c,kRate);
+    const auto rendered = render (player,c,24000).first;
+    assert (std::abs (frequency (rendered,4000,20000,kRate)-(1500+7*kRate/2048)) < .1);
+    c.stages[0].amount = 0; player.reset (data.get (),c,kRate);
+    const auto neutral = render (player,c,24000).first; double error = 0;
+    for (size_t i = 0; i < neutral.size (); ++i) error += std::pow (neutral[i]-sample->data[i],2);
+    assert (error/neutral.size () < 1e-9);
+    c.stages[0].amount = .13f; c.loop = true; player.reset (data.get (),c,kRate);
+    float previous = 0; double maxJump = 0;
+    for (int n = 0; n < 18000; ++n)
+    {
+        if (n == 4000) c.stages[0].amount = 0;
+        if (n == 8000) { c.stages[0].amount = .13f; c.stages[1] = tilt; }
+        if (n == 11000) c.reverseOrder = true;
+        if (n == 14000) c.stages[0].bypass = true;
+        const auto value = player.process (c).first;
+        assert (std::isfinite (value));
+        maxJump = std::max (maxJump,(double) std::abs (value-previous)); previous = value;
+    }
+    std::cout << "stage transitions max sample step " << maxJump << "\n";
+    assert (maxJump < .3);
+    std::cout << "ok: spectral stage precision, identity, order and transitions\n";
+}
+
+void testTransientIdentity ()
+{
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+    const auto sample = makeSample (12000, [] (int n) { return n == 3000 || n == 8000 ? .8f : 0.0f; });
+    sample->rate = rate;
+    const auto data = analyze (*sample);
+    assert (! data->transientSamples.empty ());
+    auto controls = whole (*data); controls.transientReset = true;
+    bw::SpectralVoicePlayer player; player.reset (data.get (), controls, rate);
+    const auto [left, right] = render (player, controls, 12000);
+    double error = 0;
+    for (size_t n = 0; n < left.size (); ++n) error += std::pow (left[n] - sample->data[n], 2);
+    assert (error / left.size () < 1e-9);
+    for (double speed : { .5, 2.0 })
+    {
+        controls.speed = speed; controls.transientReset = false;
+        bw::SpectralVoicePlayer baseline; baseline.reset (data.get (), controls, rate);
+        const auto plain = render (baseline, controls, (int) (12000/speed)).first;
+        controls.transientReset = true;
+        bw::SpectralVoicePlayer treated; treated.reset (data.get (), controls, rate);
+        const auto improved = render (treated, controls, (int) (12000/speed)).first;
+        double before = 0, after = 0;
+        for (int attack : { 3000, 8000 })
+            for (int n = std::max (0, (int) (attack/speed)-(int) (rate*.02)); n < (int) (attack/speed); ++n)
+            {
+                before += plain[(size_t) n]*plain[(size_t) n]; after += improved[(size_t) n]*improved[(size_t) n];
+            }
+        std::cout << "transient speed " << speed << " pre-echo " << before << " -> " << after << "\n";
+        assert (after <= before*.75);
+        for (int attack : { 3000, 8000 })
+        {
+            const int expected = (int) (attack/speed);
+            double peak = 0; int peakAt = -1;
+            for (int n = expected-16; n <= expected+16; ++n)
+                if (std::abs (improved[(size_t) n]) > peak) { peak = std::abs (improved[(size_t) n]); peakAt = n; }
+            std::cout << "attack " << expected << " peak " << peak << " at " << peakAt << "\n";
+            assert (peak > .1 && std::abs (peakAt-expected) <= 1);
+        }
+
+    }
+
+    }
+}
+
+void testTransientRatesAndCloseAttacks ()
+{
+    for (double sourceRate : { 48000.0, 96000.0 })
+        for (double hostRate : { 48000.0, 96000.0 })
+            for (int spacing : { 1200, 5000 })
+            {
+                const auto sample = makeSample (18000,[=] (int n) { return n >= 3000 && n <= 13000 && (n-3000)%spacing == 0 ? .8f : 0; });
+                sample->rate = sourceRate; const auto data = analyze (*sample);
+                for (double speed : { .5, 2.0 })
+                {
+                    auto c = whole (*data); c.speed = speed; c.transientReset = true;
+                    bw::SpectralVoicePlayer player; player.reset (data.get (),c,hostRate);
+                    const double step = speed*sourceRate/hostRate;
+                    const auto rendered = render (player,c,(int) (18000/step)).first;
+                    double onGrid = 0, offGrid = 0;
+                    for (size_t n = 0; n < rendered.size (); ++n)
+                    {
+                        bool near = false;
+                        for (int a = 3000; a <= 13000; a += spacing) near = near || std::abs ((double) n-a/step) <= 2;
+                        (near ? onGrid : offGrid) += rendered[n]*rendered[n];
+                    }
+                    std::cout << "attacks source/host " << sourceRate << "/" << hostRate << " spacing " << spacing << " speed " << speed << " energy " << onGrid << " / " << offGrid << " detected " << data->transientSamples.size () << "\n";
+                    assert (onGrid > .01 && offGrid < onGrid*.1);
+                }
+            }
+}
+
+void testPhaseLockFixtures ()
+{
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+        for (bool percussion : { false, true })
+        {
+            auto signal = [=] (int n)
+            {
+                if (! percussion) return (float) (.15*std::sin (kTwoPi*440*n/rate)+.15*std::sin (kTwoPi*470*n/rate));
+                const int age = n % (int) (rate*.08);
+                return (float) (.6*std::exp (-age/(rate*.006))*std::cos (kTwoPi*1300*age/rate));
+            };
+            const auto sample = makeSample ((int) (rate*.25),signal,[&] (int n) { return -.5f*signal (n); }); sample->rate = rate;
+            const auto data = analyze (*sample);
+            for (double speed : { .5, 1.0, 2.0 })
+                for (bool lock : { false, true })
+                {
+                    auto c = whole (*data); c.speed = speed; c.phaseLock = lock; c.transientReset = true;
+                    bw::SpectralVoicePlayer player; player.reset (data.get (),c,rate);
+                    const auto [l,r] = render (player,c,(int) (sample->numFrames ()/speed));
+                    double energy = 0, identity = 0;
+                    for (size_t n = 0; n < l.size (); ++n)
+                    {
+                        assert (std::isfinite (l[n]) && std::isfinite (r[n]) && std::abs (r[n]+.5*l[n]) < 1e-5);
+                        energy += l[n]*l[n];
+                        if (speed == 1) identity += std::pow (l[n]-sample->data[n],2);
+                    }
+                    assert (energy/l.size () > 1e-5);
+                    if (speed == 1) assert (identity/l.size () < 1e-9);
+                }
+        }
+    std::cout << "ok: phase-lock/percussion stereo and identity at 44.1/48/96 kHz\n";
+}
+
 void testFreezeAndScrub ()
 {
     const auto sample = makeSample (48000, sine (440, .25));
@@ -366,6 +519,10 @@ void testProcessorIdentityModesAndAllocation ()
     r.set ("mod1Enabled", 1); r.set ("mod1Source", 1); r.set ("mod1Destination", bw::kSpectralPositionDestination); r.set ("mod1Amount", .5f);
     r.set ("mod2Enabled", 1); r.set ("mod2Source", 3); r.set ("mod2Destination", bw::kSpectralPitchDestination); r.set ("mod2Amount", 1);
     r.set ("lfo1Rate", 8);
+    r.set ("spectralStage1Type",1); r.set ("spectralStage1Amount",.13f);
+    r.set ("spectralStage2Type",2); r.set ("spectralStage2Amount",.5f); r.set ("spectralTransients",1);
+    r.set ("mod3Enabled",1); r.set ("mod3Source",1); r.set ("mod3Destination",bw::kSpectralStage1Destination); r.set ("mod3Amount",.2f);
+
     for (int note = 48; note < 64; ++note) r.send (on (note));
     renderChecked (r.processor, r.pending, 4800, 37);
     r.set ("spectralFreeze", 1); r.set ("macro1", 1); renderChecked (r.processor, r.pending, 4800, 128);
@@ -461,7 +618,7 @@ void testPortableStateVersionAndModulation ()
 }
 } // namespace
 
-int main ()
+int main (int argc, char**)
 {
 #ifdef _WIN32
     // Failed asserts print and exit instead of opening a modal dialog.
@@ -470,8 +627,13 @@ int main ()
 #endif
     std::cout << std::unitbuf;
     juce::ScopedJuceInitialiser_GUI init;
+    if (argc > 1) { testTransientIdentity (); testSpectralStages (); testPhaseLockFixtures (); testTransientRatesAndCloseAttacks (); return 0; }
     testIdentityReconstruction ();
     testCancellation ();
+    testTransientIdentity ();
+    testSpectralStages ();
+    testPhaseLockFixtures ();
+    testTransientRatesAndCloseAttacks ();
     testFreezeAndScrub ();
     testTimeAndPitchSeparation ();
     testProcessorIdentityModesAndAllocation ();
