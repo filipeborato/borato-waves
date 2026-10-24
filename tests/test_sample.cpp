@@ -1436,8 +1436,8 @@ void testGranularCloudPoolAndRipple ()
     for (double rate : { 44100.0, 48000.0, 96000.0 })
     {
         bw::GranularVoiceEngine engine; engine.reset (rate, 1);
-        bw::GrainSources sources { bw::GrainSource { dc.get (), 64, 4096, 1, 1 }, {} };
-        bw::GrainControls controls;
+        bw::GrainSources sources { bw::GrainSource { dc.get (), 64, 16384, 1, 1 }, {} };
+        bw::GrainControls controls; controls.spread = 0;
         double lo = 1, hi = 0;
         for (int n = 0; n < (int) (rate * .3); ++n)
         {
@@ -1447,24 +1447,26 @@ void testGranularCloudPoolAndRipple ()
             assert (before == gAudioHeapOps.load ()); assert (engine.activeCount () <= 32);
             if (n > (int) (rate * .15)) { lo = std::min (lo, (double) value.first); hi = std::max (hi, (double) value.first); }
         }
-        assert (20 * std::log10 (hi / lo) < .1); assert (std::abs (hi - .5) < 1.0e-6);
+        // 40 Hz x 100 ms is a Hann overlap of 4 (window sum 2): power normalisation lifts correlated DC by sqrt (2).
+        assert (20 * std::log10 (hi / lo) < .1); assert (std::abs (hi - .5 * std::sqrt (2.0)) < 1.0e-3);
     }
     std::array<bw::GranularVoiceEngine, 16> voices;
     for (auto& voice : voices) voice.reset (8000, 9);
     bw::GrainSources sources { bw::GrainSource { dc.get (), 10, 100, 1, 1 }, {} };
-    bw::GrainControls dense { 100, 500, 1, 2, 1 };
+    bw::GrainControls dense { 100, 500, 1, 2, 1 }; dense.loop = true; // looped, so long grains keep a 90-frame region
+    const float ceiling = .5f * std::sqrt (32.0f) + 1.0e-5f;        // 32 correlated DC grains
     int maximum = 0;
     for (int n = 0; n < 4800; ++n)
     {
         int count = 0;
-        for (auto& voice : voices) { const auto value = voice.process (sources, dense, 1); assert (std::isfinite (value.first) && std::abs (value.first) <= .500001f); if (n > 1200) assert (std::abs (value.first - .5f) < 1.0e-6f); count += voice.activeCount (); }
+        for (auto& voice : voices) { const auto value = voice.process (sources, dense, 1); assert (std::isfinite (value.first) && std::abs (value.first) <= ceiling); count += voice.activeCount (); }
         maximum = std::max (maximum, count); assert (count <= 512);
     }
     assert (maximum == 512); for (auto& voice : voices) assert (voice.saturated);
     auto bounded = std::make_shared<bw::Sample> (); bounded->data.assign (1024, 100); std::fill (bounded->data.begin () + 101, bounded->data.begin () + 200, .5f);
     bw::GranularVoiceEngine edge; edge.reset (8000, 1);
     sources[0] = { bounded.get (), 100.5, 200, 1, 1 };
-    for (int i = 0; i < 1600; ++i) { const auto value = edge.process (sources, dense, 4); assert (value.first <= .50001f); }
+    for (int i = 0; i < 1600; ++i) { const auto value = edge.process (sources, dense, 4); assert (value.first <= ceiling); }
     std::cout << "ok: Hann DC ripple <0.1 dB, region bounds, 32/512 caps and allocation-free engine" << std::endl;
 }
 void testGranularDensityDurationAndBlockInvariance ()
@@ -1539,7 +1541,7 @@ void testGranularModulationAndPortableRoundTrip ()
         assert (std::sqrt (error / audio.size ()) < 3.1623e-5); // -90 dBFS.
     }
     Rig stress (8000); stress.processor.setStateInformation (state.getData (), (int) state.getSize ());
-    stress.set ("grainDensity", 100); stress.set ("grainSize", 500);
+    stress.set ("grainDensity", 100); stress.set ("grainSize", 500); stress.set ("grainLoop", 1); // long grains wrap in the short tone
     for (int note = 48; note < 64; ++note) stress.send (on (note));
     renderChecked (stress.processor, stress.pending, 2800, 64);
     assert (stress.processor.activeGrains.load () == 512 && stress.processor.grainPoolSaturated.load ());
@@ -2034,14 +2036,16 @@ void testGranularSyncDistributionsJumpStartAndKeyTrack ()
     rateSync.densityBeats = bw::divisionBeats (19); assert (std::abs (bw::resolveGrainTiming (rateSync, 120).eventHz - straight / 1.5) < 1.0e-9);
     rateSync.densityBeats = bw::divisionBeats (20); assert (std::abs (bw::resolveGrainTiming (rateSync, 120).eventHz - straight * 1.5) < 1.0e-9);
 
-    // A looping grain that crosses the region end wraps inside it; without loop it holds the last frame.
+    // A looping grain that crosses the region end wraps inside it; without loop it is moved back and shortened to
+    // end inside the region, never holding the last frame.
     for (bool loop : { false, true })
     {
         bw::GrainControls c; c.sizeMs = 500; c.position = .95f; c.loop = loop;
         bw::GrainSources region {}; region[0] = { &flat, 1000, 2000, 1.0 / 440, 1 };
         bw::GranularVoiceEngine engine; engine.reset (rate, 1);
         bw::GrainDisplaySnapshot display;
-        float lowest = 1.0e9f, highest = 0;
+        float lowest = 1.0e9f, highest = 0, previous = -1;
+        int alive = 0, held = 0;
         for (int s = 0; s < 20000; ++s)
         {
             engine.process (region, c, 440, s == 0);
@@ -2049,9 +2053,10 @@ void testGranularSyncDistributionsJumpStartAndKeyTrack ()
             if (display.count.load () == 0) continue;
             const float at = display.grains[0].normPos.load () * 48000;
             lowest = std::min (lowest, at); highest = std::max (highest, at);
+            held += std::abs (at - previous) < .5f ? 1 : 0; previous = at; ++alive;
         }
-        assert (lowest >= 999.9f && highest <= 1999.1f);
-        assert (loop ? lowest < 1100 : lowest > 1900);
+        assert (lowest >= 999.9f && highest <= 1999.1f && held == 0);
+        assert (loop ? alive == 20000 : alive < 1000 && lowest < 1002);
     }
 
     // Extremes: zero density clamps to 1 Hz; long synced grains saturate the pool predictably, finite throughout.
@@ -2079,6 +2084,78 @@ void testGranularSyncDistributionsJumpStartAndKeyTrack ()
     assert (value ("grainDensityMode") == 2 && value ("grainBatch") == 3 && value ("grainKeyTrack") == 50 && value ("grainJumpStart") == 1);
     std::cout << "ok: grain BPM grid/tempo/stop/seek within 1 sample, batch distributions, jump-start, target overlap, key tracking, percent/dotted/triplet, grain loop and saturation" << std::endl;
 }
+void testGranularJitterPanAndLevel ()
+{
+    constexpr double rate = 48000;
+    bw::Sample noise; noise.rate = rate; noise.data.resize (96000);
+    bw::DeterministicRng source; source.state = 99;
+    for (auto& x : noise.data) x = (float) (source.next () - .5);
+    const bw::GrainSources sources { bw::GrainSource { &noise, 0, 96000, 1, 1 }, {} };
+
+    // Jitter delays each grain by [0, jitter x interval) after its event, reproducibly per seed.
+    bw::GrainControls jittered; jittered.density = 10; jittered.sizeMs = 5; jittered.jitter = .5f;
+    auto spawnTimes = [&] (uint64_t seed)
+    {
+        bw::GranularVoiceEngine engine; engine.reset (rate, seed); std::vector<int> times;
+        for (int n = 0; n < (int) rate; ++n)
+        {
+            const auto before = engine.spawned;
+            { ScopedAudioHeapGuard guard; engine.process (sources, jittered, 1); }
+            if (engine.spawned != before) times.push_back (n);
+        }
+        return times;
+    };
+    const auto times = spawnTimes (3);
+    assert (times.size () == 10 && times == spawnTimes (3) && times != spawnTimes (4));
+    bool late = false;
+    for (size_t k = 0; k < times.size (); ++k)
+    {
+        assert (times[k] >= (int) k * 4800 && times[k] <= (int) k * 4800 + 2400);
+        late |= times[k] > (int) k * 4800 + 10;
+    }
+    assert (late);
+
+    // Pan spread keeps equal power against the centred cloud with the same timing; no spread keeps L == R.
+    const auto dc = engineFixture ();
+    const bw::GrainSources flat { bw::GrainSource { dc.get (), 0, 16384, 1, 1 }, {} };
+    bw::GrainControls centred; centred.density = 5; centred.sizeMs = 100; centred.position = 0;
+    auto panned = centred; panned.panSpread = 1;
+    bw::GranularVoiceEngine a, b; a.reset (rate, 5); b.reset (rate, 5);
+    bool wide = false;
+    for (int n = 0; n < (int) rate; ++n)
+    {
+        const auto mono = a.process (flat, centred, 1), stereo = b.process (flat, panned, 1);
+        assert (mono.first == mono.second);
+        assert (std::abs (stereo.first * stereo.first + stereo.second * stereo.second - 2 * mono.first * mono.first) < 1.0e-6);
+        wide |= std::abs (stereo.first - stereo.second) > .05f;
+    }
+    assert (wide);
+
+    // Power normalisation: an overlapped noise cloud keeps its RMS within 3 dB from 2 to 10 overlapping grains, with
+    // or without position spread.
+    auto level = [&] (float density, float spread)
+    {
+        bw::GrainControls c; c.density = density; c.sizeMs = 100; c.spread = spread; c.jitter = .2f; c.scan = .5f;
+        bw::GranularVoiceEngine engine; engine.reset (rate, 11); double sum = 0;
+        for (int n = 0; n < (int) rate * 2; ++n) { const auto value = engine.process (sources, c, 1); if (n >= rate) sum += value.first * value.first; }
+        return 10 * std::log10 (sum / rate);
+    };
+    const double reference = level (20, 0);
+    for (float density : { 20.0f, 50.0f, 100.0f })
+        for (float spread : { 0.0f, 1.0f })
+        {
+            const double db = level (density, spread);
+            std::cout << "grain cloud " << density << " Hz spread " << spread << ": " << db - reference << " dB" << std::endl;
+            assert (std::abs (db - reference) < 3);
+        }
+
+    Rig r; for (auto id : { "grainJitter", "grainPan" }) assert (r.processor.apvts.getParameter (id)->isAutomatable ());
+    r.set ("grainJitter", 70); r.set ("grainPan", 40);
+    juce::MemoryBlock state; r.processor.getStateInformation (state);
+    Rig restored; restored.processor.setStateInformation (state.getData (), (int) state.getSize ());
+    assert (restored.processor.apvts.getRawParameterValue ("grainJitter")->load () == 70 && restored.processor.apvts.getRawParameterValue ("grainPan")->load () == 40);
+    std::cout << "ok: grain jitter bounds and determinism, equal-power pan spread, overlap-stable cloud level" << std::endl;
+}
 } // namespace
 
 int main()
@@ -2092,6 +2169,7 @@ int main()
     testRegionLoopDirectionsAndTailedRelease ();
     testManualSlicesSharedAssetAndUndo ();
     testSfzSubsetImportAndDiagnostics ();
+    testGranularJitterPanAndLevel ();
     testGranularSyncDistributionsJumpStartAndKeyTrack ();
     testVelocityLayersAndCrossfadeLaws ();
     testRoundRobinSequenceAndDeterminism ();

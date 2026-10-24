@@ -41,16 +41,18 @@ private:
     bool updatingZones = false;
     WaveProcessor& processor;
     Action load, relink, cancel, clear;
-    ParameterToggle enabled, loop, freeze, loopLink, jumpStart, grainLoop;
+    ParameterToggle enabled, loop, freeze, loopLink, jumpStart, grainLoop, oscA, oscB;
     ParameterChoice route, mode, loopMode, direction, densityMode, densityDivision, lengthMode, lengthDivision, distribution;
     Dial level, pitch, root, pan, start, end, loopStart, loopEnd, loopFade, fadeIn, fadeOut;
-    Dial density, size, position, scan, spread, grainPitch, seed;
+    Dial density, size, position, scan, spread, grainPitch, jitter, grainPan, seed;
     Dial spectralPosition, spectralSpeed, spectralPitch;
     Dial overlap, lengthPercent, batch, keyTrack;
-    Action timingPage;
-    bool showTiming = false;
+    Action grainsPage, timingPage;
+    bool showTiming = false, draggingPosition = false;
     int shownMode = -1;
     void updatePages ();
+    void updateEnables ();
+    void setGrainPosition (int x);
     std::unique_ptr<juce::FileChooser> chooser;
     juce::String status;
     std::vector<float> overview, overviewRight; // peak per column of the loaded sample (L/mono and R)

@@ -64,7 +64,9 @@ struct GrainControls
     int batch = 1;
     float keyTrack = 0;                           // 0..1: length x 2^(-(note - root) / 12 x keyTrack)
     int note = 60, root = 60;
-    bool loop = false;                            // grains wrap inside the region instead of holding its last frame
+    bool loop = false;                            // grains wrap inside the region instead of fitting before its end
+    float jitter = 0;                             // 0..1: each grain waits a random [0, jitter x interval) after its event
+    float panSpread = 0;                          // 0..1: random equal-power pan per grain
 };
 // Host or internal tempo; with a playing transport, synced events follow the ppq grid, otherwise the note.
 struct GrainClock { double bpm = 120, ppq = 0; bool transport = false; };
@@ -103,6 +105,7 @@ struct Grain
     GrainSources sources {};
     std::array<double, 2> positions {};
     int age = 0, duration = 1;
+    float gainL = 1, gainR = 1;
     bool active = false;
 };
 struct GrainDisplaySnapshot
@@ -171,7 +174,9 @@ public:
         if (event)
             for (int k = 0; k < timing.batch; ++k)
             {
-                const double delay = grainBatchOffset (controls.distribution, k, timing.batch, rng) * interval;
+                double delay = grainBatchOffset (controls.distribution, k, timing.batch, rng) * interval;
+                if (const float jitter = std::isfinite (controls.jitter) ? juce::jlimit (0.0f, 1.0f, controls.jitter) : 0.0f; jitter > 0)
+                    delay += rng.next () * jitter * interval;
                 if (delay < 1) spawn (sources, controls, timing, frequency);
                 else if (pending < (int) delays.size ()) delays[(size_t) pending++] = delay;
                 else saturated = true;
@@ -195,13 +200,14 @@ public:
                 const double increment = frequency * source.ratio;
                 const auto value = source.sample->readFilteredStereo (grain.positions[l], increment, source.from, source.to);
                 const double weight = window * source.weight;
-                left += value.first * weight; right += value.second * weight;
+                left += value.first * weight * grain.gainL; right += value.second * weight * grain.gainR;
                 grain.positions[l] = advance (grain.positions[l], increment, source, controls.loop);
             }
             if (++grain.age >= grain.duration) grain.active = false;
         }
-        // Unity for overlapped DC; sparse clouds retain their Hann envelope. Denominator never approaches zero.
-        const double normalise = 1.0 / std::max (1.0, windowSum);
+        // Power normalisation: overlapped grains read decorrelated material, so their level holds steady as the
+        // overlap grows; perfectly correlated input (DC) rises by sqrt (overlap). Sparse clouds keep their Hann envelope.
+        const double normalise = 1.0 / std::sqrt (std::max (1.0, windowSum));
         return { (float) (left * normalise), (float) (right * normalise) };
     }
     int activeCount () const noexcept
@@ -244,12 +250,25 @@ private:
         if (! sources[0].sample && ! sources[1].sample) return;
         *free = {}; free->sources = sources; free->active = true;
         free->duration = std::max (2, (int) std::round (rate * timing.lengthMs * .001));
+        // Without grain loop a grain must end inside the region: shorter regions shorten it, later starts move back.
+        const size_t lead = sources[0].sample ? 0u : 1u;
+        const double increment = frequency * sources[lead].ratio, span = sources[lead].to - sources[lead].from - 1;
+        if (! controls.loop && std::isfinite (increment) && increment > 0 && span > 0)
+            free->duration = std::max (2, (int) std::min ((double) free->duration, span / increment));
+        if (const float pan = std::isfinite (controls.panSpread) ? juce::jlimit (0.0f, 1.0f, controls.panSpread) : 0.0f; pan > 0)
+        {
+            const double angle = ((rng.next () * 2 - 1) * pan + 1) * juce::MathConstants<double>::pi * .25;
+            free->gainL = (float) (std::cos (angle) * juce::MathConstants<double>::sqrt2);
+            free->gainR = (float) (std::sin (angle) * juce::MathConstants<double>::sqrt2);
+        }
         double position = (std::isfinite (controls.position) ? juce::jlimit (0.0f, 1.0f, controls.position) : .5f) + scanOffset;
         if (position < 0 || position > 1) position -= std::floor (position);
         position = juce::jlimit (0.0, 1.0, position + randomOffset);
         for (size_t l = 0; l < 2; ++l)
         {
-            free->positions[l] = sources[l].from + position * std::max (0.0, sources[l].to - sources[l].from - 1);
+            const double length = std::max (0.0, sources[l].to - sources[l].from - 1);
+            const double travel = controls.loop ? 0.0 : std::min (length, free->duration * frequency * sources[l].ratio);
+            free->positions[l] = sources[l].from + std::min (position * length, std::isfinite (travel) ? length - travel : length);
             // A jump-started grain is placed where it would be after `age` frames.
             if (age > 0) free->positions[l] = advance (free->positions[l], age * frequency * sources[l].ratio, sources[l], controls.loop);
         }

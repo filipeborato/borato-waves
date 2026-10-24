@@ -34,7 +34,7 @@ struct SynthParams
     bw::SamplePlaybackState* playback = nullptr;
     struct GrainParams { std::atomic<float> *mode, *density, *size, *position, *scan, *spread, *seed, *pitch,
                          *densityMode, *densityDivision, *overlap, *lengthMode, *lengthDivision, *lengthPercent,
-                         *distribution, *batch, *jumpStart, *keyTrack, *loop; } grain {};
+                         *distribution, *batch, *jumpStart, *keyTrack, *loop, *jitter, *pan; } grain {};
     bw::GrainClock clock; // tempo and ppq at the start of the block; transport true while the host plays
     struct SpectralParams { std::atomic<float> *position, *freeze, *speed, *pitch; } spectralParams {};
     struct RegionParams { std::atomic<float> *loopMode, *direction, *loopStart, *loopEnd, *crossfade, *link, *fadeIn, *fadeOut; } region {};

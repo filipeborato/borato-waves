@@ -20,6 +20,7 @@ SamplePanel::SamplePanel (WaveProcessor& p)
       freeze (p.apvts, "spectralFreeze", "FREEZE"),
       loopLink (p.apvts, "sampleLoopLink", "LINK"),
       jumpStart (p.apvts, "grainJumpStart", "JUMP"), grainLoop (p.apvts, "grainLoop", "G-LOOP"),
+      oscA (p.apvts, "oscAOn", "OSC A"), oscB (p.apvts, "oscBOn", "OSC B"),
       route (p.apvts, "sampleRoute", "ROUTE", "Sample route"),
       mode (p.apvts, "sampleMode", "MODE", "Sample playback mode"),
       loopMode (p.apvts, "sampleLoopMode", "LOOP", "Sample loop mode"),
@@ -41,18 +42,21 @@ SamplePanel::SamplePanel (WaveProcessor& p)
       density (p.apvts, "grainDensity", "DENSITY"), size (p.apvts, "grainSize", "GRAIN SIZE"),
       position (p.apvts, "grainPosition", "POSITION"), scan (p.apvts, "grainScan", "SCAN RATE"),
       spread (p.apvts, "grainSpreadPos", "POS SPREAD"), grainPitch (p.apvts, "grainPitch", "GRAIN PITCH"),
+      jitter (p.apvts, "grainJitter", "JITTER"), grainPan (p.apvts, "grainPan", "PAN SPREAD"),
       seed (p.apvts, "grainSeed", "GRAIN SEED"),
       spectralPosition (p.apvts, "spectralPos", "SPECTRAL POS"), spectralSpeed (p.apvts, "spectralSpeed", "SPEED"),
       spectralPitch (p.apvts, "spectralPitch", "SPECTRAL PITCH"),
       overlap (p.apvts, "grainOverlap", "OVERLAP"), lengthPercent (p.apvts, "grainLengthPercent", "LENGTH %"),
       batch (p.apvts, "grainBatch", "PER EVENT"), keyTrack (p.apvts, "grainKeyTrack", "KEY TRACK"),
-      timingPage ("TIMING", [this] { showTiming = ! showTiming; updatePages (); })
+      grainsPage ("GRAINS", [this] { showTiming = false; updatePages (); }),
+      timingPage ("TIMING", [this] { showTiming = true; updatePages (); })
 {
     setTitle ("Sample source");
-    for (Component* c : std::initializer_list<Component*> { &load, &relink, &cancel, &clear, &route, &enabled, &loop, &level, &pitch, &root, &pan, &start, &end, &loopStart, &loopEnd, &loopFade, &fadeIn, &fadeOut, &loopLink, &loopMode, &direction, &mode, &density, &size, &position, &scan, &spread, &grainPitch, &seed })
+    for (Component* c : std::initializer_list<Component*> { &load, &relink, &cancel, &clear, &route, &enabled, &loop, &level, &pitch, &root, &pan, &start, &end, &loopStart, &loopEnd, &loopFade, &fadeIn, &fadeOut, &loopLink, &loopMode, &direction, &mode, &oscA, &oscB })
         addAndMakeVisible (c);
     for (Component* c : std::initializer_list<Component*> { &freeze, &spectralPosition, &spectralSpeed, &spectralPitch, &overlap, &lengthPercent, &batch, &keyTrack,
-                                                            &densityMode, &densityDivision, &lengthMode, &lengthDivision, &distribution, &jumpStart, &grainLoop, &timingPage })
+                                                            &densityMode, &densityDivision, &lengthMode, &lengthDivision, &distribution, &jumpStart, &grainLoop,
+                                                            &grainsPage, &timingPage, &density, &size, &position, &scan, &spread, &grainPitch, &jitter, &grainPan, &seed })
         addChildComponent (c);
     relink.setEnabled (processor.sampleMissing ());
     cancel.setEnabled (processor.sampleLoading ());
@@ -94,6 +98,7 @@ void SamplePanel::resized ()
     route.setBounds (808, 52, 124, 28);
     enabled.setBounds (940, 52, 116, 28);
     loop.setBounds (1064, 52, 116, 28);
+    oscA.setBounds (130, 10, 100, 28); oscB.setBounds (236, 10, 100, 28);
     mode.setBounds (500, 10, 200, 28);
     loopMode.setBounds (710, 10, 170, 28);
     direction.setBounds (890, 10, 130, 28);
@@ -107,7 +112,7 @@ void SamplePanel::resized ()
     for (auto* dial : { &level, &pitch, &root, &pan, &start, &end, &loopStart, &loopEnd, &loopFade, &fadeIn, &fadeOut }) { dial->setBounds (x, 300, 92, 88); x += 98; }
     loopLink.setBounds (x, 330, 1180 - x, 28);
     x = 20;
-    for (auto* dial : { &density, &size, &position, &scan, &spread, &grainPitch, &seed }) { dial->setBounds (x, 395, 100, 88); x += 112; }
+    for (auto* dial : { &density, &size, &position, &spread, &scan, &grainPitch, &jitter, &grainPan, &seed }) { dial->setBounds (x, 395, 96, 88); x += 104; }
     x = 20;
     for (auto* dial : { &spectralPosition, &spectralSpeed, &spectralPitch }) { dial->setBounds (x, 395, 100, 88); x += 112; }
     freeze.setBounds (x + 6, 425, 116, 28);
@@ -116,7 +121,7 @@ void SamplePanel::resized ()
     densityMode.setBounds (480, 395, 150, 26); densityDivision.setBounds (640, 395, 160, 26);
     lengthMode.setBounds (480, 427, 150, 26); lengthDivision.setBounds (640, 427, 160, 26);
     distribution.setBounds (480, 459, 150, 26); jumpStart.setBounds (640, 459, 78, 26); grainLoop.setBounds (722, 459, 78, 26);
-    timingPage.setBounds (820, 456, 110, 26);
+    grainsPage.setBounds (960, 460, 106, 26); timingPage.setBounds (1074, 460, 106, 26);
 
 }
 
@@ -167,7 +172,7 @@ void SamplePanel::paint (Graphics& g)
                    + String (bw::kSpectralLatencySamples) + " SAMPLES / PREVIOUS ANALYSIS PLAYS UNTIL READY",
                { 600, 428, 580, 22 }, 11, error.isNotEmpty () ? coral : muted);
     }
-    else
+    else if (shownMode == kSampleModeGranular)
     {
         // The same resolution the engine uses, at the root note: effective event rate, length and occupancy.
         auto value = [this] (const char* id) { return processor.apvts.getRawParameterValue (id)->load (); };
@@ -180,10 +185,15 @@ void SamplePanel::paint (Graphics& g)
         c.overlap = value ("grainOverlap"); c.lengthPercent = value ("grainLengthPercent"); c.batch = roundToInt (value ("grainBatch"));
         const auto timing = bw::resolveGrainTiming (c, processor.currentBpm.load ());
         const double expected = timing.eventHz * timing.batch * timing.lengthMs * .001;
-        label (g, "GRAINS: " + String (processor.grainDisplay.count.load ()) + "/32  / TOTAL " + String (processor.activeGrains.load ()) + "/512", { 820, 400, 360, 22 }, 11, mint);
-        label (g, String (timing.eventHz, 2) + " EVENTS/S x" + String (timing.batch) + " / " + String (timing.lengthMs, 1) + " MS / EXPECTED " + String (expected, 1)
-                   + (expected > 32 || processor.grainPoolSaturated.load () ? " / POOL FULL" : ""),
-               { 820, 428, 360, 22 }, 11, expected > 32 || processor.grainPoolSaturated.load () ? coral : muted);
+        const bool full = expected > 32 || processor.grainPoolSaturated.load ();
+        label (g, "GRAINS " + String (processor.grainDisplay.count.load ()) + "/32  TOTAL " + String (processor.activeGrains.load ()) + "/512", { 960, 396, 220, 18 }, 11, mint);
+        label (g, String (timing.eventHz, 1) + " EVENTS/S x" + String (timing.batch) + "  " + String (timing.lengthMs, 0) + " MS", { 960, 416, 220, 18 }, 11, muted);
+        label (g, "OVERLAP " + String (expected, 1) + (full ? "  POOL FULL" : ""), { 960, 436, 220, 18 }, 11, full ? coral : muted);
+    }
+    else
+    {
+        label (g, "MODE SAMPLE plays the region with the loop and fades above.", { 20, 405, 900, 22 }, 12, muted);
+        label (g, "Switch MODE (top) to GRANULAR for a grain cloud or SPECTRAL for stretch / freeze; their controls appear here.", { 20, 431, 900, 22 }, 12, muted);
     }
     if (bank && selectedZone >= 0 && selectedZone < (int) bank->zones.size ())
     {
@@ -266,6 +276,19 @@ void SamplePanel::paint (Graphics& g)
         g.fillRoundedRectangle (barArea.withWidth (barArea.getWidth () * progress), 4.0f);
     }
 
+    if (shownMode == kSampleModeGranular && ! overview.empty ())
+    {
+        // Where new grains start: POSITION inside the region, with its +/- spread band. Click or drag to move it.
+        auto value = [this] (const char* id) { return processor.apvts.getRawParameterValue (id)->load (); };
+        const float a = std::min (shown[0], shown[1]), b = std::max (shown[0], shown[1]);
+        const float at = a + jlimit (0.0f, 1.0f, value ("grainPosition")) * (b - a), band = jlimit (0.0f, 1.0f, value ("grainSpreadPos")) * (b - a);
+        const float lo = jlimit (a, b, at - band), hi = jlimit (a, b, at + band);
+        g.setColour (mint.withAlpha (.15f));
+        g.fillRect (r.getX () + lo * r.getWidth (), r.getY (), (hi - lo) * r.getWidth (), r.getHeight ());
+        g.setColour (mint);
+        g.fillRect (r.getX () + at * r.getWidth () - 1.5f, r.getY (), 3.0f, r.getHeight ());
+        label (g, "POSITION: CLICK OR DRAG", { roundToInt (r.getX () + at * r.getWidth ()) + 5, (int) r.getY () + 20, 160, 14 }, 9, mint);
+    }
     if (processor.grainDisplay.count.load (std::memory_order_relaxed) > 0)
         for (const auto& grain : processor.grainDisplay.grains)
         {
@@ -292,11 +315,24 @@ void SamplePanel::paint (Graphics& g)
     }
     const String err = processor.sampleLoadError ().toUpperCase ();
     const String msg = status.isNotEmpty () ? status : err;
-    label (g, msg.isNotEmpty () ? msg : "Root note plays the file at its original pitch. Start and end move with the next loop pass or note.",
-           { 20, 279, 600, 18 }, 10, msg.isNotEmpty () ? coral : muted);
+    auto value = [this] (const char* id) { return processor.apvts.getRawParameterValue (id)->load (); };
+    const bool sampleOn = value ("sampleOn") >= .5f;
+    // Why nothing is heard, ahead of the generic hint.
+    const String warning = sample == nullptr && ! loading ? (shownMode == kSampleModeGranular ? "GRAINS NEED A SAMPLE: LOAD ONE" : "")
+                         : ! sampleOn ? "SAMPLE IS OFF: TURN SAMPLE ON TO HEAR IT"
+                         : value ("sampleLevel") <= 0 ? "SAMPLE LEVEL IS 0" : "";
+    label (g, msg.isNotEmpty () ? msg : warning.isNotEmpty () ? warning : String ("Root note plays the file at its original pitch. Start and end move with the next loop pass or note."),
+           { 20, 279, 600, 18 }, 10, msg.isNotEmpty () || warning.isNotEmpty () ? coral : muted);
     const String sfz = processor.sfzDiagnostics ().toUpperCase ();
-    label (g, sfz.isNotEmpty () ? "SFZ: " + sfz : String ("Saved presets embed a portable sample container; missing legacy paths can be relinked."),
-           { 640, 279, 540, 18 }, 10, sfz.contains ("UNSUPPORTED") || sfz.contains ("MISSING") ? coral : muted);
+    // Every enabled source sums into its route: the sample (or its grains) plays on top of the oscillators.
+    StringArray sounding;
+    if (value ("oscAOn") >= .5f) sounding.add ("OSC A");
+    if (value ("oscBOn") >= .5f) sounding.add ("OSC B");
+    if (value ("subOn") >= .5f) sounding.add ("SUB");
+    if (value ("noiseOn") >= .5f) sounding.add ("NOISE");
+    if (sampleOn) sounding.add (shownMode == kSampleModeGranular ? "GRAINS" : shownMode == kSampleModeSpectral ? "SPECTRAL" : "SAMPLE");
+    label (g, sfz.isNotEmpty () ? "SFZ: " + sfz : "SOUNDING: " + (sounding.isEmpty () ? String ("NOTHING") : sounding.joinIntoString (" + ")) + "  /  SAMPLE " + String (routeBadge),
+           { 640, 279, 540, 18 }, 10, sfz.contains ("UNSUPPORTED") || sfz.contains ("MISSING") ? coral : mint);
 }
 
 void SamplePanel::timerCallback ()
@@ -307,6 +343,7 @@ void SamplePanel::timerCallback ()
         shownMode = current;
         updatePages ();
     }
+    updateEnables ();
     const int active = processor.activeSampleZone.load (std::memory_order_relaxed);
     if (active != displayedZone) { displayedZone = active; repaint (); }
     const auto now = processor.sampleRevision.load (std::memory_order_relaxed);
@@ -357,13 +394,44 @@ void SamplePanel::timerCallback ()
 
 void SamplePanel::updatePages ()
 {
-    const bool spectral = shownMode == kSampleModeSpectral, timing = ! spectral && showTiming;
-    for (Component* c : std::initializer_list<Component*> { &density, &size, &position, &scan, &spread, &grainPitch, &seed }) c->setVisible (! spectral && ! timing);
+    const bool granular = shownMode == kSampleModeGranular, timing = granular && showTiming;
+    for (Component* c : std::initializer_list<Component*> { &density, &size, &position, &scan, &spread, &grainPitch, &jitter, &grainPan, &seed }) c->setVisible (granular && ! timing);
     for (Component* c : std::initializer_list<Component*> { &overlap, &lengthPercent, &batch, &keyTrack, &densityMode, &densityDivision,
                                                             &lengthMode, &lengthDivision, &distribution, &jumpStart, &grainLoop }) c->setVisible (timing);
-    for (Component* c : std::initializer_list<Component*> { &freeze, &spectralPosition, &spectralSpeed, &spectralPitch }) c->setVisible (spectral);
-    timingPage.setVisible (! spectral);
-    timingPage.setText (timing ? "BASIC" : "TIMING");
+    for (Component* c : std::initializer_list<Component*> { &freeze, &spectralPosition, &spectralSpeed, &spectralPitch }) c->setVisible (shownMode == kSampleModeSpectral);
+    for (auto* page : { &grainsPage, &timingPage }) page->setVisible (granular);
+    grainsPage.setSelected (! timing); timingPage.setSelected (timing);
+    repaint ();
+}
+
+// Controls that cannot change what is heard right now are dimmed and locked. Read every tick, so mode changes from
+// the host or a preset show at once.
+void SamplePanel::updateEnables ()
+{
+    auto enable = [] (Component& c, bool on) { c.setEnabled (on); c.setAlpha (on ? 1.0f : .3f); };
+    auto value = [this] (const char* id) { return roundToInt (processor.apvts.getRawParameterValue (id)->load ()); };
+    const bool mapped = processor.sampleZonesMapped (), engine = shownMode != kSampleModePlayback;
+    // Zones carry their own loop window, mode and direction; the grain and spectral engines read only the region.
+    for (Component* c : std::initializer_list<Component*> { &loopStart, &loopEnd, &loopLink, &loopMode, &direction }) enable (*c, ! mapped && ! engine);
+    for (Component* c : std::initializer_list<Component*> { &loopFade, &fadeIn, &fadeOut }) enable (*c, ! engine);
+    enable (loop, ! mapped && shownMode != kSampleModeGranular);
+    const int rateMode = value ("grainDensityMode"), sizeMode = value ("grainLengthMode");
+    enable (density, rateMode == 0 || (rateMode == 2 && sizeMode == 2)); // Percent measures the Free interval
+    enable (densityDivision, rateMode == 1);
+    enable (overlap, rateMode == 2);
+    enable (size, sizeMode == 0);
+    enable (lengthDivision, sizeMode == 1);
+    enable (lengthPercent, sizeMode == 2);
+    enable (distribution, value ("grainBatch") > 1);
+}
+
+void SamplePanel::setGrainPosition (int x)
+{
+    const auto r = waveform.toFloat ().reduced (10);
+    const float a = std::min (shown[0], shown[1]), b = std::max (shown[0], shown[1]);
+    const float at = ((float) x - r.getX ()) / r.getWidth ();
+    if (auto* parameter = processor.apvts.getParameter ("grainPosition"); parameter && b > a)
+        parameter->setValueNotifyingHost (parameter->convertTo0to1 (jlimit (0.0f, 1.0f, (at - a) / (b - a))));
 }
 
 std::shared_ptr<const bw::Sample> SamplePanel::displayedSample () const
@@ -382,9 +450,7 @@ void SamplePanel::refreshZones ()
 {
     const ScopedValueSetter<bool> guard (updatingZones, true);
     const bool mapped = processor.sampleZonesMapped ();
-    root.setEnabled (! mapped); start.setEnabled (! mapped); end.setEnabled (! mapped); loop.setEnabled (! mapped);
-    // Zones carry their own loop window, mode and direction; crossfade and edge fades stay global.
-    for (Component* c : std::initializer_list<Component*> { &loopStart, &loopEnd, &loopLink, &loopMode, &direction }) c->setEnabled (! mapped);
+    root.setEnabled (! mapped); start.setEnabled (! mapped); end.setEnabled (! mapped);
     zoneChoice.clear (dontSendNotification);
     const auto bank = processor.sampleBank ();
     for (auto* slider : { &lowKey, &highKey, &zoneRoot, &lowVelocity, &highVelocity, &velocityFade, &variantCount }) slider->setEnabled (bank != nullptr);
@@ -502,9 +568,16 @@ void SamplePanel::toggleSlices ()
 
 void SamplePanel::mouseDown (const MouseEvent& e)
 {
-    if (! waveform.contains (e.getPosition ()) || sliceMarkers ().empty ()) return;
-    const int index = markerAt (e.x);
-    if (index < 0) return;
+    if (! waveform.contains (e.getPosition ())) return;
+    const int index = sliceMarkers ().empty () ? -1 : markerAt (e.x);
+    if (index < 0)
+    {
+        if (shownMode != kSampleModeGranular || e.mods.isPopupMenu () || overview.empty ()) return;
+        draggingPosition = true; // one gesture, one undo step, per drag
+        processor.apvts.getParameter ("grainPosition")->beginChangeGesture ();
+        setGrainPosition (e.x);
+        return;
+    }
     auto markers = sliceMarkers ();
     if (e.mods.isPopupMenu ()) { markers.erase (markers.begin () + index); commitSlices (std::move (markers)); return; }
     draggedMarkers = std::move (markers); draggedIndex = index;
@@ -512,6 +585,7 @@ void SamplePanel::mouseDown (const MouseEvent& e)
 
 void SamplePanel::mouseDrag (const MouseEvent& e)
 {
+    if (draggingPosition) { setGrainPosition (e.x); return; }
     if (draggedIndex < 0) return;
     draggedMarkers[(size_t) draggedIndex] = frameAt (e.x);
     repaint ();
@@ -519,6 +593,7 @@ void SamplePanel::mouseDrag (const MouseEvent& e)
 
 void SamplePanel::mouseUp (const MouseEvent&)
 {
+    if (draggingPosition) { draggingPosition = false; processor.apvts.getParameter ("grainPosition")->endChangeGesture (); return; }
     if (draggedIndex < 0) return;
     auto markers = std::move (draggedMarkers);
     draggedIndex = -1; draggedMarkers.clear ();
