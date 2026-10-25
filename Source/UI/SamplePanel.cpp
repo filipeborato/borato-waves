@@ -6,6 +6,7 @@ using namespace juce;
 namespace
 {
 const Rectangle<int> waveform { 20, 96, 1160, 180 };
+const Rectangle<int> spectralFilterBox { 934, 395, 246, 72 };
 }
 
 SamplePanel::SamplePanel (WaveProcessor& p)
@@ -86,6 +87,14 @@ SamplePanel::SamplePanel (WaveProcessor& p)
     {
         auto c = std::make_unique<ParameterToggle> (p.apvts, "spectralStage" + String (i) + "Bypass", "BYPASS " + String (i));
         addChildComponent (*c); extraControls.push_back ({ std::move (c), 6 });
+        if (i == 2)
+        {
+            choice ("spectralFilterOrder", "FILTER POS", 6);
+            dial ("spectralFilterLow", "SPEC LOW", 6);
+            dial ("spectralFilterHigh", "SPEC HIGH", 6);
+            dial ("spectralFilterShift", "SPEC SHIFT", 6);
+            dial ("spectralMix", "SPEC MIX", 6);
+        }
     }
     for (size_t i = 0; i < extraPages.size (); ++i)
     {
@@ -167,6 +176,15 @@ void SamplePanel::resized ()
         const int column = columns[(size_t) item.page]++;
         if (item.page == 2) item.component->setBounds (column == 0 ? 20 : 220+(column-1)*132, 395, column == 0 ? 190 : 124, 88);
         else if (item.page == 5) item.component->setBounds (480 + column*170, 397, 160, 28);
+        else if (item.page == 6)
+        {
+            static const std::array<Rectangle<int>, 12> kStagesBounds { {
+                { 20, 398, 126, 28 }, { 152, 395, 86, 88 }, { 244, 398, 126, 28 }, { 374, 395, 86, 88 },
+                { 466, 398, 92, 28 }, { 20, 434, 126, 28 }, { 244, 434, 126, 28 }, { 466, 434, 92, 28 },
+                { 564, 395, 86, 88 }, { 656, 395, 86, 88 }, { 748, 395, 86, 88 }, { 840, 395, 86, 88 }
+            } };
+            item.component->setBounds (kStagesBounds[(size_t) jlimit (0, 11, column)]);
+        }
         else item.component->setBounds (20 + column*132, 395, 124, 88);
     }
     spectralPlaybackPage.setBounds (600, 280, 108, 22); spectralStagesPage.setBounds (716, 280, 108, 22);
@@ -237,6 +255,45 @@ void SamplePanel::paint (Graphics& g)
         if (! showSpectralStages) label (g, error.isNotEmpty () ? error : "FFT " + String (bw::kSpectralFftSize) + " / HOP " + String (bw::kSpectralHop) + " / LATENCY "
                    + String (bw::kSpectralLatencySamples) + " SAMPLES / PREVIOUS ANALYSIS PLAYS UNTIL READY",
                { 470, 452, 710, 22 }, 11, error.isNotEmpty () ? coral : muted);
+        else
+        {
+            surface (g, spectralFilterBox, inset);
+            const auto customCurve = processor.getSpectralFilterCurve ();
+            bw::SpectralFilter filter;
+            filter.lowHz = processor.apvts.getRawParameterValue ("spectralFilterLow")->load ();
+            filter.highHz = processor.apvts.getRawParameterValue ("spectralFilterHigh")->load ();
+            filter.shiftSemitones = processor.apvts.getRawParameterValue ("spectralFilterShift")->load ();
+            filter.postOrder = processor.apvts.getRawParameterValue ("spectralFilterOrder")->load () >= 0.5f;
+            filter.curve = &customCurve;
+            const auto plot = spectralFilterBox.reduced (8, 16).withTrimmedTop (4).toFloat ();
+            constexpr double binHz = 48000.0 / bw::kSpectralFftSize;
+            Path stroke, fill;
+            const int widthPx = (int) plot.getWidth ();
+            for (int px = 0; px <= widthPx; ++px)
+            {
+                const double normX = (double) px / (double) std::max (1, widthPx);
+                const double hz = 20.0 * std::pow (1000.0, normX);
+                const int bin = jlimit (0, bw::kSpectralBins - 1, roundToInt (hz / binHz));
+                const float gain = bw::spectralFilterBinGain (bin, binHz, filter);
+                const float x = plot.getX () + (float) px;
+                const float y = plot.getBottom () - jlimit (0.0f, 1.0f, gain) * plot.getHeight ();
+                if (px == 0)
+                {
+                    stroke.startNewSubPath (x, y);
+                    fill.startNewSubPath (x, plot.getBottom ());
+                }
+                else stroke.lineTo (x, y);
+                fill.lineTo (x, y);
+            }
+            fill.lineTo (plot.getRight (), plot.getBottom ());
+            fill.closeSubPath ();
+            g.setColour (mint.withAlpha (0.18f));
+            g.fillPath (fill);
+            g.setColour (mint);
+            g.strokePath (stroke, PathStrokeType (1.5f));
+            label (g, String ("SPEC FILTER ") + (filter.postOrder ? "POST" : "PRE") + (customCurve.custom ? " / CUSTOM" : ""),
+                   spectralFilterBox.reduced (8, 3).removeFromTop (14), 9.0f, mint, Justification::centredLeft, true);
+        }
     }
     else if (shownMode == kSampleModeGranular)
     {
@@ -647,8 +704,33 @@ void SamplePanel::toggleSlices ()
     revision = ~0u; timerCallback ();
 }
 
+void SamplePanel::editSpectralFilterCurve (Point<int> pos)
+{
+    const auto plot = spectralFilterBox.reduced (8, 16).withTrimmedTop (4).toFloat ();
+    const float normX = jlimit (0.0f, 1.0f, ((float) pos.x - plot.getX ()) / std::max (1.0f, plot.getWidth ()));
+    const float gain = jlimit (0.0f, 1.0f, (plot.getBottom () - (float) pos.y) / std::max (1.0f, plot.getHeight ()));
+    const double centerHz = 20.0 * std::pow (1000.0, (double) normX);
+    constexpr double binHz = 48000.0 / bw::kSpectralFftSize;
+    auto curve = processor.getSpectralFilterCurve ();
+    curve.custom = true;
+    const double loHz = centerHz * std::exp2 (-0.2), hiHz = centerHz * std::exp2 (0.2);
+    const int loBin = jlimit (0, bw::kSpectralBins - 1, (int) std::floor (loHz / binHz));
+    const int hiBin = jlimit (0, bw::kSpectralBins - 1, (int) std::ceil (hiHz / binHz));
+    for (int k = loBin; k <= hiBin; ++k) curve.gains[(size_t) k] = gain;
+    processor.setSpectralFilterCurve (curve);
+    repaint ();
+}
+
 void SamplePanel::mouseDown (const MouseEvent& e)
 {
+    if (shownMode == kSampleModeSpectral && showSpectralStages && spectralFilterBox.contains (e.getPosition ()))
+    {
+        if (e.mods.isPopupMenu ()) { processor.clearSpectralFilterCurve ("RESET SPECTRAL FILTER CURVE"); repaint (); return; }
+        draggingFilterCurve = true;
+        processor.beginEdit ("SPECTRAL FILTER CURVE");
+        editSpectralFilterCurve (e.getPosition ());
+        return;
+    }
     if (! waveform.contains (e.getPosition ())) return;
     const int index = sliceMarkers ().empty () ? -1 : markerAt (e.x);
     if (index < 0)
@@ -666,6 +748,7 @@ void SamplePanel::mouseDown (const MouseEvent& e)
 
 void SamplePanel::mouseDrag (const MouseEvent& e)
 {
+    if (draggingFilterCurve) { editSpectralFilterCurve (e.getPosition ()); return; }
     if (draggingPosition) { setGrainPosition (e.x); return; }
     if (draggedIndex < 0) return;
     draggedMarkers[(size_t) draggedIndex] = frameAt (e.x);
@@ -674,6 +757,7 @@ void SamplePanel::mouseDrag (const MouseEvent& e)
 
 void SamplePanel::mouseUp (const MouseEvent&)
 {
+    if (draggingFilterCurve) { draggingFilterCurve = false; processor.endEdit (); return; }
     if (draggingPosition) { draggingPosition = false; processor.apvts.getParameter ("grainPosition")->endChangeGesture (); return; }
     if (draggedIndex < 0) return;
     auto markers = std::move (draggedMarkers);
@@ -683,6 +767,12 @@ void SamplePanel::mouseUp (const MouseEvent&)
 
 void SamplePanel::mouseDoubleClick (const MouseEvent& e)
 {
+    if (shownMode == kSampleModeSpectral && showSpectralStages && spectralFilterBox.contains (e.getPosition ()))
+    {
+        processor.clearSpectralFilterCurve ("RESET SPECTRAL FILTER CURVE");
+        repaint ();
+        return;
+    }
     if (! waveform.contains (e.getPosition ()) || sliceMarkers ().empty () || markerAt (e.x) >= 0) return;
     auto markers = sliceMarkers ();
     markers.push_back (frameAt (e.x));

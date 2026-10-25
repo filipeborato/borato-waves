@@ -157,6 +157,147 @@ struct SpectralStage
     bool bypass = false;
 };
 using SpectralBuffer = std::array<float, 2 * kSpectralFftSize>;
+
+struct SpectralFilterCurve
+{
+    std::array<float, kSpectralBins> gains {};
+    bool custom = false;
+
+    SpectralFilterCurve () noexcept { gains.fill (1.0f); }
+
+    bool valid () const noexcept
+    {
+        for (float g : gains)
+            if (! std::isfinite (g) || g < 0.0f || g > 1.0f) return false;
+        return true;
+    }
+
+    uint64_t contentHash () const noexcept
+    {
+        if (! custom) return 0;
+        uint64_t h = 14695981039346656037ull;
+        const auto* bytes = reinterpret_cast<const uint8_t*> (gains.data ());
+        for (size_t i = 0; i < gains.size () * sizeof (float); ++i)
+        {
+            h ^= bytes[i];
+            h *= 1099511628211ull;
+        }
+        return h == 0 ? 1 : h;
+    }
+
+    bool operator== (const SpectralFilterCurve& other) const noexcept
+    {
+        if (custom != other.custom) return false;
+        if (! custom) return true;
+        return gains == other.gains;
+    }
+
+    bool operator!= (const SpectralFilterCurve& other) const noexcept { return ! (*this == other); }
+};
+
+struct SpectralFilter
+{
+    float lowHz = 20.0f;
+    float highHz = 20000.0f;
+    float shiftSemitones = 0.0f;
+    bool postOrder = false;
+    bool bypass = false;
+    const SpectralFilterCurve* curve = nullptr;
+};
+
+inline float spectralFilterBinGain (int bin, double binHz, const SpectralFilter& filter) noexcept
+{
+    if (filter.bypass) return 1.0f;
+    if (bin < 0 || bin >= kSpectralBins || ! std::isfinite (binHz) || binHz <= 0.0) return 0.0f;
+    if (! std::isfinite (filter.lowHz) || ! std::isfinite (filter.highHz) || ! std::isfinite (filter.shiftSemitones))
+        return 0.0f;
+    if (filter.lowHz >= filter.highHz) return 0.0f;
+
+    const double lowHz = juce::jlimit (20.0, 20000.0, (double) filter.lowHz);
+    const double highHz = juce::jlimit (20.0, 20000.0, (double) filter.highHz);
+    if (lowHz >= highHz) return 0.0f;
+
+    const double shiftSt = juce::jlimit (-24.0, 24.0, (double) filter.shiftSemitones);
+    const double shiftRatio = std::exp2 (shiftSt / 12.0);
+    const double lowEff = lowHz * shiftRatio;
+    const double highEff = highHz * shiftRatio;
+    const double freq = (double) bin * binHz;
+    constexpr double kSlopeOctaves = 0.25;
+
+    double gain = 1.0;
+    if (! (lowHz <= 20.0001 && shiftSt <= 0.0))
+    {
+        if (freq <= 0.0)
+            gain = 0.0;
+        else
+        {
+            const double lowStop = lowEff * std::exp2 (-kSlopeOctaves);
+            if (freq <= lowStop)
+                gain = 0.0;
+            else if (freq < lowEff)
+            {
+                const double u = (std::log2 (freq / lowEff) + kSlopeOctaves) / kSlopeOctaves;
+                gain *= 0.5 * (1.0 - std::cos (juce::MathConstants<double>::pi * u));
+            }
+        }
+    }
+
+    if (! (highHz >= 19999.9 && shiftSt >= 0.0))
+    {
+        if (freq > highEff)
+        {
+            const double highStop = highEff * std::exp2 (kSlopeOctaves);
+            if (freq >= highStop || highEff <= 0.0)
+                gain = 0.0;
+            else
+            {
+                const double u = std::log2 (freq / highEff) / kSlopeOctaves;
+                gain *= 0.5 * (1.0 + std::cos (juce::MathConstants<double>::pi * u));
+            }
+        }
+    }
+
+    if (filter.curve != nullptr && filter.curve->custom)
+    {
+        const double sourceBin = juce::jlimit (0.0, (double) (kSpectralBins - 1), (double) bin / shiftRatio);
+        const int lo = juce::jlimit (0, kSpectralBins - 1, (int) std::floor (sourceBin));
+        const int hi = juce::jmin (kSpectralBins - 1, lo + 1);
+        const double frac = sourceBin - (double) lo;
+        const double g0 = std::isfinite (filter.curve->gains[(size_t) lo])
+                              ? juce::jlimit (0.0, 1.0, (double) filter.curve->gains[(size_t) lo])
+                              : 0.0;
+        const double g1 = std::isfinite (filter.curve->gains[(size_t) hi])
+                              ? juce::jlimit (0.0, 1.0, (double) filter.curve->gains[(size_t) hi])
+                              : 0.0;
+        gain *= g0 + frac * (g1 - g0);
+    }
+
+    return (float) juce::jlimit (0.0, 1.0, gain);
+}
+
+inline void applySpectralFilter (SpectralBuffer& bins, double binHz, const SpectralFilter& filter) noexcept
+{
+    if (filter.bypass) return;
+    const bool hasCustomCurve = filter.curve != nullptr && filter.curve->custom;
+    if (! hasCustomCurve && filter.lowHz <= 20.0f && filter.highHz >= 20000.0f
+        && std::isfinite (filter.shiftSemitones) && std::abs (filter.shiftSemitones) <= 1.0e-6f)
+        return;
+
+    const float gDc = spectralFilterBinGain (0, binHz, filter);
+    bins[0] *= gDc;
+    bins[1] = 0.0f;
+
+    for (int k = 1; k < kSpectralBins - 1; ++k)
+    {
+        const float g = spectralFilterBinGain (k, binHz, filter);
+        bins[2 * (size_t) k] *= g;
+        bins[2 * (size_t) k + 1] *= g;
+    }
+
+    const float gNyq = spectralFilterBinGain (kSpectralBins - 1, binHz, filter);
+    bins[2 * (size_t) (kSpectralBins - 1)] *= gNyq;
+    bins[2 * (size_t) (kSpectralBins - 1) + 1] = 0.0f;
+}
 // Complex bin translation includes the inter-hop phase advance of the frequency offset.
 inline void applySpectralStage (SpectralBuffer& bins, SpectralBuffer& scratch, const SpectralStage& stage,
                                 double binHz, double shiftPhase) noexcept
@@ -198,6 +339,8 @@ struct SpectralControls
     bool phaseLock = true, transientReset = false;
     std::array<SpectralStage, 2> stages {};
     bool reverseOrder = false;
+    SpectralFilter filter {};
+    float wet = 1.0f;
 };
 
 // One voice's resynthesis. Every hop it reads the analysis at a fractional frame, interpolating magnitudes and
@@ -213,7 +356,11 @@ public:
 
     void reset (const SpectralData* source, const SpectralControls& controls, double hostRate) noexcept
     {
-        data = source; finished = data == nullptr; accumulator = {}; hopPosition = 0; initialised = false;
+        data = source; finished = data == nullptr; accumulator = {}; dryAccumulator = {}; hopPosition = 0; initialised = false;
+        filterLowHz = std::isfinite (controls.filter.lowHz) ? juce::jlimit (20.0, 20000.0, (double) controls.filter.lowHz) : 20.0;
+        filterHighHz = std::isfinite (controls.filter.highHz) ? juce::jlimit (20.0, 20000.0, (double) controls.filter.highHz) : 20000.0;
+        filterShiftSt = std::isfinite (controls.filter.shiftSemitones) ? juce::jlimit (-24.0, 24.0, (double) controls.filter.shiftSemitones) : 0.0;
+        smoothedWet = std::isfinite (controls.wet) ? juce::jlimit (0.0f, 1.0f, controls.wet) : 1.0f;
         stageCurrent = stagePrevious = controls; stageTransition = 1; stagePhases = {};
         for (size_t k = 0; k < 2; ++k) { stageAmounts[k] = controls.stages[k].amount; stageWet[k] = controls.stages[k].amount == 0 ? 0 : 1; }
         if (finished) return;
@@ -242,7 +389,13 @@ public:
             if (! controls.freeze) framePosition += stepFor (controls);
         }
         const auto index = (size_t) hopPosition;
-        const std::pair<float, float> out { accumulator[0][index], accumulator[data->channels == 2 ? 1 : 0][index] };
+        const float targetWet = std::isfinite (controls.wet) ? juce::jlimit (0.0f, 1.0f, controls.wet) : 1.0f;
+        const float wetStep = (float) std::min (1.0, rateRatio / (data->rate * 0.01));
+        smoothedWet += juce::jlimit (-wetStep, wetStep, targetWet - smoothedWet);
+        const size_t rightCh = data->channels == 2 ? 1 : 0;
+        const float dryL = dryAccumulator[0][index], dryR = dryAccumulator[rightCh][index];
+        const float wetL = accumulator[0][index], wetR = accumulator[rightCh][index];
+        const std::pair<float, float> out { dryL + smoothedWet * (wetL - dryL), dryR + smoothedWet * (wetR - dryR) };
         if (++hopPosition == kSpectralHop) { shift (); hopPosition = 0; }
         return out;
     }
@@ -264,11 +417,17 @@ private:
     bool tailDrained () const noexcept
     {
         for (const auto& channel : accumulator) for (float v : channel) if (v != 0) return false;
+        for (const auto& channel : dryAccumulator) for (float v : channel) if (v != 0) return false;
         return true;
     }
     void shift () noexcept
     {
         for (auto& channel : accumulator)
+        {
+            std::copy (channel.begin () + kSpectralHop, channel.end (), channel.begin ());
+            std::fill (channel.end () - kSpectralHop, channel.end (), 0.0f);
+        }
+        for (auto& channel : dryAccumulator)
         {
             std::copy (channel.begin () + kSpectralHop, channel.end (), channel.begin ());
             std::fill (channel.end () - kSpectralHop, channel.end (), 0.0f);
@@ -412,6 +571,11 @@ private:
                 }
                 fft.performRealOnlyForwardTransform (out.data (), true);
             }
+            stageScratch = out;
+            stageScratch[1] = 0; stageScratch[2 * (kSpectralBins - 1) + 1] = 0;
+            fft.performRealOnlyInverseTransform (stageScratch.data ());
+            auto& dryAcc = dryAccumulator[(size_t) ch];
+            for (size_t n = 0; n < (size_t) kSpectralFftSize; ++n) dryAcc[n] += .5f * stageScratch[n] * spectralWindow[n];
             transformStages (out, controls, ch == 0);
             out[1] = 0; out[2 * (kSpectralBins - 1) + 1] = 0;
             fft.performRealOnlyInverseTransform (out.data ());
@@ -429,7 +593,8 @@ private:
             auto same = [] (const SpectralControls& a, const SpectralControls& b)
             {
                 return a.reverseOrder == b.reverseOrder && a.stages[0].type == b.stages[0].type && a.stages[1].type == b.stages[1].type
-                    && a.stages[0].bypass == b.stages[0].bypass && a.stages[1].bypass == b.stages[1].bypass;
+                    && a.stages[0].bypass == b.stages[0].bypass && a.stages[1].bypass == b.stages[1].bypass
+                    && a.filter.postOrder == b.filter.postOrder && a.filter.bypass == b.filter.bypass;
             };
             if (stageTransition >= 1 && ! same (controls, stageCurrent)) { stagePrevious = stageCurrent; stageCurrent = controls; stageTransition = 0; }
             stageTransition = std::min (1.0, stageTransition + step);
@@ -439,19 +604,53 @@ private:
                 stageAmounts[k] += juce::jlimit (-step, step, target-stageAmounts[k]);
                 stageWet[k] += juce::jlimit (-step, step, (target == 0 ? 0.0 : 1.0) - stageWet[k]);
                 stagePhases[k] = stageWet[k] == 0 ? 0 : principalArgument (stagePhases[k] + stageAmounts[k]*64*juce::MathConstants<double>::halfPi);
+                if (k == 1)
+                {
+                    if (std::isfinite (controls.filter.lowHz) && std::isfinite (controls.filter.highHz) && controls.filter.lowHz < controls.filter.highHz)
+                    {
+                        const double targetLow = juce::jlimit (20.0, 20000.0, (double) controls.filter.lowHz);
+                        const double targetHigh = juce::jlimit (20.0, 20000.0, (double) controls.filter.highHz);
+                        filterLowHz += (targetLow - filterLowHz) * step;
+                        filterHighHz += (targetHigh - filterHighHz) * step;
+                    }
+                    if (std::isfinite (controls.filter.shiftSemitones))
+                    {
+                        const double targetShift = juce::jlimit (-24.0, 24.0, (double) controls.filter.shiftSemitones);
+                        filterShiftSt += (targetShift - filterShiftSt) * step;
+                    }
+                }
             }
         }
         auto apply = [&] (SpectralBuffer& bins, const SpectralControls& c)
         {
+            const double binHz = data->rate / (rateRatio * kSpectralFftSize);
+            SpectralFilter activeFilter = c.filter;
+            if (! std::isfinite (c.filter.lowHz) || ! std::isfinite (c.filter.highHz) || c.filter.lowHz >= c.filter.highHz)
+            {
+                activeFilter.lowHz = c.filter.lowHz;
+                activeFilter.highHz = c.filter.highHz;
+            }
+            else
+            {
+                activeFilter.lowHz = (float) filterLowHz;
+                activeFilter.highHz = (float) filterHighHz;
+            }
+            activeFilter.shiftSemitones = std::isfinite (c.filter.shiftSemitones) ? (float) filterShiftSt : c.filter.shiftSemitones;
+            if (! c.filter.postOrder) applySpectralFilter (bins, binHz, activeFilter);
             for (int i = 0; i < 2; ++i)
             {
                 const size_t index = (size_t) (c.reverseOrder ? 1-i : i);
                 auto stage = c.stages[index]; stage.amount = (float) stageAmounts[index];
-                if (stageWet[index] == 0) continue;
+                if (stageWet[index] == 0)
+                {
+                    if (i == 1 && c.filter.postOrder) applySpectralFilter (bins, binHz, activeFilter);
+                    continue;
+                }
                 stageDry = bins;
                 applySpectralStage (bins, stageScratch, stage, data->rate / (rateRatio*kSpectralFftSize), stagePhases[index]);
                 if (stageWet[index] < 1)
                     for (size_t k = 0; k < bins.size (); ++k) bins[k] = stageDry[k] + (float) stageWet[index]*(bins[k]-stageDry[k]);
+                if (i == 1 && c.filter.postOrder) applySpectralFilter (bins, binHz, activeFilter);
             }
         };
         if (stageTransition < 1)
@@ -464,7 +663,10 @@ private:
     SpectralControls stageCurrent, stagePrevious;
     double stageTransition = 1;
     std::array<double, 2> stageAmounts {}, stagePhases {}, stageWet {};
+    double filterLowHz = 20.0, filterHighHz = 20000.0, filterShiftSt = 0.0;
+    float smoothedWet = 1.0f;
     SpectralBuffer stageScratch {}, stageOld {}, stageDry {};
+    std::array<std::array<float, kSpectralFftSize>, 2> dryAccumulator {};
     juce::dsp::FFT fft { kSpectralFftOrder };
     std::array<std::array<float, kSpectralFftSize>, 2> accumulator {};
     std::array<double, kSpectralBins> synthPhase {};

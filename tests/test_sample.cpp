@@ -2274,12 +2274,18 @@ void testGrainWindowEndpoints ()
     }
     rig.set ("sampleMode",kSampleModeSpectral); panel->visibilityChanged ();
     sampleControl (*panel,"STAGES")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
-    for (auto title : { "STAGE 1 AMT", "STAGE 2 AMT" })
+    for (auto title : { "STAGE 1 AMT", "STAGE 2 AMT", "SPEC LOW", "SPEC HIGH", "SPEC SHIFT", "SPEC MIX" })
     {
         auto* dial = dynamic_cast<bw::ui::Dial*> (sampleControl (*panel,title));
         assert (dial && dial->isVisible () && dial->getHeight () >= 80 && dial->onModulationDrop);
         dial->onModulationDrop (3,dial->parameterId ());
     }
+    assert (sampleControl (*panel, "FILTER POS") && sampleControl (*panel, "FILTER POS")->isVisible ());
+    for (int i = 0; i < panel->getNumChildComponents (); ++i)
+        if (auto* childA = panel->getChildComponent (i); childA->isVisible () && childA->getY () >= 390)
+            for (int j = i + 1; j < panel->getNumChildComponents (); ++j)
+                if (auto* childB = panel->getChildComponent (j); childB->isVisible () && childB->getY () >= 390)
+                    assert (! childA->getBounds ().intersects (childB->getBounds ()));
     snapshot ("STAGES");
     sampleControl (*panel,"PLAYBACK")->keyPressed (juce::KeyPress (juce::KeyPress::returnKey)); snapshot ("SPECTRAL");
     std::cout << "ok: ten windows, skew, PRNG, warp identity and deterministic dispersed stereo grains\n";

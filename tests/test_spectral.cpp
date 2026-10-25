@@ -226,9 +226,7 @@ void testTransientIdentity ()
             std::cout << "attack " << expected << " peak " << peak << " at " << peakAt << "\n";
             assert (peak > .1 && std::abs (peakAt-expected) <= 1);
         }
-
     }
-
     }
 }
 
@@ -616,9 +614,197 @@ void testPortableStateVersionAndModulation ()
     assert (std::abs (cents (hz, 880)) < 2);
     std::cout << "ok: portable spectral state and preset, version tag, editor invariance and matrix pitch\n";
 }
+
+void testSpectralFilterAndPhaseAlignedMix ()
+{
+    constexpr double binHz = kRate / bw::kSpectralFftSize;
+
+    // 1. Cutoff precision: spectralFilterHigh = 1000 Hz, spectralFilterLow = 20 Hz, shift = 0 st.
+    const auto harmonicSample = makeSample (24000, [] (int n)
+    {
+        return (float) (0.20 * std::sin (kTwoPi * 300.0 * n / kRate)
+                      + 0.20 * std::sin (kTwoPi * 600.0 * n / kRate)
+                      + 0.20 * std::sin (kTwoPi * 2500.0 * n / kRate)
+                      + 0.20 * std::sin (kTwoPi * 5000.0 * n / kRate));
+    });
+    const auto data = analyze (*harmonicSample);
+    auto cOpen = whole (*data);
+    bw::SpectralVoicePlayer player;
+    player.reset (data.get (), cOpen, kRate);
+    const auto openAudio = render (player, cOpen, 24000).first;
+
+    auto cLowpass = whole (*data);
+    cLowpass.filter.lowHz = 20.0f;
+    cLowpass.filter.highHz = 1000.0f;
+    cLowpass.filter.shiftSemitones = 0.0f;
+    player.reset (data.get (), cLowpass, kRate);
+    const auto lpAudio = render (player, cLowpass, 24000).first;
+
+    auto bandPowerDb = [] (const std::vector<float>& x, double hz)
+    {
+        double s = 0, c = 0;
+        constexpr size_t from = 4096, to = 20480;
+        for (size_t i = from; i < to; ++i)
+        {
+            s += x[i] * std::sin (kTwoPi * hz * (double) i / kRate);
+            c += x[i] * std::cos (kTwoPi * hz * (double) i / kRate);
+        }
+        const double mag = 2.0 * std::sqrt (s * s + c * c) / (double) (to - from);
+        return 20.0 * std::log10 (std::max (mag, 1.0e-12));
+    };
+    const double pass300Diff = std::abs (bandPowerDb (lpAudio, 300.0) - bandPowerDb (openAudio, 300.0));
+    const double pass600Diff = std::abs (bandPowerDb (lpAudio, 600.0) - bandPowerDb (openAudio, 600.0));
+    const double stop2500Atten = bandPowerDb (openAudio, 2500.0) - bandPowerDb (lpAudio, 2500.0);
+    const double stop5000Atten = bandPowerDb (openAudio, 5000.0) - bandPowerDb (lpAudio, 5000.0);
+    std::cout << "spectral filter LP 1kHz: passband diff " << pass300Diff << " / " << pass600Diff
+              << " dB, stopband atten " << stop2500Atten << " / " << stop5000Atten << " dB\n";
+    assert (pass300Diff <= 0.5 && pass600Diff <= 0.5);
+    assert (stop2500Atten >= 60.0 && stop5000Atten >= 60.0);
+
+    // 2. Inverted / equal cutoffs (lowHz >= highHz): deterministic total attenuation, zero NaN/Inf.
+    for (std::pair<float, float> inv : { std::pair { 5000.0f, 500.0f }, std::pair { 1000.0f, 1000.0f } })
+    {
+        bw::SpectralFilter f;
+        f.lowHz = inv.first; f.highHz = inv.second;
+        for (int k = 0; k < bw::kSpectralBins; ++k)
+        {
+            const float g = bw::spectralFilterBinGain (k, binHz, f);
+            assert (std::isfinite (g) && g == 0.0f);
+        }
+        auto cInv = whole (*data);
+        cInv.filter = f;
+        player.reset (data.get (), cInv, kRate);
+        const auto invAudio = render (player, cInv, 12000).first;
+        assert (rms (invAudio, 0, invAudio.size ()) < 1.0e-7);
+    }
+
+    // 3. Filter shift (+12 st doubles effective cutoff from 1000 Hz to 2000 Hz; custom curve shifts safely).
+    bw::SpectralFilter fShiftedUp { 20.0f, 1000.0f, 12.0f, false, false, nullptr };
+    bw::SpectralFilter fRef2k { 40.0f, 2000.0f, 0.0f, false, false, nullptr };
+    for (int k = 1; k < bw::kSpectralBins - 1; ++k)
+    {
+        const float gShifted = bw::spectralFilterBinGain (k, binHz, fShiftedUp);
+        const float gRef = bw::spectralFilterBinGain (k, binHz, fRef2k);
+        assert (std::abs (gShifted - gRef) < 1.0e-5f);
+    }
+    bw::SpectralFilterCurve customCurve;
+    customCurve.custom = true;
+    for (int k = 0; k < bw::kSpectralBins; ++k)
+        customCurve.gains[(size_t) k] = (k >= 20 && k <= 60) ? 1.0f : 0.1f;
+    for (float shiftSt : { -24.0f, -12.0f, 0.0f, 12.0f, 24.0f })
+    {
+        bw::SpectralFilter fc { 20.0f, 20000.0f, shiftSt, false, false, &customCurve };
+        for (int k = 0; k < bw::kSpectralBins; ++k)
+        {
+            const float g = bw::spectralFilterBinGain (k, binHz, fc);
+            assert (std::isfinite (g) && g >= 0.0f && g <= 1.0f);
+        }
+    }
+
+    // 4. Pre vs Post stage ordering with an active spectral stage (binShift +32 bins = +750 Hz, cutoff = 2000 Hz).
+    const auto tone1500 = makeSample (24000, sine (1500.0, 0.3));
+    const auto data1500 = analyze (*tone1500);
+    auto cPre = whole (*data1500);
+    cPre.stages[0] = { bw::SpectralStageType::binShift, 0.75f, false };
+    cPre.filter.lowHz = 20.0f; cPre.filter.highHz = 2000.0f; cPre.filter.postOrder = false;
+    auto cPost = cPre;
+    cPost.filter.postOrder = true;
+    player.reset (data1500.get (), cPre, kRate);
+    const auto preOut = render (player, cPre, 24000).first;
+    player.reset (data1500.get (), cPost, kRate);
+    const auto postOut = render (player, cPost, 24000).first;
+    const double preHighDb = dbfs (rms (preOut, 4096, 20480));
+    const double postHighDb = dbfs (rms (postOut, 4096, 20480));
+    std::cout << "spectral filter Pre vs Post (>2kHz shifted band): Pre " << preHighDb << " dBFS, Post " << postHighDb << " dBFS\n";
+    assert (preHighDb - postHighDb > 18.0);
+
+    // Mid-note Pre/Post toggle and cutoff/mix sweeps remain click-free.
+    auto cToggle = cPre; cToggle.loop = true;
+    player.reset (data1500.get (), cToggle, kRate);
+    float prevSample = 0.0f, maxStep = 0.0f;
+    for (int n = 0; n < 16000; ++n)
+    {
+        if (n == 4000) cToggle.filter.postOrder = true;
+        if (n == 8000) cToggle.filter.postOrder = false;
+        if (n == 12000) cToggle.wet = 0.25f;
+        const float s = player.process (cToggle).first;
+        assert (std::isfinite (s));
+        if (n > 0) maxStep = std::max (maxStep, std::abs (s - prevSample));
+        prevSample = s;
+    }
+    assert (maxStep < 0.25f);
+
+    // 5. Phase-aligned Wet/Dry mix: 0.0 == dry (<-95 dBFS), 1.0 == wet (<-95 dBFS), 0.5 with neutral stages has zero comb filtering (<0.1 dB ripple).
+    auto cWetOnly = cPre; cWetOnly.wet = 1.0f;
+    auto cDryOnly = cPre; cDryOnly.wet = 0.0f;
+    auto cRefDry = whole (*data1500);
+    player.reset (data1500.get (), cWetOnly, kRate);
+    const auto wetSignal = render (player, cWetOnly, 24000).first;
+    player.reset (data1500.get (), cDryOnly, kRate);
+    const auto drySignal = render (player, cDryOnly, 24000).first;
+    player.reset (data1500.get (), cRefDry, kRate);
+    const auto refDrySignal = render (player, cRefDry, 24000).first;
+    assert (dbfs (errorRms (drySignal, refDrySignal)) < -95.0);
+    assert (dbfs (errorRms (wetSignal, preOut)) < -95.0);
+
+    auto cHalfNeutral = whole (*data);
+    cHalfNeutral.wet = 0.5f;
+    player.reset (data.get (), cHalfNeutral, kRate);
+    const auto halfNeutralAudio = render (player, cHalfNeutral, 24000).first;
+    assert (dbfs (errorRms (halfNeutralAudio, openAudio)) < -95.0);
+    for (double testHz : { 300.0, 600.0, 2500.0, 5000.0 })
+        assert (std::abs (bandPowerDb (halfNeutralAudio, testHz) - bandPowerDb (openAudio, testHz)) < 0.05);
+
+    // 6. Processor integration: custom curve state round-trip, corrupted XML rejection, and modulation destinations without heap allocs.
+    {
+        const auto wavFile = writeWav ("spectral-filter-proc", *harmonicSample);
+        Rig rig; sampleOnly (rig); rig.set ("sampleMode", kSampleModeSpectral);
+        assert (rig.processor.loadSample (wavFile).isEmpty ());
+        waitReady (rig.processor);
+        rig.set ("spectralFilterLow", 120.0f);
+        rig.set ("spectralFilterHigh", 4200.0f);
+        rig.set ("spectralFilterShift", -3.0f);
+        rig.set ("spectralFilterOrder", 1.0f);
+        rig.set ("spectralMix", 0.65f);
+        assert (rig.processor.setSpectralFilterCurve (customCurve));
+        assert (rig.processor.getSpectralFilterCurve () == customCurve);
+
+        juce::MemoryBlock savedState;
+        rig.processor.getStateInformation (savedState);
+        Rig restored;
+        restored.processor.setStateInformation (savedState.getData (), (int) savedState.getSize ());
+        waitReady (restored.processor);
+        assert (restored.processor.getSpectralFilterCurve () == customCurve);
+        assert (std::abs (restored.processor.apvts.getRawParameterValue ("spectralFilterHigh")->load () - 4200.0f) < 1.0f);
+        assert (std::abs (restored.processor.apvts.getRawParameterValue ("spectralMix")->load () - 0.65f) < 1.0e-4f);
+
+        // Corrupted SPECTRAL_FILTER XML (wrong bins or invalid base64) is rejected without overwriting existing curve.
+        auto badXml = juce::AudioProcessor::getXmlFromBinary (savedState.getData (), (int) savedState.getSize ());
+        assert (badXml != nullptr);
+        if (auto* filtEl = badXml->getChildByName ("SPECTRAL_FILTER"))
+            filtEl->setAttribute ("bins", 999);
+        juce::MemoryBlock badBlock;
+        juce::AudioProcessor::copyXmlToBinary (*badXml, badBlock);
+        restored.processor.clearSpectralFilterCurve ();
+        assert (! restored.processor.getSpectralFilterCurve ().custom);
+        restored.processor.setStateInformation (badBlock.getData (), (int) badBlock.getSize ());
+        assert (! restored.processor.getSpectralFilterCurve ().custom);
+
+        // Matrix modulation of Spectral Low, High, Shift and Mix runs with zero heap allocations in processBlock.
+        rig.set ("mod1Enabled", 1); rig.set ("mod1Source", 1); rig.set ("mod1Destination", bw::kSpectralFilterLowDestination); rig.set ("mod1Amount", 0.25f);
+        rig.set ("mod2Enabled", 1); rig.set ("mod2Source", 2); rig.set ("mod2Destination", bw::kSpectralFilterHighDestination); rig.set ("mod2Amount", -0.35f);
+        rig.set ("mod3Enabled", 1); rig.set ("mod3Source", 3); rig.set ("mod3Destination", bw::kSpectralFilterShiftDestination); rig.set ("mod3Amount", 0.5f);
+        rig.set ("mod4Enabled", 1); rig.set ("mod4Source", 4); rig.set ("mod4Destination", bw::kSpectralMixDestination); rig.set ("mod4Amount", -0.5f);
+        rig.set ("macro1", 0.8f); rig.set ("macro2", 0.6f);
+        rig.send (on (60));
+        const auto modRendered = renderChecked (rig.processor, rig.pending, 12000, 64);
+        assert (rms (modRendered, 2048, 12000) > 1.0e-4);
+    }
+    std::cout << "ok: spectral filter cutoffs, inverted policy, shift, Pre/Post ordering, phase-aligned wet/dry mix and custom curve persistence\n";
+}
 } // namespace
 
-int main (int argc, char**)
+int main (int argc, char** argv)
 {
 #ifdef _WIN32
     // Failed asserts print and exit instead of opening a modal dialog.
@@ -627,7 +813,8 @@ int main (int argc, char**)
 #endif
     std::cout << std::unitbuf;
     juce::ScopedJuceInitialiser_GUI init;
-    if (argc > 1) { testTransientIdentity (); testSpectralStages (); testPhaseLockFixtures (); testTransientRatesAndCloseAttacks (); return 0; }
+    if (argc > 1 && juce::String (argv[1]) == "--filter") { testSpectralFilterAndPhaseAlignedMix (); folder.deleteRecursively (); return 0; }
+    if (argc > 1) { testTransientIdentity (); testSpectralStages (); testPhaseLockFixtures (); testTransientRatesAndCloseAttacks (); testSpectralFilterAndPhaseAlignedMix (); folder.deleteRecursively (); return 0; }
     testIdentityReconstruction ();
     testCancellation ();
     testTransientIdentity ();
@@ -639,6 +826,7 @@ int main (int argc, char**)
     testProcessorIdentityModesAndAllocation ();
     testBudgetRefusalKeepsPreviousAnalysis ();
     testPortableStateVersionAndModulation ();
+    testSpectralFilterAndPhaseAlignedMix ();
     folder.deleteRecursively ();
     std::cout << "ok\n";
     return 0;

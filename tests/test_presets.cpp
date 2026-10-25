@@ -81,11 +81,12 @@ bool checkPerformance (int index, double sampleRate, float velocity, float macro
                 peak = jmax (peak, std::abs (x));
             }
     }
-    // Closed tone macros and soft velocities can intentionally be very quiet.
-    if (peak >= .98 || energy <= 1.0e-10)
+    // Closed tone macros and soft velocities can intentionally be very quiet. Sample presets keep -1 dBFS headroom.
+    const double limit = bw::factoryPresets()[(size_t) index].sampleBank != nullptr ? .891 : .98;
+    if (peak >= limit || energy <= 1.0e-10)
         std::printf ("PERFORMANCE FAIL: %s rate=%.0f velocity=%.2f macros=%.1f peak=%.5f energy=%.8g\n",
                      bw::factoryPresets()[(size_t) index].name, sampleRate, velocity, macro, peak, energy);
-    return peak < .98 && energy > 1.0e-10;
+    return peak < limit && energy > 1.0e-10;
 }
 
 void writeWav (const File& file, const AudioBuffer<float>& audio)
@@ -101,6 +102,206 @@ void writeWav (const File& file, const AudioBuffer<float>& audio)
     while (length > (int) rate * 5 && audio.getMagnitude (length - block, block) < 1.0e-4f) length -= block;
     assert (writer->writeFromAudioSampleBuffer (audio, 0, length));
 }
+
+std::vector<float> renderNote (WaveProcessor& p, int midiNote, uint8 velocity, int frames = 12000)
+{
+    std::vector<float> out ((size_t) frames, 0.0f);
+    AudioBuffer<float> buffer (2, block);
+    for (int start = 0; start < frames; start += block)
+    {
+        const int chunk = jmin (block, frames - start);
+        AudioBuffer<float> view (buffer.getArrayOfWritePointers(), 2, 0, chunk);
+        MidiBuffer midi;
+        if (start == 0)
+            midi.addEvent (MidiMessage::noteOn (1, midiNote, velocity), 0);
+        if (start <= frames / 2 && start + chunk > frames / 2)
+            midi.addEvent (MidiMessage::noteOff (1, midiNote), frames / 2 - start);
+        p.processBlock (view, midi);
+        for (int i = 0; i < chunk; ++i)
+        {
+            const float x = 0.5f * (view.getSample (0, i) + view.getSample (1, i));
+            assert (std::isfinite (x));
+            out[(size_t) (start + i)] = x;
+        }
+    }
+    return out;
+}
+
+double diffRms (const std::vector<float>& a, const std::vector<float>& b)
+{
+    assert (a.size() == b.size() && ! a.empty());
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        const double d = (double) a[i] - (double) b[i];
+        sum += d * d;
+    }
+    return std::sqrt (sum / (double) a.size());
+}
+
+void checkSampleMultisamplePresets()
+{
+    const auto& presets = bw::factoryPresets();
+    auto findPreset = [&] (const char* name) -> int
+    {
+        for (int i = 0; i < (int) presets.size(); ++i)
+            if (String (presets[(size_t) i].name) == name)
+                return i;
+        return -1;
+    };
+
+    const int velvetIdx = findPreset ("Atelier Sample - Velvet Keys");
+    const int pluckIdx  = findPreset ("Atelier Sample - Round Robin Pluck");
+    const int sliceIdx  = findPreset ("Atelier Sample - Sliced Groove");
+    assert (velvetIdx >= 0 && pluckIdx >= 0 && sliceIdx >= 0);
+
+    // 1. Portable state & .bwpreset round-trip, asset memory budget, and macro responsiveness for all 3 Sample presets.
+    const File tempDir = File::getSpecialLocation (File::tempDirectory).getChildFile ("borato-wave-sample-presets");
+    tempDir.createDirectory();
+    for (int idx : { velvetIdx, pluckIdx, sliceIdx })
+    {
+        const auto& preset = presets[(size_t) idx];
+        assert (preset.sampleBank != nullptr && preset.sampleBank->valid());
+
+        WaveProcessor p;
+        p.loadFactoryPreset (idx);
+        assert (p.matchingFactoryPreset() == idx);
+        assert (p.sampleBank() != nullptr && p.sampleBank()->zones.size() == preset.sampleBank->zones.size());
+        assert (p.sampleBank()->zones[0].sample->contentHash == preset.sampleBank->zones[0].sample->contentHash);
+        assert (p.assetMemoryBytes() < 16u * 1024u * 1024u);
+
+        // Every zone sounds at its key and velocity boundaries.
+        p.prepareToPlay (rate, block);
+        for (const auto& z : preset.sampleBank->zones)
+            for (int key : { z.lowKey, z.highKey })
+                for (int vel : { z.lowVel, z.highVel })
+                {
+                    const auto out = renderNote (p, key, (uint8) vel, 2048);
+                    double e = 0;
+                    for (float x : out) e += x * x;
+                    if (e <= 1.0e-8) std::printf ("ZONE FAIL: %s key=%d vel=%d\n", preset.name, key, vel);
+                    assert (e > 1.0e-8);
+                }
+
+        MemoryBlock state;
+        p.getStateInformation (state);
+        WaveProcessor restored;
+        restored.setStateInformation (state.getData(), (int) state.getSize());
+        assert (restored.waitForSampleLoad (10000));
+        assert (restored.matchingFactoryPreset() == idx);
+        assert (restored.sampleBank() != nullptr && restored.sampleBank()->zones[0].sample->contentHash == preset.sampleBank->zones[0].sample->contentHash);
+
+        const File presetFile = tempDir.getChildFile (File::createLegalFileName (String (preset.name) + ".bwpreset"));
+        assert (p.savePreset (presetFile));
+        WaveProcessor fromFile;
+        assert (fromFile.loadPreset (presetFile));
+        assert (fromFile.waitForSampleLoad (10000));
+        assert (fromFile.matchingFactoryPreset() == idx);
+        assert (fromFile.sampleBank() != nullptr && fromFile.sampleBank()->zones[0].sample->contentHash == preset.sampleBank->zones[0].sample->contentHash);
+
+        for (int m = 1; m <= 4; ++m)
+        {
+            WaveProcessor p0, p1;
+            p0.loadFactoryPreset (idx);
+            p1.loadFactoryPreset (idx);
+            p0.apvts.getParameter ("macro" + String (m))->setValueNotifyingHost (0.0f);
+            p1.apvts.getParameter ("macro" + String (m))->setValueNotifyingHost (1.0f);
+            p0.prepareToPlay (rate, block);
+            p1.prepareToPlay (rate, block);
+            const auto out0 = renderNote (p0, 60, (uint8) 100, 16000);
+            const auto out1 = renderNote (p1, 60, (uint8) 100, 16000);
+            const double delta = diffRms (out0, out1);
+            if (db (delta) <= -40.0)
+                std::printf ("MACRO FAIL: %s macro%d diffRms=%.4f dB\n", preset.name, m, db (delta));
+            assert (db (delta) > -40.0);
+        }
+    }
+    tempDir.deleteRecursively();
+
+    // 2. Velocity layer differentiation on "Atelier Sample - Velvet Keys".
+    {
+        const auto& bank = *presets[(size_t) velvetIdx].sampleBank;
+        assert (bank.zones.size() >= 2);
+        bool hasSoft = false, hasHard = false;
+        for (const auto& z : bank.zones)
+        {
+            hasSoft |= (z.lowVel == 1 && z.highVel < 127 && z.crossfadeVel > 0 && z.crossfadeLaw == bw::VelocityCrossfadeLaw::equalPower);
+            hasHard |= (z.lowVel > 1 && z.highVel == 127 && z.crossfadeVel > 0 && z.crossfadeLaw == bw::VelocityCrossfadeLaw::equalPower);
+        }
+        assert (hasSoft && hasHard);
+
+        auto renderVel = [&] (uint8 vel)
+        {
+            WaveProcessor p;
+            p.loadFactoryPreset (velvetIdx);
+            p.prepareToPlay (rate, block);
+            return renderNote (p, 60, vel, 12000);
+        };
+        const auto v20  = renderVel ((uint8) 20);
+        const auto v70  = renderVel ((uint8) 70);
+        const auto v120 = renderVel ((uint8) 120);
+        assert (diffRms (v20, v70) > 1.0e-3);
+        assert (diffRms (v70, v120) > 1.0e-3);
+        assert (diffRms (v20, v120) > 1.0e-3);
+    }
+
+    // 3. Round-robin 4-variant cycling on "Atelier Sample - Round Robin Pluck".
+    {
+        const auto& bank = *presets[(size_t) pluckIdx].sampleBank;
+        assert (bank.zones.size() >= 3);
+        for (const auto& z : bank.zones)
+        {
+            assert (z.numVariants == 4);
+            for (int v = 0; v < 4; ++v)
+                assert (z.sampleForVariant (v) != nullptr);
+        }
+
+        WaveProcessor p;
+        p.loadFactoryPreset (pluckIdx);
+        // Disable free-running chorus / delay / reverb for pure round-robin cycle comparison.
+        p.apvts.getParameter ("chorusOn")->setValueNotifyingHost (0.0f);
+        p.apvts.getParameter ("delayOn")->setValueNotifyingHost (0.0f);
+        p.apvts.getParameter ("reverbOn")->setValueNotifyingHost (0.0f);
+        p.prepareToPlay (rate, block);
+        std::array<std::vector<float>, 5> hits;
+        for (size_t h = 0; h < 5; ++h)
+        {
+            hits[h] = renderNote (p, 60, (uint8) 100, 12000);
+            // Let voice release completely before next noteOn.
+            AudioBuffer<float> silent (2, block);
+            for (int i = 0; i < 40; ++i)
+            {
+                MidiBuffer empty;
+                p.processBlock (silent, empty);
+            }
+        }
+        for (size_t i = 0; i < 4; ++i)
+            for (size_t j = i + 1; j < 4; ++j)
+                assert (diffRms (hits[i], hits[j]) > 1.0e-3);
+        assert (db (diffRms (hits[0], hits[4])) < -80.0);
+    }
+
+    // 4. Manual slice differentiation on "Atelier Sample - Sliced Groove".
+    {
+        const auto& bank = *presets[(size_t) sliceIdx].sampleBank;
+        assert (bank.sliced && bank.slices.markers.size() >= 8 && bank.zones.size() >= 8);
+        for (const auto& z : bank.zones)
+            assert (z.lowKey == z.highKey && z.lowKey == z.rootKey);
+
+        std::array<std::vector<float>, 4> slices;
+        for (int s = 0; s < 4; ++s)
+        {
+            WaveProcessor p;
+            p.loadFactoryPreset (sliceIdx);
+            p.prepareToPlay (rate, block);
+            slices[(size_t) s] = renderNote (p, 60 + s, (uint8) 100, 8000);
+        }
+        for (size_t i = 0; i < 4; ++i)
+            for (size_t j = i + 1; j < 4; ++j)
+                assert (diffRms (slices[i], slices[j]) > 1.0e-3);
+    }
+    std::printf ("ok: 3 Sample/Multisample factory presets (velocity layers, 4x round-robin, manual slices, macros and portable state)\n");
+}
 }
 
 int main (int argc, char** argv)
@@ -110,6 +311,11 @@ int main (int argc, char** argv)
     _set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
    #endif
     ScopedJuceInitialiser_GUI juce;
+    if (argc > 1 && String (argv[1]) == "--sample")
+    {
+        checkSampleMultisamplePresets();
+        return 0;
+    }
     const File out = argc > 1 ? File (String (argv[1])) : File();
     if (out != File()) out.createDirectory();
     const auto& presets = bw::factoryPresets();
@@ -174,6 +380,7 @@ int main (int argc, char** argv)
         std::fflush (stdout);
     }
     assert (ok);
+    checkSampleMultisamplePresets();
 
     // Env 2 closes the filter during a Rubber Floor note: brightness falls after the attack.
     int rubber = -1;

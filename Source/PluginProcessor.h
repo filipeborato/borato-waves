@@ -37,7 +37,8 @@ struct SynthParams
                          *distribution, *batch, *jumpStart, *keyTrack, *loop, *jitter, *pan, *window, *windowAmount, *windowSkew, *directionSpread, *pitchSpread, *lengthSpread, *gainSpread, *amountSpread, *skewSpread, *warpSpread, *warp1Type, *warp1Amount, *warp2Type, *warp2Amount; } grain {};
     std::atomic<bool>* spectralCompare = nullptr;
     bw::GrainClock clock; // tempo and ppq at the start of the block; transport true while the host plays
-    struct SpectralParams { std::atomic<float> *position, *freeze, *speed, *pitch, *phaseLock, *transients, *stage1Type, *stage1Amount, *stage1Bypass, *stage2Type, *stage2Amount, *stage2Bypass, *order; } spectralParams {};
+    struct SpectralParams { std::atomic<float> *position, *freeze, *speed, *pitch, *phaseLock, *transients, *stage1Type, *stage1Amount, *stage1Bypass, *stage2Type, *stage2Amount, *stage2Bypass, *order, *filterLow, *filterHigh, *filterShift, *filterOrder, *mix; } spectralParams {};
+    const bw::SpectralFilterCurve* spectralFilterCurve = nullptr;
     struct RegionParams { std::atomic<float> *loopMode, *direction, *loopStart, *loopEnd, *crossfade, *link, *fadeIn, *fadeOut; } region {};
     const bw::SpectralData* spectral = nullptr;
     std::atomic<float>* spectralCursor = nullptr; // display voice's read position, 0..1 of the sample, or -1
@@ -303,6 +304,10 @@ public:
     std::shared_ptr<const bw::SpectralData> spectralData () const;
     std::atomic<bool> spectralCompareBaseline { false };
     std::atomic<float> spectralCursor { -1 };
+    bw::SpectralFilterCurve getSpectralFilterCurve () const;
+    bool setSpectralFilterCurve (const bw::SpectralFilterCurve& curve, const juce::String& stepName = "SPECTRAL FILTER CURVE");
+    void clearSpectralFilterCurve (const juce::String& stepName = {});
+    std::atomic<unsigned> spectralFilterRevision { 0 };
 
     // Aggregate asset memory budget (256 MiB across active assets, retired assets awaiting voices, and undo history).
     // Policy: loading a new asset first collects settled retired items, then evicts oldest undo steps if needed;
@@ -357,6 +362,7 @@ private:
         std::shared_ptr<const bw::Sample> sample;
         std::shared_ptr<const bw::SampleBank> sampleBank;
         juce::File samplePath;
+        bw::SpectralFilterCurve spectralFilterCurve;
     };
     struct Step { Snapshot before, after; std::vector<bool> parameters; juce::String name; };
     Snapshot capture () const;
@@ -392,6 +398,8 @@ private:
     bw::PublishSlot<bw::Sample> sampleSlot;
     bw::PublishSlot<bw::SampleBank> sampleBankSlot;
     bw::PublishSlot<bw::SpectralData> spectralSlot;
+    std::array<bw::SpectralFilterCurve, 2> spectralFilterCurveSlots {};
+    std::atomic<int> activeSpectralFilterCurveSlot { 0 };
     // Identity (content hash, frames) of the sample being analysed, or that was refused; 0 frames when none.
     struct SpectralKey { uint64_t hash = 0; int frames = 0; bool operator== (const SpectralKey&) const = default; };
     SpectralKey spectralPendingKey, spectralRefusedKey;

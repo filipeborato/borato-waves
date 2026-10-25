@@ -7,7 +7,8 @@ namespace
 // Matrix source and destination indices (see Modulation.h).
 enum Source { lfo1 = 1, lfo2, m1, m2, m3, m4, env1, vel, env2 };
 enum Destination { aPos, aLevel, aPan, aPitch, aDetune, aSpread, bPos, bLevel, bPan, bPitch, bDetune, bSpread,
-                   cutoff, reso, subLevel, noiseLevel, cutoff2, reso2, fxDrive, fxDelay, fxReverb, aWarp, bWarp, fm };
+                   cutoff, reso, subLevel, noiseLevel, cutoff2, reso2, fxDrive, fxDelay, fxReverb, aWarp, bWarp, fm,
+                   sampleLevel, samplePan, samplePitch };
 // Table indices in WavetableBank.
 enum Table { basic, sineTri, saw, odd, pulse, formant, bells, bend };
 // Division indices in divisionNames(): straight, dotted, triplet.
@@ -96,6 +97,162 @@ FactoryPreset atelier (const char* name, const char* category, const char* tags,
     p.tables[0] = atelierTable (table);
     static constexpr const char* names[] { "Atelier Reed", "Atelier Prism", "Atelier Tine", "Atelier Silk" };
     p.tableNames[0] = names[table];
+    return p;
+}
+
+std::shared_ptr<const SampleBank> atelierSampleBank (int kind)
+{
+    static const auto banks = []
+    {
+        std::array<std::shared_ptr<const SampleBank>, 3> result {};
+        constexpr double sampleRate = 24000.0;
+        constexpr double twoPi = juce::MathConstants<double>::twoPi;
+
+        auto makeWave = [&] (int frames, const std::function<float (int, double)>& gen)
+        {
+            auto s = std::make_shared<Sample> ();
+            s->rate = sampleRate;
+            s->data.resize ((size_t) frames);
+            for (int n = 0; n < frames; ++n)
+                s->data[(size_t) n] = juce::jlimit (-0.95f, 0.95f, gen (n, (double) n / sampleRate));
+            s->updateHash ();
+            return s;
+        };
+
+        // Bank 0: Velvet Keys — 3 key zones x 2 velocity layers with equal-power crossfade.
+        {
+            auto bank = std::make_shared<SampleBank> ();
+            struct KeyRange { int low, high, root; };
+            static constexpr std::array<KeyRange, 3> ranges { { { 0, 47, 36 }, { 48, 63, 55 }, { 64, 127, 72 } } };
+            for (const auto& kr : ranges)
+            {
+                const double f0 = juce::MidiMessage::getMidiNoteInHertz (kr.root);
+                const int frames = 9600;
+                SampleZone soft;
+                soft.lowKey = kr.low; soft.highKey = kr.high; soft.rootKey = kr.root;
+                soft.lowVel = 1; soft.highVel = 68; soft.crossfadeVel = 16;
+                soft.crossfadeLaw = VelocityCrossfadeLaw::equalPower;
+                soft.loop = true; soft.loopStart = 0.25f; soft.loopEnd = 0.85f;
+                soft.sample = makeWave (frames, [f0] (int, double t)
+                {
+                    const double env = 0.55 + 0.35 * std::exp (-t * 7.0);
+                    const double sig = 0.72 * std::sin (twoPi * f0 * t)
+                                     + 0.20 * std::sin (twoPi * 2.0 * f0 * t)
+                                     + 0.08 * std::sin (twoPi * 3.0 * f0 * t);
+                    return (float) (0.72 * env * sig);
+                });
+                soft.variants[0].sample = soft.sample;
+                bank->zones.push_back (std::move (soft));
+
+                SampleZone bright;
+                bright.lowKey = kr.low; bright.highKey = kr.high; bright.rootKey = kr.root;
+                bright.lowVel = 69; bright.highVel = 127; bright.crossfadeVel = 16;
+                bright.crossfadeLaw = VelocityCrossfadeLaw::equalPower;
+                bright.loop = true; bright.loopStart = 0.25f; bright.loopEnd = 0.85f;
+                bright.sample = makeWave (frames, [f0] (int, double t)
+                {
+                    const double body = 0.50 + 0.40 * std::exp (-t * 6.0);
+                    const double bell = std::exp (-t * 18.0);
+                    const double sig = 0.42 * std::sin (twoPi * f0 * t)
+                                     + 0.28 * std::sin (twoPi * 2.0 * f0 * t + 0.3)
+                                     + 0.22 * std::sin (twoPi * 3.0 * f0 * t)
+                                     + 0.18 * std::sin (twoPi * 4.0 * f0 * t + 0.7)
+                                     + (0.24 * bell + 0.10) * std::sin (twoPi * 6.0 * f0 * t);
+                    return (float) (0.78 * body * sig);
+                });
+                bright.variants[0].sample = bright.sample;
+                bank->zones.push_back (std::move (bright));
+            }
+            jassert (bank->valid ());
+            result[0] = std::move (bank);
+        }
+
+        // Bank 1: Round Robin Pluck — 3 key zones, each with 4 distinct round-robin variants.
+        {
+            auto bank = std::make_shared<SampleBank> ();
+            struct KeyRange { int low, high, root; };
+            static constexpr std::array<KeyRange, 3> ranges { { { 0, 47, 36 }, { 48, 63, 55 }, { 64, 127, 72 } } };
+            for (const auto& kr : ranges)
+            {
+                const double f0 = juce::MidiMessage::getMidiNoteInHertz (kr.root);
+                const int frames = 9600;
+                SampleZone zone;
+                zone.lowKey = kr.low; zone.highKey = kr.high; zone.rootKey = kr.root;
+                zone.lowVel = 1; zone.highVel = 127; zone.numVariants = 4;
+                zone.loop = true; zone.loopStart = 0.30f; zone.loopEnd = 0.90f;
+                for (int v = 0; v < 4; ++v)
+                {
+                    auto varSample = makeWave (frames, [f0, v] (int, double t)
+                    {
+                        const double attack = 1.0 - std::exp (-t * (900.0 + 250.0 * v));
+                        const double sustain = 0.42 + 0.48 * std::exp (-t * (6.5 + 1.2 * v));
+                        double sig = 0.0;
+                        if (v == 0)
+                            sig = 0.56 * std::sin (twoPi * f0 * t) + 0.24 * std::sin (twoPi * 2.0 * f0 * t) + 0.18 * std::sin (twoPi * 4.0 * f0 * t) + 0.14 * std::sin (twoPi * 6.0 * f0 * t);
+                        else if (v == 1)
+                            sig = 0.58 * std::sin (twoPi * f0 * t + 0.4) + 0.34 * std::sin (twoPi * 3.0 * f0 * t) + 0.18 * std::sin (twoPi * 5.0 * f0 * t);
+                        else if (v == 2)
+                            sig = 0.50 * std::sin (twoPi * f0 * t + 0.9) + 0.32 * std::sin (twoPi * 2.0 * f0 * t) + 0.26 * std::sin (twoPi * 4.0 * f0 * t);
+                        else
+                            sig = 0.54 * std::sin (twoPi * f0 * t + 1.4) + 0.28 * std::sin (twoPi * 2.0 * f0 * t) + 0.22 * std::sin (twoPi * 3.0 * f0 * t) + 0.16 * std::sin (twoPi * 6.0 * f0 * t);
+                        return (float) (0.78 * attack * sustain * sig);
+                    });
+                    zone.variants[(size_t) v].sample = varSample;
+                    if (v == 0) zone.sample = varSample;
+                }
+                bank->zones.push_back (std::move (zone));
+            }
+            jassert (bank->valid ());
+            result[1] = std::move (bank);
+        }
+
+        // Bank 2: Sliced Groove — 32 slices starting at root 36 (C2..G4), built via buildSliceBank.
+        {
+            constexpr int numSlices = 32;
+            constexpr int sliceFrames = 1200;
+            constexpr int totalFrames = numSlices * sliceFrames;
+            std::vector<int> markers;
+            markers.reserve (numSlices);
+            for (int s = 0; s < numSlices; ++s) markers.push_back (s * sliceFrames);
+
+            auto groove = makeWave (totalFrames, [] (int n, double)
+            {
+                const int sliceIdx = juce::jlimit (0, numSlices - 1, n / sliceFrames);
+                const int local = n % sliceFrames;
+                const double lt = (double) local / sampleRate;
+                static constexpr std::array<double, 8> ratios { 1.0, 1.25, 1.3333333, 1.5, 1.6666667, 2.0, 0.75, 1.125 };
+                const double baseHz = 130.81278265 * ratios[(size_t) (sliceIdx % 8)] * (1.0 + 0.03 * (sliceIdx / 8));
+                const double env = (1.0 - std::exp (-lt * 1200.0)) * (0.48 + 0.45 * std::exp (-lt * 18.0));
+                const double transient = std::exp (-lt * 95.0) * std::sin (twoPi * (baseHz * (3.0 + (sliceIdx % 4))) * lt);
+                const double tone = 0.62 * std::sin (twoPi * baseHz * lt + 0.25 * sliceIdx)
+                                  + 0.28 * std::sin (twoPi * 2.0 * baseHz * lt)
+                                  + 0.16 * std::sin (twoPi * 3.0 * baseHz * lt);
+                return (float) (0.78 * (env * tone + 0.25 * transient));
+            });
+
+            juce::String err;
+            auto slicedBank = buildSliceBank (groove, {}, { markers, 36, true }, err);
+            jassert (slicedBank != nullptr && slicedBank->valid () && slicedBank->sliced && err.isEmpty ());
+            result[2] = std::move (slicedBank);
+        }
+
+        return result;
+    } ();
+    return banks[(size_t) juce::jlimit (0, 2, kind)];
+}
+
+FactoryPreset atelierSample (const char* name, const char* category, const char* tags, const char* description,
+                             int bankKind, Values values, Routes routes, std::array<const char*, 4> macros, LfoCurve curve)
+{
+    Values defaults { { "oscAOn", 0 }, { "oscBOn", 0 }, { "sampleOn", 1 }, { "sampleMode", 0 },
+                      { "sampleLevel", .85f }, { "sampleRoute", 0 }, { "gain", -4 }, { "cutoff", 3200 }, { "reso", 1.1f },
+                      { "distOn", 1 }, { "distDrive", 2.5f }, { "distMix", .18f },
+                      { "delayOn", 1 }, { "delaySync", 1 }, { "delayDivision", dEighthDot }, { "delayFeedback", .24f }, { "delayMix", .08f },
+                      { "reverbOn", 1 }, { "reverbSize", .62f }, { "reverbMix", .12f } };
+    defaults.insert (defaults.end (), values.begin (), values.end ());
+    FactoryPreset p { name, category, tags, description, std::move (defaults), std::move (routes), { sine, sine }, macros };
+    p.curves[0] = curve;
+    p.sampleBank = atelierSampleBank (bankKind);
     return p;
 }
 }
@@ -441,6 +598,27 @@ const std::vector<FactoryPreset>& factoryPresets()
                 { "sustain", .8f }, { "release", 1.7f }, { "chorusOn", 1 }, { "chorusRate", .45f }, { "chorusDepth", .45f }, { "chorusMix", .38f },
                 { "reverbMix", .15f }, { "gain", -9 } },
               { { vel, cutoff, .05f }, { lfo1, aPos, .08f, true }, { m2, aPos, .4f } }, "Shimmer"),
+        atelierSample ("Atelier Sample - Velvet Keys", "KEYS", "Sample Multi Velocity Layers Poly",
+            "Dual-layer electric mallet keys with equal-power velocity crossfade. Tone opens the filter; Bark drives the harmonic bite. Play C2-C6.", 0,
+            { { "cutoff", 850 }, { "reso", 1.35f }, { "distMix", .35f }, { "attack", .004f }, { "decay", 1.1f }, { "sustain", .68f }, { "release", .32f },
+              { "env2Attack", .003f }, { "env2Decay", .28f }, { "env2Sustain", .15f }, { "env2Release", .22f }, { "lfo1Rate", 3.4f } },
+            { { vel, cutoff, .14f }, { env2, cutoff, .16f }, { lfo1, samplePan, .12f, true },
+              { m1, cutoff, .48f }, { m2, fxDrive, .65f }, { m2, cutoff, .22f }, { m3, fxDelay, .55f }, { m4, fxReverb, .58f } },
+            { "Tone", "Bark", "Echo", "Space" }, contour ({ { 0,.5f,.3f }, { .25f,.85f,-.3f }, { .75f,.15f,.3f }, { 1,.5f,0 } })),
+        atelierSample ("Atelier Sample - Round Robin Pluck", "PLUCK", "Sample Multi RoundRobin Pluck Poly",
+            "Four-variant round-robin acoustic pluck across three key zones. Tone opens the filter; Body shapes resonance and stereo motion. Play C2-C6.", 1,
+            { { "cutoff", 460 }, { "reso", 1.35f }, { "distMix", .35f }, { "attack", .002f }, { "decay", .85f }, { "sustain", .55f }, { "release", .28f },
+              { "env2Attack", .002f }, { "env2Decay", .22f }, { "env2Sustain", .1f }, { "env2Release", .18f }, { "lfo1Rate", 2.2f } },
+            { { vel, cutoff, .12f }, { env2, cutoff, .18f }, { lfo1, samplePan, .14f, true },
+              { m1, cutoff, .62f }, { m2, reso, .45f }, { m2, fxDrive, .55f }, { m3, fxDelay, .55f }, { m4, fxReverb, .58f } },
+            { "Tone", "Body", "Echo", "Space" }, contour ({ { 0,.2f,.6f }, { .35f,.9f,-.5f }, { .75f,.3f,.4f }, { 1,.2f,0 } })),
+        atelierSample ("Atelier Sample - Sliced Groove", "ARP", "Sample Sliced Loop Groove Sync",
+            "Chromatic 32-slice harmonic groove mapped from C2 to G4. Tone sweeps the low-pass filter; Punch adds resonant drive. Play C2-G4.", 2,
+            { { "cutoff", 480 }, { "reso", 1.35f }, { "distMix", .35f }, { "attack", .002f }, { "decay", .95f }, { "sustain", .65f }, { "release", .24f },
+              { "lfo1Sync", 1 }, { "lfo1Division", dEighth }, { "delayDivision", dSixteenth } },
+            { { vel, cutoff, .12f }, { lfo1, cutoff, .14f, true },
+              { m1, cutoff, .62f }, { m2, fxDrive, .65f }, { m2, reso, .35f }, { m3, fxDelay, .55f }, { m4, fxReverb, .58f } },
+            { "Tone", "Punch", "Echo", "Space" }, contour ({ { 0,0,.7f }, { .2f,1,-.6f }, { .55f,.35f,.5f }, { .85f,.75f,-.5f }, { 1,0,0 } })),
     };
     return presets;
 }

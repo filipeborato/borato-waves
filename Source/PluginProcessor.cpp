@@ -193,6 +193,11 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createLayout ()
     continuous ("grainWarp1Amount", "Grain Warp 1 Amount", -1, 1, 0);
     choice ("grainWarp2Type", bw::grainWarpNames ());
     continuous ("grainWarp2Amount", "Grain Warp 2 Amount", -1, 1, 0);
+    l.add (std::make_unique<P> (juce::ParameterID { "spectralFilterLow", 1 }, "Spectral Filter Low", R (20, 20000, 0, 0.25f), 20.0f));
+    l.add (std::make_unique<P> (juce::ParameterID { "spectralFilterHigh", 1 }, "Spectral Filter High", R (20, 20000, 0, 0.25f), 20000.0f));
+    continuous ("spectralFilterShift", "Spectral Filter Shift", -24, 24, 0);
+    choice ("spectralFilterOrder", { "Pre", "Post" }, 0);
+    continuous ("spectralMix", "Spectral Mix", 0, 1, 1);
     return l;
 }
 
@@ -454,6 +459,13 @@ bw::SpectralControls WaveVoice::spectralControls (float position, float speed, f
     c.reverseOrder = sp.order->load () >= .5f;
     c.stages[0] = { (bw::SpectralStageType) juce::jlimit (0, 2, juce::roundToInt (sp.stage1Type->load ())), sp.stage1Amount->load (), compare || sp.stage1Bypass->load () >= .5f };
     c.stages[1] = { (bw::SpectralStageType) juce::jlimit (0, 2, juce::roundToInt (sp.stage2Type->load ())), sp.stage2Amount->load (), compare || sp.stage2Bypass->load () >= .5f };
+    c.filter.lowHz = sp.filterLow->load ();
+    c.filter.highHz = sp.filterHigh->load ();
+    c.filter.shiftSemitones = sp.filterShift->load ();
+    c.filter.postOrder = sp.filterOrder->load () >= .5f;
+    c.filter.bypass = compare;
+    c.filter.curve = compare ? nullptr : params.spectralFilterCurve;
+    c.wet = compare ? 0.0f : sp.mix->load ();
     c.freeze = params.spectralParams.freeze->load () >= .5f;
     c.loop = zone ? zone->loop : params.sampleLoop->load () >= .5f;
     const int root = zone ? zone->rootKey : juce::roundToInt (params.sampleRoot->load ());
@@ -781,6 +793,10 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
                 auto controls = spectralControls (spectralPos, spectralRate, sampleSemitones + spectralSemitones);
                 controls.stages[0].amount = effective (bw::kSpectralStage1Destination, controls.stages[0].amount);
                 controls.stages[1].amount = effective (bw::kSpectralStage2Destination, controls.stages[1].amount);
+                controls.filter.lowHz = effective (bw::kSpectralFilterLowDestination, controls.filter.lowHz);
+                controls.filter.highHz = effective (bw::kSpectralFilterHighDestination, controls.filter.highHz);
+                controls.filter.shiftSemitones = effective (bw::kSpectralFilterShiftDestination, controls.filter.shiftSemitones);
+                if (! controls.filter.bypass) controls.wet = effective (bw::kSpectralMixDestination, controls.wet);
                 const auto resynthesis = spectral.process (controls);
                 sampledL += spectralAmount * (resynthesis.first - sampledL); sampledR += spectralAmount * (resynthesis.second - sampledR);
             }
@@ -828,7 +844,8 @@ WaveProcessor::WaveProcessor ()
                      p ("grainDensityMode"), p ("grainDensityDivision"), p ("grainOverlap"), p ("grainLengthMode"), p ("grainLengthDivision"), p ("grainLengthPercent"),
                      p ("grainDistribution"), p ("grainBatch"), p ("grainJumpStart"), p ("grainKeyTrack"), p ("grainLoop"),
                      p ("grainJitter"), p ("grainPan"), p ("grainWindow"), p ("grainWindowAmount"), p ("grainWindowSkew"), p ("grainDirectionSpread"), p ("grainPitchSpread"), p ("grainLengthSpread"), p ("grainGainSpread"), p ("grainAmountSpread"), p ("grainSkewSpread"), p ("grainWarpSpread"), p ("grainWarp1Type"), p ("grainWarp1Amount"), p ("grainWarp2Type"), p ("grainWarp2Amount") };
-    params.spectralParams = { p ("spectralPos"), p ("spectralFreeze"), p ("spectralSpeed"), p ("spectralPitch"), p ("spectralPhaseLock"), p ("spectralTransients"), p ("spectralStage1Type"), p ("spectralStage1Amount"), p ("spectralStage1Bypass"), p ("spectralStage2Type"), p ("spectralStage2Amount"), p ("spectralStage2Bypass"), p ("spectralOrder") };
+    params.spectralParams = { p ("spectralPos"), p ("spectralFreeze"), p ("spectralSpeed"), p ("spectralPitch"), p ("spectralPhaseLock"), p ("spectralTransients"), p ("spectralStage1Type"), p ("spectralStage1Amount"), p ("spectralStage1Bypass"), p ("spectralStage2Type"), p ("spectralStage2Amount"), p ("spectralStage2Bypass"), p ("spectralOrder"), p ("spectralFilterLow"), p ("spectralFilterHigh"), p ("spectralFilterShift"), p ("spectralFilterOrder"), p ("spectralMix") };
+    params.spectralFilterCurve = &spectralFilterCurveSlots[0];
     params.spectralCompare = &spectralCompareBaseline;
     params.region = { p ("sampleLoopMode"), p ("sampleDirection"), p ("sampleLoopStart"), p ("sampleLoopEnd"), p ("sampleLoopXfade"),
                       p ("sampleLoopLink"), p ("sampleFadeIn"), p ("sampleFadeOut") };
@@ -944,6 +961,7 @@ void WaveProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     params.sample = sampleSlot.acquire (buffer.getNumSamples ());
     params.sampleBank = sampleBankSlot.acquire (buffer.getNumSamples ());
     params.spectral = spectralSlot.acquire (buffer.getNumSamples ());
+    params.spectralFilterCurve = &spectralFilterCurveSlots[(size_t) activeSpectralFilterCurveSlot.load (std::memory_order_acquire)];
     spectralCursor.store (-1, std::memory_order_relaxed);
     const auto revision = sampleSequenceRevision.load (std::memory_order_acquire);
     if (revision != seenSampleSequenceRevision) { samplePlayback.reset (); seenSampleSequenceRevision = revision; }
@@ -1841,7 +1859,10 @@ void WaveProcessor::loadFactoryPreset (int index)
     for (int i = 0; i < 2; ++i) setLfoCurve (i, preset.curve (i));
     for (int i = 0; i < 4; ++i) setMacroName (i, preset.macros[(size_t) i]);
     for (int i = 0; i < 2; ++i) setUserTable (i, preset.tables[(size_t) i], preset.tableNames[(size_t) i]);
-    clearSample ();
+    clearSpectralFilterCurve ();
+    if (preset.sampleBank != nullptr) setSampleBank (*preset.sampleBank, "PRESET SAMPLE BANK");
+    else if (preset.sample != nullptr) publishSample (preset.sample, {});
+    else clearSample ();
 }
 static bool sameCurve (const bw::LfoCurve& a, const bw::LfoCurve& b)
 {
@@ -1853,9 +1874,76 @@ static bool sameCurve (const bw::LfoCurve& a, const bw::LfoCurve& b)
     }
     return true;
 }
+bw::SpectralFilterCurve WaveProcessor::getSpectralFilterCurve () const
+{
+    std::lock_guard<std::mutex> lock (extraStateMutex);
+    return spectralFilterCurveSlots[(size_t) activeSpectralFilterCurveSlot.load (std::memory_order_acquire)];
+}
+bool WaveProcessor::setSpectralFilterCurve (const bw::SpectralFilterCurve& curve, const juce::String& stepName)
+{
+    if (! curve.valid ()) return false;
+    const ScopedEdit edit (*this, stepName);
+    {
+        std::lock_guard<std::mutex> lock (extraStateMutex);
+        const int next = 1 - activeSpectralFilterCurveSlot.load (std::memory_order_relaxed);
+        spectralFilterCurveSlots[(size_t) next] = curve;
+        activeSpectralFilterCurveSlot.store (next, std::memory_order_release);
+        spectralFilterRevision.fetch_add (1, std::memory_order_relaxed);
+    }
+    updateHostDisplay (ChangeDetails {}.withNonParameterStateChanged (true));
+    return true;
+}
+void WaveProcessor::clearSpectralFilterCurve (const juce::String& stepName)
+{
+    bw::SpectralFilterCurve neutral;
+    neutral.custom = false;
+    setSpectralFilterCurve (neutral, stepName);
+}
+static bool sameSampleAsset (const bw::Sample* a, const bw::Sample* b)
+{
+    if (a == b) return true;
+    if (a == nullptr || b == nullptr) return false;
+    return a->contentHash == b->contentHash && a->numFrames () == b->numFrames ()
+        && a->numChannels () == b->numChannels () && std::abs (a->rate - b->rate) <= 1.0e-3;
+}
+static bool sameSampleBankAsset (const bw::SampleBank* a, const bw::SampleBank* b)
+{
+    if (a == b) return true;
+    if (a == nullptr || b == nullptr) return false;
+    if (a->sliced != b->sliced || a->zones.size () != b->zones.size ())
+        return false;
+    if (a->sliced)
+    {
+        if (a->slices.markers != b->slices.markers || a->slices.root != b->slices.root
+            || a->slices.playToEnd != b->slices.playToEnd)
+            return false;
+    }
+    for (size_t i = 0; i < a->zones.size (); ++i)
+    {
+        const auto& za = a->zones[i];
+        const auto& zb = b->zones[i];
+        if (za.lowKey != zb.lowKey || za.highKey != zb.highKey || za.rootKey != zb.rootKey
+            || za.lowVel != zb.lowVel || za.highVel != zb.highVel || za.crossfadeVel != zb.crossfadeVel
+            || za.crossfadeLaw != zb.crossfadeLaw
+            || za.loop != zb.loop || za.loopMode != zb.loopMode || za.reverse != zb.reverse
+            || za.loopLinked != zb.loopLinked || za.numVariants != zb.numVariants)
+            return false;
+        if (std::abs (za.start - zb.start) > 1.0e-5f || std::abs (za.end - zb.end) > 1.0e-5f
+            || std::abs (za.loopStart - zb.loopStart) > 1.0e-5f || std::abs (za.loopEnd - zb.loopEnd) > 1.0e-5f
+            || std::abs (za.tuneCents - zb.tuneCents) > 1.0e-3f || std::abs (za.gainDb - zb.gainDb) > 1.0e-3f
+            || std::abs (za.pan - zb.pan) > 1.0e-4f)
+            return false;
+        for (int v = 0; v < za.numVariants; ++v)
+            if (! sameSampleAsset (za.sampleForVariant (v), zb.sampleForVariant (v))) return false;
+    }
+    return true;
+}
 int WaveProcessor::matchingFactoryPreset () const
 {
-    if (sampleZonesMapped () || sample () != nullptr || samplePath () != juce::File () || sampleLoading ()) return -1; // factory presets carry no sample
+    if (sampleLoading () || getSpectralFilterCurve ().custom) return -1;
+    const auto currentBank = sampleBank ();
+    const auto currentSample = sample ();
+    const auto currentSamplePath = samplePath ();
     const auto& parameters = getParameters ();
     std::array<bw::LfoCurve, 2> curves { getLfoCurve (0), getLfoCurve (1) };
     std::array<juce::String, 4> macros { getMacroName (0), getMacroName (1), getMacroName (2), getMacroName (3) };
@@ -1878,6 +1966,15 @@ int WaveProcessor::matchingFactoryPreset () const
             for (int f = 0; same && f < actual->numFrames; ++f)
                 for (int s = 0; same && s < bw::Wavetable::kSize; ++s)
                     same = std::abs (actual->ptr (f, 0)[s] - expected->ptr (f, 0)[s]) < 2.0e-5f;
+        }
+        if (same)
+        {
+            if (preset.sampleBank != nullptr)
+                same = currentBank != nullptr && sameSampleBankAsset (currentBank.get (), preset.sampleBank.get ());
+            else if (preset.sample != nullptr)
+                same = currentBank == nullptr && currentSample != nullptr && sameSampleAsset (currentSample.get (), preset.sample.get ());
+            else
+                same = currentBank == nullptr && currentSample == nullptr && currentSamplePath == juce::File ();
         }
         if (same) return (int) n;
     }
@@ -1948,6 +2045,7 @@ void WaveProcessor::endEdit ()
     for (size_t t = 0; t < 2; ++t)
         if (before.tables[t] != after.tables[t] || before.tableNames[t] != after.tableNames[t]) changes.add (t == 0 ? "OSC A TABLE" : "OSC B TABLE");
     if (before.sampleBank != after.sampleBank || before.sample != after.sample || before.samplePath != after.samplePath) changes.add ("SAMPLE");
+    if (before.spectralFilterCurve != after.spectralFilterCurve) changes.add ("SPECTRAL FILTER CURVE");
     if (changes.isEmpty ()) return;
     if (step.name.isEmpty ()) step.name = changes.size () == 1 ? changes[0] : "EDIT";
     // Wheel ticks and arrow steps are a gesture each: on the same control within half a second, they extend the last step.
@@ -1994,6 +2092,7 @@ WaveProcessor::Snapshot WaveProcessor::capture () const
     s.sample = sampleSlot.get ();
     s.sampleBank = sampleBankSlot.get ();
     s.samplePath = sampleFile;
+    s.spectralFilterCurve = spectralFilterCurveSlots[(size_t) activeSpectralFilterCurveSlot.load (std::memory_order_acquire)];
     return s;
 }
 // Through the same setters as an edit, so the editor, host and audio thread follow.
@@ -2017,12 +2116,13 @@ void WaveProcessor::restore (const Snapshot& s, const std::vector<bool>& paramet
             setUserTable (t, s.tables[(size_t) t], s.tableNames[(size_t) t]);
     if (s.sampleBank) setSampleBank (*s.sampleBank);
     else if (sample () != s.sample || samplePath () != s.samplePath || sampleZonesMapped ()) publishSample (s.sample, s.samplePath);
+    if (getSpectralFilterCurve () != s.spectralFilterCurve) setSpectralFilterCurve (s.spectralFilterCurve);
 }
 
 std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
 {
     auto state = apvts.copyState ();
-    for (auto name : { "MODULATION", "USERTABLES", "SAMPLE", "SAMPLE_BANK" })
+    for (auto name : { "MODULATION", "USERTABLES", "SAMPLE", "SAMPLE_BANK", "SPECTRAL_FILTER" })
         if (const auto old = state.getChildWithName (name); old.isValid ()) state.removeChild (old, nullptr);
     state.setProperty ("formatVersion", kStateVersion, nullptr);
     state.setProperty ("spectralAlgorithmVersion", bw::kSpectralAlgorithmVersion, nullptr);
@@ -2059,6 +2159,23 @@ std::unique_ptr<juce::XmlElement> WaveProcessor::createStateXml ()
     }
     state.addChild (extra, -1, nullptr);
     state.addChild (tables, -1, nullptr);
+    if (const auto filterCurve = getSpectralFilterCurve (); filterCurve.custom && filterCurve.valid ())
+    {
+        juce::MemoryBlock curveData (bw::kSpectralBins * sizeof (uint32_t));
+        for (int k = 0; k < bw::kSpectralBins; ++k)
+        {
+            uint32_t bits = 0;
+            std::memcpy (&bits, &filterCurve.gains[(size_t) k], sizeof (uint32_t));
+            bits = juce::ByteOrder::swapIfBigEndian (bits);
+            curveData.copyFrom (&bits, (int) ((size_t) k * sizeof (uint32_t)), sizeof (uint32_t));
+        }
+        juce::ValueTree filterNode ("SPECTRAL_FILTER");
+        filterNode.setProperty ("version", 1, nullptr);
+        filterNode.setProperty ("custom", 1, nullptr);
+        filterNode.setProperty ("bins", bw::kSpectralBins, nullptr);
+        filterNode.setProperty ("data", curveData.toBase64Encoding (), nullptr);
+        state.addChild (filterNode, -1, nullptr);
+    }
     if (currentBank) state.addChild (bw::serializeSampleBank (*currentBank), -1, nullptr);
     if (currentSample != nullptr || currentSamplePath != juce::File ())
         state.addChild (bw::serializeSampleContainer (currentSample.get (), currentSamplePath), -1, nullptr);
@@ -2072,6 +2189,35 @@ bool WaveProcessor::restoreState (const juce::XmlElement& xml)
 {
     auto state = juce::ValueTree::fromXml (xml);
     if (! state.isValid ()) return false;
+
+    bw::SpectralFilterCurve parsedFilterCurve;
+    if (const auto filterNode = state.getChildWithName ("SPECTRAL_FILTER"); filterNode.isValid ())
+    {
+        const int version = (int) filterNode.getProperty ("version", 0);
+        const bool isCustom = (int) filterNode.getProperty ("custom", 0) != 0;
+        const int bins = (int) filterNode.getProperty ("bins", 0);
+        if (version != 1) return false;
+        if (isCustom)
+        {
+            if (bins != bw::kSpectralBins) return false;
+            const auto encoded = filterNode.getProperty ("data").toString ();
+            juce::MemoryBlock decoded;
+            if (encoded.isEmpty () || ! decoded.fromBase64Encoding (encoded)
+                || decoded.getSize () != (size_t) bw::kSpectralBins * sizeof (uint32_t))
+                return false;
+            parsedFilterCurve.custom = true;
+            for (int k = 0; k < bw::kSpectralBins; ++k)
+            {
+                uint32_t bits = 0;
+                decoded.copyTo (&bits, (int) ((size_t) k * sizeof (uint32_t)), sizeof (uint32_t));
+                bits = juce::ByteOrder::swapIfBigEndian (bits);
+                float val = 0.0f;
+                std::memcpy (&val, &bits, sizeof (float));
+                parsedFilterCurve.gains[(size_t) k] = val;
+            }
+            if (! parsedFilterCurve.valid ()) return false;
+        }
+    }
 
     std::shared_ptr<const bw::SampleBank> parsedBank;
     if (const auto node = state.getChildWithName ("SAMPLE_BANK"); node.isValid ())
@@ -2158,6 +2304,9 @@ bool WaveProcessor::restoreState (const juce::XmlElement& xml)
         setUserTable (i, std::move (table), entry.getProperty ("name").toString ());
     }
 
+    if (parsedFilterCurve.custom) setSpectralFilterCurve (parsedFilterCurve);
+    else clearSpectralFilterCurve ();
+
     if (parsedBank)
     {
         if (setSampleBank (*parsedBank).isNotEmpty ()) return false;
@@ -2183,7 +2332,7 @@ bool WaveProcessor::restoreState (const juce::XmlElement& xml)
         clearSample ();
     }
 
-    for (auto name : { "MODULATION", "USERTABLES", "SAMPLE", "SAMPLE_BANK" })
+    for (auto name : { "MODULATION", "USERTABLES", "SAMPLE", "SAMPLE_BANK", "SPECTRAL_FILTER" })
         if (const auto child = state.getChildWithName (name); child.isValid ()) state.removeChild (child, nullptr);
     apvts.replaceState (state);
     sampleSequenceRevision.fetch_add (1, std::memory_order_release);

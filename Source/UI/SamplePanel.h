@@ -55,7 +55,8 @@ private:
     juce::TextButton compareBaseline { "HOLD BASELINE" };
     Action spectralPlaybackPage, spectralStagesPage;
     int grainPage = 0;
-    bool showSpectralStages = false, draggingPosition = false;
+    bool showSpectralStages = false, draggingPosition = false, draggingFilterCurve = false;
+    void editSpectralFilterCurve (juce::Point<int> pos);
     int shownMode = -1;
     void updatePages ();
     void updateEnables ();
