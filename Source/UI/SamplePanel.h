@@ -9,6 +9,7 @@ class SamplePanel : public juce::Component, private juce::Timer
 {
 public:
     explicit SamplePanel (WaveProcessor&);
+    ~SamplePanel () override { processor.spectralCompareBaseline.store (false); }
     void paint (juce::Graphics&) override;
     void resized () override;
     void visibilityChanged () override { if (isVisible ()) timerCallback (); }
@@ -48,7 +49,14 @@ private:
     Dial spectralPosition, spectralSpeed, spectralPitch;
     Dial overlap, lengthPercent, batch, keyTrack;
     Action grainsPage, timingPage;
-    bool showTiming = false, draggingPosition = false;
+    struct ExtraControl { std::unique_ptr<juce::Component> component; int page; };
+    std::vector<ExtraControl> extraControls;
+    std::array<std::unique_ptr<Action>, 3> extraPages;
+    juce::TextButton compareBaseline { "HOLD BASELINE" };
+    Action spectralPlaybackPage, spectralStagesPage;
+    int grainPage = 0;
+    bool showSpectralStages = false, draggingPosition = false, draggingFilterCurve = false;
+    void editSpectralFilterCurve (juce::Point<int> pos);
     int shownMode = -1;
     void updatePages ();
     void updateEnables ();

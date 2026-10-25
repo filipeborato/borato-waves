@@ -53,6 +53,88 @@ struct GrainSource
     float weight = 0;
 };
 using GrainSources = std::array<GrainSource, 2>;
+enum class GrainWindowType { hann, welch, gaussian, blackmanHarris, sinc, tukey, triangle, trapezoid, expDec, expDecRev };
+enum class GrainWarpType { identity, bend, asym };
+inline juce::StringArray grainWindowNames () { return { "Hann", "Welch", "Gaussian", "Blackman-Harris", "Sinc", "Tukey", "Triangle", "Trapezoid", "ExpDec", "ExpDecRev" }; }
+inline juce::StringArray grainWarpNames () { return { "Identity", "Bend", "Asym" }; }
+inline double grainEdgeFade (double t) noexcept
+{
+    const double edge = std::min (t, 1 - t);
+    return edge >= .02 ? 1 : .5 * (1 - std::cos (juce::MathConstants<double>::pi * std::max (0.0, edge) / .02));
+}
+inline double grainWindowFormula (GrainWindowType type, double t) noexcept
+{
+    if (! std::isfinite (t) || t <= 0 || t >= 1) return 0;
+    const double pi = juce::MathConstants<double>::pi, x = 2 * t - 1;
+    switch (type)
+    {
+        case GrainWindowType::welch: return 1 - x * x;
+        case GrainWindowType::gaussian: return std::exp (-.5 * std::pow ((t - .5) / .18, 2)) * grainEdgeFade (t);
+        case GrainWindowType::blackmanHarris: return (.35875 - .48829 * std::cos (2*pi*t) + .14128 * std::cos (4*pi*t) - .01168 * std::cos (6*pi*t)) * grainEdgeFade (t);
+        case GrainWindowType::sinc: return x == 0 ? 1 : std::pow (std::sin (4*pi*x) / (4*pi*x), 2);
+        case GrainWindowType::tukey: return t < .25 ? .5 * (1 - std::cos (4*pi*t)) : t > .75 ? .5 * (1 - std::cos (4*pi*(1-t))) : 1;
+        case GrainWindowType::triangle: return 1 - std::abs (x);
+        case GrainWindowType::trapezoid: return std::min ({ 1.0, 4*t, 4*(1-t) });
+        case GrainWindowType::expDec: return std::exp (-6*t) * grainEdgeFade (t);
+        case GrainWindowType::expDecRev: return std::exp (-6*(1-t)) * grainEdgeFade (t);
+        default: return .5 * (1 - std::cos (2*pi*t));
+    }
+}
+struct GrainWindowTables
+{
+    std::array<std::array<float, 4097>, 10> values {};
+    std::array<double, 10> energy {}, cross {};
+    std::array<double, 10> leftEnergy {}, leftCross {};
+    GrainWindowTables ()
+    {
+        for (size_t w = 0; w < values.size (); ++w)
+            for (size_t i = 0; i < values[w].size (); ++i)
+            {
+                const double t = (double) i / 4096, v = grainWindowFormula ((GrainWindowType) w, t);
+                values[w][i] = (float) v;
+                energy[w] += v * v / 4096;
+                cross[w] += v * grainWindowFormula (GrainWindowType::hann, t) / 4096;
+                if (i <= 2048)
+                {
+                    const double weight = i == 2048 ? .5 : 1;
+                    leftEnergy[w] += weight * v * v / 4096;
+                    leftCross[w] += weight * v * grainWindowFormula (GrainWindowType::hann, t) / 4096;
+                }
+            }
+    }
+};
+inline const GrainWindowTables grainWindowTables;
+inline float evaluateGrainWindow (GrainWindowType type, double t) noexcept
+{
+    if (! std::isfinite (t) || t <= 0 || t >= 1) return 0;
+    const auto& table = grainWindowTables.values[(size_t) juce::jlimit (0, 9, (int) type)];
+    const double x = t * 4096; const auto i = (size_t) x;
+    return table[i] + (float) (x - i) * (table[i+1] - table[i]);
+}
+inline double applyGrainSkew (double t, double skew) noexcept
+{
+    const double b = std::isfinite (skew) ? juce::jlimit (.01, .99, skew) : .5;
+    t = std::isfinite (t) ? juce::jlimit (0.0, 1.0, t) : 0;
+    return t <= b ? .5 * t / b : .5 + .5 * (t - b) / (1 - b);
+}
+inline double applyGrainWarp (double t, GrainWarpType type, double amount) noexcept
+{
+    t = std::isfinite (t) ? juce::jlimit (0.0, 1.0, t) : 0;
+    const double a = std::isfinite (amount) ? juce::jlimit (-1.0, 1.0, amount) : 0;
+    if (a == 0 || type == GrainWarpType::identity) return t;
+    if (type == GrainWarpType::bend) return t + a * t * (1-t);
+    return applyGrainSkew (t, .5 + .49*a);
+}
+inline float grainWindowGain (GrainWindowType type, float amount, float skew) noexcept
+{
+    const auto w = (size_t) juce::jlimit (0, 9, (int) type);
+    const double a = std::isfinite (amount) ? juce::jlimit (0.0f, 1.0f, amount) : 0;
+    const double b = std::isfinite (skew) ? juce::jlimit (.01f, .99f, skew) : .5;
+    const double energy = 2*b*grainWindowTables.leftEnergy[w] + 2*(1-b)*(grainWindowTables.energy[w]-grainWindowTables.leftEnergy[w]);
+    const double cross = 2*b*grainWindowTables.leftCross[w] + 2*(1-b)*(grainWindowTables.cross[w]-grainWindowTables.leftCross[w]);
+    return (float) std::sqrt (.375 / std::max (1e-4, (1-a)*(1-a)*.375 + a*a*energy + 2*a*(1-a)*cross));
+}
+struct GrainWarp { GrainWarpType type = GrainWarpType::identity; float amount = 0; };
 struct GrainControls
 {
     float density = 40, sizeMs = 100, position = .5f, scan = 0, spread = 0;
@@ -67,6 +149,11 @@ struct GrainControls
     bool loop = false;                            // grains wrap inside the region instead of fitting before its end
     float jitter = 0;                             // 0..1: each grain waits a random [0, jitter x interval) after its event
     float panSpread = 0;                          // 0..1: random equal-power pan per grain
+    GrainWindowType window = GrainWindowType::hann;
+    float windowAmount = 0, windowSkew = .5f; // amount 0 = legacy Hann, 1 = selected window; skew .5 = symmetric time mapping
+    float directionSpread = 0, pitchSpread = 0, lengthSpread = 0, gainSpread = 0;
+    float amountSpread = 0, skewSpread = 0, warpSpread = 0;
+    std::array<GrainWarp, 2> warp {};
 };
 // Host or internal tempo; with a playing transport, synced events follow the ppq grid, otherwise the note.
 struct GrainClock { double bpm = 120, ppq = 0; bool transport = false; };
@@ -107,6 +194,11 @@ struct Grain
     int age = 0, duration = 1;
     float gainL = 1, gainR = 1;
     bool active = false;
+    GrainWindowType window = GrainWindowType::hann;
+    float windowAmount = 0, windowSkew = .5f, windowGain = 1;
+    double pitchRatio = 1;
+    bool reverse = false;
+    std::array<GrainWarp, 2> warp {};
 };
 struct GrainDisplaySnapshot
 {
@@ -129,6 +221,14 @@ inline float grainWindow (double phase) noexcept
     const auto index = (size_t) x;
     if (index >= 1024) return 0;
     return hannWindow[index] + (float) (x - (double) index) * (hannWindow[index + 1] - hannWindow[index]);
+}
+inline float grainWindow (const Grain& grain, double phase) noexcept
+{
+    // Keep the original interpolation and gain at neutral settings for existing presets.
+    if (grain.windowSkew == .5f && (grain.windowAmount == 0 || grain.window == GrainWindowType::hann)) return grainWindow (phase);
+    const double t = applyGrainSkew (phase, grain.windowSkew);
+    const float hann = evaluateGrainWindow (GrainWindowType::hann, t);
+    return (hann + grain.windowAmount * (evaluateGrainWindow (grain.window, t) - hann)) * grain.windowGain;
 }
 class GranularVoiceEngine
 {
@@ -191,14 +291,24 @@ public:
         for (auto& grain : grains)
         {
             if (! grain.active) continue;
-            const float window = grainWindow ((double) grain.age / grain.duration);
+            const double phase = (double) grain.age / grain.duration;
+            const float window = grainWindow (grain, phase);
             windowSum += window;
+            double u = phase, nextU = (double) (grain.age + 1) / grain.duration;
+            for (const auto& warp : grain.warp)
+            {
+                u = applyGrainWarp (u, warp.type, warp.amount);
+                nextU = applyGrainWarp (nextU, warp.type, warp.amount);
+            }
+            const bool warped = (grain.warp[0].type != GrainWarpType::identity && grain.warp[0].amount != 0)
+                             || (grain.warp[1].type != GrainWarpType::identity && grain.warp[1].amount != 0);
             for (size_t l = 0; l < 2; ++l)
             {
                 const auto& source = grain.sources[l];
                 if (! source.sample || source.weight <= 0) continue;
-                const double increment = frequency * source.ratio;
-                const auto value = source.sample->readFilteredStereo (grain.positions[l], increment, source.from, source.to);
+                const double increment = frequency * source.ratio * grain.pitchRatio * (grain.reverse ? -1 : 1)
+                                       * (warped ? (nextU - u) * grain.duration : 1);
+                const auto value = source.sample->readFilteredStereo (grain.positions[l], std::abs (increment), source.from, source.to);
                 const double weight = window * source.weight;
                 left += value.first * weight * grain.gainL; right += value.second * weight * grain.gainR;
                 grain.positions[l] = advance (grain.positions[l], increment, source, controls.loop);
@@ -229,7 +339,7 @@ public:
             const auto* sample = g.sources[sourceIndex].sample;
             visual.normPos.store (g.active && sample ? (float) (g.positions[sourceIndex] / sample->numFrames ()) : 0, std::memory_order_relaxed);
             visual.normPhase.store (g.active ? (float) phase : 0, std::memory_order_relaxed);
-            visual.amp.store (g.active ? grainWindow (phase) : 0, std::memory_order_relaxed);
+            visual.amp.store (g.active ? grainWindow (g, phase) : 0, std::memory_order_relaxed);
         }
         display.count.store (activeCount (), std::memory_order_relaxed);
     }
@@ -239,8 +349,14 @@ private:
     static double advance (double position, double increment, const GrainSource& source, bool loop) noexcept
     {
         const double next = position + increment, last = source.to - 1;
-        if (loop && next >= last && last > source.from) return source.from + std::fmod (next - source.from, last - source.from);
-        return std::min (last, next);
+        if (last <= source.from) return source.from;
+        if (loop && (next >= last || next < source.from))
+        {
+            double offset = std::fmod (next - source.from, last - source.from);
+            if (offset < 0) offset += last - source.from;
+            return source.from + offset;
+        }
+        return juce::jlimit (source.from, last, next);
     }
     void spawn (const GrainSources& sources, const GrainControls& controls, const GrainTiming& timing, double frequency, int age = 0) noexcept
     {
@@ -249,10 +365,21 @@ private:
         if (free == grains.end ()) { saturated = true; return; } // Refuse, never steal an audible grain.
         if (! sources[0].sample && ! sources[1].sample) return;
         *free = {}; free->sources = sources; free->active = true;
-        free->duration = std::max (2, (int) std::round (rate * timing.lengthMs * .001));
+        auto bounded = [] (float v, float lo, float hi, float fallback = 0) { return std::isfinite (v) ? juce::jlimit (lo, hi, v) : fallback; };
+        auto spread = [&] (float width) { return width > 0 ? (rng.next () * 2 - 1) * width : 0; };
+        const float reverseChance = bounded (controls.directionSpread, 0, 1);
+        free->reverse = reverseChance > 0 && rng.next () < reverseChance;
+        free->pitchRatio = std::exp2 (spread (bounded (controls.pitchSpread, 0, 24)) / 12);
+        free->duration = std::max (2, (int) std::round (rate * juce::jlimit (5.0, 2000.0, timing.lengthMs * (1 + spread (bounded (controls.lengthSpread, 0, 1)))) * .001));
+        free->window = (GrainWindowType) juce::jlimit (0, 9, (int) controls.window);
+        free->windowAmount = (float) juce::jlimit (0.0, 1.0, bounded (controls.windowAmount, 0, 1) + spread (bounded (controls.amountSpread, 0, 1)));
+        free->windowSkew = (float) juce::jlimit (.01, .99, bounded (controls.windowSkew, .01f, .99f, .5f) + spread (bounded (controls.skewSpread, 0, 1)));
+        free->warp = controls.warp;
+        for (auto& warp : free->warp) warp.amount = (float) juce::jlimit (-1.0, 1.0, bounded (warp.amount, -1, 1) + spread (bounded (controls.warpSpread, 0, 1)));
+        free->windowGain = grainWindowGain (free->window, free->windowAmount, free->windowSkew);
         // Without grain loop a grain must end inside the region: shorter regions shorten it, later starts move back.
         const size_t lead = sources[0].sample ? 0u : 1u;
-        const double increment = frequency * sources[lead].ratio, span = sources[lead].to - sources[lead].from - 1;
+        const double increment = frequency * sources[lead].ratio * free->pitchRatio, span = sources[lead].to - sources[lead].from - 1;
         if (! controls.loop && std::isfinite (increment) && increment > 0 && span > 0)
             free->duration = std::max (2, (int) std::min ((double) free->duration, span / increment));
         if (const float pan = std::isfinite (controls.panSpread) ? juce::jlimit (0.0f, 1.0f, controls.panSpread) : 0.0f; pan > 0)
@@ -261,16 +388,23 @@ private:
             free->gainL = (float) (std::cos (angle) * juce::MathConstants<double>::sqrt2);
             free->gainR = (float) (std::sin (angle) * juce::MathConstants<double>::sqrt2);
         }
+        const float gain = (float) (1 + spread (bounded (controls.gainSpread, 0, 1)));
+        free->gainL *= gain; free->gainR *= gain;
         double position = (std::isfinite (controls.position) ? juce::jlimit (0.0f, 1.0f, controls.position) : .5f) + scanOffset;
         if (position < 0 || position > 1) position -= std::floor (position);
         position = juce::jlimit (0.0, 1.0, position + randomOffset);
         for (size_t l = 0; l < 2; ++l)
         {
             const double length = std::max (0.0, sources[l].to - sources[l].from - 1);
-            const double travel = controls.loop ? 0.0 : std::min (length, free->duration * frequency * sources[l].ratio);
-            free->positions[l] = sources[l].from + std::min (position * length, std::isfinite (travel) ? length - travel : length);
+            const double travel = controls.loop ? 0.0 : std::min (length, free->duration * frequency * sources[l].ratio * free->pitchRatio);
+            free->positions[l] = sources[l].from + (free->reverse ? std::max (position * length, travel) : std::min (position * length, std::isfinite (travel) ? length - travel : length));
             // A jump-started grain is placed where it would be after `age` frames.
-            if (age > 0) free->positions[l] = advance (free->positions[l], age * frequency * sources[l].ratio, sources[l], controls.loop);
+            if (age > 0)
+            {
+                double u = (double) std::min (age, free->duration - 1) / free->duration;
+                for (const auto& warp : free->warp) u = applyGrainWarp (u, warp.type, warp.amount);
+                free->positions[l] = advance (free->positions[l], u * free->duration * frequency * sources[l].ratio * free->pitchRatio * (free->reverse ? -1 : 1), sources[l], controls.loop);
+            }
         }
         free->age = std::min (age, free->duration - 1);
         ++spawned;

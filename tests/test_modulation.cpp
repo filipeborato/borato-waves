@@ -571,6 +571,75 @@ void benchmarkProfiles()
                       << " over_budget_blocks=" << overBudget << "/" << blocks << '\n';
         }
 }
+
+// Issue 28: the sample engines under their factory presets, 16 held notes, three 2 s runs per rate.
+// Per-block times are reported against the block period; gate: mean <= 70%, p99 < 70%, max < 100%.
+void benchmarkEngines()
+{
+    struct Case { const char* name; const char* preset; bool saturateGrains; int notes = 16; };
+    constexpr Case cases[] {
+        { "multisample16_rr", "Atelier Sample - Round Robin Pluck", false },
+        { "multisample16_vel", "Atelier Sample - Velvet Keys", false },
+        { "granular16x32", "Grain Cloud - Glass Choir", true },
+        { "spectral16_stages_filter", "Spectral Bloom - Metal Shift", false },
+        { "granular16_preset", "Grain Cloud - Glass Choir", false },
+        { "granular4_preset", "Grain Cloud - Glass Choir", false, 4 },
+        { "spectral4_stages_filter", "Spectral Bloom - Metal Shift", false, 4 },
+    };
+    constexpr int blockSize = 128;
+    const auto& presets = bw::factoryPresets();
+    for (const auto& c : cases)
+    {
+        int index = -1;
+        for (int i = 0; i < (int) presets.size(); ++i) if (juce::String (presets[(size_t) i].name) == c.preset) index = i;
+        if (index < 0) std::abort();
+        for (double rate : { 48000.0, 96000.0 })
+            for (int run = 1; run <= 3; ++run)
+            {
+                WaveProcessor p;
+                p.loadFactoryPreset (index);
+                // Dense, long grains fill every voice's 32-grain pool.
+                if (c.saturateGrains) { set (p, "grainDensity", 100); set (p, "grainSize", 500); }
+                p.prepareToPlay (rate, blockSize);
+                if (! p.waitForSampleLoad (60000)) std::abort();
+                for (int waited = 0; p.spectralState() == WaveProcessor::SpectralState::analyzing; waited += 5)
+                {
+                    if (waited > 60000) std::abort();
+                    juce::Thread::sleep (5);
+                }
+                juce::AudioBuffer<float> audio (2, blockSize);
+                juce::MidiBuffer midi;
+                const int blocks = (int) (2 * rate) / blockSize;
+                const double deadline = blockSize / rate;
+                std::vector<double> times;
+                times.reserve ((size_t) blocks);
+                int maxGrains = 0;
+                for (int block = 0; block < blocks; ++block)
+                {
+                    midi.clear();
+                    if (block == 0)
+                        for (int note = 48; note < 48 + c.notes; ++note) midi.addEvent (juce::MidiMessage::noteOn (1, note, .8f), 0);
+                    if (block % 13 == 0) set (p, "macro1", (float) (block % 2));
+                    const auto start = std::chrono::steady_clock::now();
+                    p.processBlock (audio, midi);
+                    times.push_back (std::chrono::duration<double> (std::chrono::steady_clock::now() - start).count() / deadline * 100);
+                    maxGrains = std::max (maxGrains, p.activeGrains.load());
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int s = 0; s < blockSize; ++s)
+                            if (! std::isfinite (audio.getSample (ch, s))) std::abort();
+                }
+                double mean = 0;
+                for (double t : times) mean += t;
+                mean /= (double) times.size();
+                std::sort (times.begin(), times.end());
+                const double p99 = times[(size_t) (0.99 * (double) (times.size() - 1))], worst = times.back();
+                const bool pass = mean <= 70 && p99 < 70 && worst < 100;
+                std::cout << "engine_benchmark case=" << c.name << " rate=" << rate << " block=" << blockSize << " run=" << run
+                          << " notes=" << c.notes << " max_grains=" << maxGrains << " mean_pct=" << mean << " p99_pct=" << p99
+                          << " max_pct=" << worst << " gate=" << (pass ? "PASS" : "FAIL") << '\n';
+            }
+    }
+}
 }
 
 int main (int argc, char** argv)
@@ -578,6 +647,7 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     const bool benchmark = argc > 1 && juce::String (argv[1]) == "--benchmark";
     if (benchmark) { benchmarkProfiles(); return 0; }
+    if (argc > 1 && juce::String (argv[1]) == "--benchmark-engines") { benchmarkEngines(); return 0; }
     WaveProcessor processor;
     initialise (processor);
     testCurves(); testTableFade (processor.wavetableBank);

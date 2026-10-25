@@ -45,7 +45,7 @@ Dial::Dial (AudioProcessorValueTreeState& s, const String& parameterId, const St
 Dial::~Dial() { endDrag(); }
 String Dial::valueText() const
 {
-    if (id == "cutoff" || id == "cutoff2") return plainValue >= 1000 ? String (plainValue / 1000.0f, 2) + " kHz" : String (plainValue, 0) + " Hz";
+    if (id == "cutoff" || id == "cutoff2" || id == "spectralFilterLow" || id == "spectralFilterHigh") return plainValue >= 1000 ? String (plainValue / 1000.0f, 2) + " kHz" : String (plainValue, 0) + " Hz";
     if (id == "gain" || id == "distDrive" || id.startsWith ("eq") || id == "compThreshold" || id == "compMakeup")
     {
         if (id == "eqFreq") return plainValue >= 1000 ? String (plainValue / 1000.0f, 2) + " kHz" : String (plainValue, 0) + " Hz";
@@ -67,7 +67,7 @@ String Dial::valueText() const
     if (id.endsWith ("Phase")) return String (plainValue, 0) + " deg";
     if (id.endsWith ("Rate")) return String (plainValue, 2) + " Hz";
     if (id == "internalBpm") return String (plainValue, 1) + " BPM";
-    if (id.endsWith ("Pitch")) return String (plainValue, 1) + " st";
+    if (id.endsWith ("Pitch") || id == "grainPitchSpread" || id == "spectralFilterShift") return String (plainValue, 1) + " st";
     if (id.endsWith ("Fine")) return String (plainValue, 1) + " ct";
     if (id == "sampleRoot") return MidiMessage::getMidiNoteName (roundToInt (plainValue), true, true, 4) + " (" + String (roundToInt (plainValue)) + ")";
     if (id == "subOctave") return String (plainValue, 0) + " oct";

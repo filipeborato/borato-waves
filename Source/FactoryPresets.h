@@ -5,6 +5,7 @@
 #include <optional>
 #include "Modulation.h"
 #include "Wavetable.h"
+#include "Sample.h"
 
 namespace bw
 {
@@ -27,6 +28,8 @@ struct FactoryPreset
     std::array<std::optional<LfoCurve>, 2> curves {};
     std::array<std::shared_ptr<const Wavetable>, 2> tables {};
     std::array<const char*, 2> tableNames { "", "" };
+    std::shared_ptr<const Sample> sample {};
+    std::shared_ptr<const SampleBank> sampleBank {};
 
     LfoCurve curve (int index) const { return curves[(size_t) index].value_or (LfoCurve::factory (lfoShapes[(size_t) index])); }
 };
