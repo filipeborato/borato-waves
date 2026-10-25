@@ -624,18 +624,20 @@ private:
         auto apply = [&] (SpectralBuffer& bins, const SpectralControls& c)
         {
             const double binHz = data->rate / (rateRatio * kSpectralFftSize);
+            // Edges come from the live controls: c may be a snapshot taken when the stage layout last changed.
             SpectralFilter activeFilter = c.filter;
-            if (! std::isfinite (c.filter.lowHz) || ! std::isfinite (c.filter.highHz) || c.filter.lowHz >= c.filter.highHz)
+            const auto& live = controls.filter;
+            if (! std::isfinite (live.lowHz) || ! std::isfinite (live.highHz) || live.lowHz >= live.highHz)
             {
-                activeFilter.lowHz = c.filter.lowHz;
-                activeFilter.highHz = c.filter.highHz;
+                activeFilter.lowHz = live.lowHz;
+                activeFilter.highHz = live.highHz;
             }
             else
             {
                 activeFilter.lowHz = (float) filterLowHz;
                 activeFilter.highHz = (float) filterHighHz;
             }
-            activeFilter.shiftSemitones = std::isfinite (c.filter.shiftSemitones) ? (float) filterShiftSt : c.filter.shiftSemitones;
+            activeFilter.shiftSemitones = std::isfinite (live.shiftSemitones) ? (float) filterShiftSt : live.shiftSemitones;
             if (! c.filter.postOrder) applySpectralFilter (bins, binHz, activeFilter);
             for (int i = 0; i < 2; ++i)
             {

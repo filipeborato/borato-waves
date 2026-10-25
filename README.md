@@ -15,7 +15,7 @@ Borato Waves takes you from a single wavetable frame to a frozen spectral pad wi
 - **Spectral resynthesis.** Freeze a moment, scrub through it, change pitch without changing time, and stack two spectral transform stages. A spectral band filter with a wet/dry mix stays phase-aligned with the dry signal.
 - **Modulation everywhere.** Two drawable LFOs, two envelopes, velocity and four macros route to 40 destinations through the matrix. Drag a source onto any dial to assign it.
 - **Finishing built in.** Dual SVF filters in serial or parallel, plus drive, chorus, delay, reverb, EQ and compression.
-- **68 factory presets, ready to play.** Basses, leads, pads, plucks, keys and arps, including three sample-based instruments with velocity layers, round robin and sliced grooves. Every preset has four working macros.
+- **74 factory presets, ready to play.** Basses, leads, pads, plucks, keys and arps. Three sampled instruments show off velocity layers, round robin and sliced grooves; three granular patches turn a sung glass choir, a tempo-locked figure and worn tape keys into clouds and pulses; three spectral patches freeze, stretch and bin-shift their sources. Every preset has four working macros.
 - **Portable sessions.** Samples are embedded in the preset and project state, so a session opens on another machine without missing files.
 
 ## Building

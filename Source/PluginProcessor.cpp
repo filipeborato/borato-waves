@@ -1941,7 +1941,8 @@ static bool sameSampleBankAsset (const bw::SampleBank* a, const bw::SampleBank* 
 int WaveProcessor::matchingFactoryPreset () const
 {
     if (sampleLoading () || getSpectralFilterCurve ().custom) return -1;
-    const auto currentBank = sampleBank ();
+    // The published bank only: sampleBank () also wraps a lone sample as a one-zone bank.
+    const auto currentBank = [this] { std::lock_guard<std::mutex> lock (extraStateMutex); return sampleBankSlot.get (); } ();
     const auto currentSample = sample ();
     const auto currentSamplePath = samplePath ();
     const auto& parameters = getParameters ();

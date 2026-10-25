@@ -2291,7 +2291,73 @@ void testGrainWindowEndpoints ()
     std::cout << "ok: ten windows, skew, PRNG, warp identity and deterministic dispersed stereo grains\n";
 }
 
-int main (int argc, char**)
+// Issue 28: measured onset of an impulse sample equals the declared host latency (within 1 sample)
+// in playback and spectral modes.
+void testDeclaredLatencyByImpulse ()
+{
+    constexpr int impulseAt = 6000;
+    juce::AudioBuffer<float> impulse (1, 24000);
+    impulse.clear();
+    impulse.setSample (0, impulseAt, .9f);
+    const auto file = writeFloatWav ("latency-impulse", 48000, impulse);
+    for (int mode : { kSampleModePlayback, kSampleModeSpectral })
+    {
+        Rig rig; sampleOnly (rig);
+        rig.set ("sampleMode", (float) mode);
+        rig.set ("sampleFadeOut", 0);
+        if (mode == kSampleModeSpectral) rig.set ("spectralTransients", 1);
+        assert (rig.processor.loadSample (file).isEmpty ());
+        assert (rig.processor.waitForSampleLoad (60000));
+        while (rig.processor.spectralState () == WaveProcessor::SpectralState::analyzing) juce::Thread::sleep (5);
+        rig.send (on (bw::kSampleRootNote));
+        const auto out = rig.run (.3);
+        size_t at = 0;
+        for (size_t i = 0; i < out.size (); ++i) if (std::abs (out[i]) > std::abs (out[at])) at = i;
+        const int measured = (int) at - impulseAt, declared = rig.processor.getLatencySamples ();
+        std::cout << "latency mode " << mode << ": measured " << measured << " declared " << declared << "\n";
+        assert (std::abs (measured - declared) <= 1);
+    }
+    std::cout << "ok: impulse onset matches declared latency in playback and spectral modes\n";
+}
+
+// Issue 28: continuous automation, background imports, mode switches and state reopen; no NaN, no callback
+// allocations, and asset memory stops growing after warm-up.
+void testEnginesSoak ()
+{
+    const std::array<juce::File, 2> files { writeTone ("soak-a", 48000, 2, 220, 2), writeTone ("soak-b", 44100, 3, 330) };
+    Rig rig; sampleOnly (rig);
+    assert (rig.processor.loadSample (files[0]).isEmpty ());
+    assert (rig.processor.waitForSampleLoad (60000));
+    juce::MemoryBlock state;
+    rig.processor.getStateInformation (state);
+    juce::MidiBuffer midi;
+    size_t warm = 0, peakAfterWarm = 0;
+    constexpr int blocks = 9000; // 12 s at 48 kHz in 64-sample blocks
+    for (int b = 0; b < blocks; ++b)
+    {
+        const float phase = (float) b / 97.0f;
+        rig.set ("macro1", .5f + .5f * std::sin (phase));
+        rig.set ("grainPosition", .5f + .45f * std::sin (phase * .7f));
+        rig.set ("spectralPos", .5f + .45f * std::cos (phase * .3f));
+        rig.set ("spectralFilterHigh", 2000 + 1500 * std::sin (phase));
+        rig.set ("spectralMix", .5f + .5f * std::sin (phase * 1.3f));
+        if (b % 400 == 0) rig.set ("sampleMode", (float) ((b / 400) % 3));
+        if (b % 700 == 350) rig.processor.loadSample (files[(size_t) (b / 700) % 2]); // background import, not awaited
+        if (b % 1500 == 1499) rig.processor.setStateInformation (state.getData (), (int) state.getSize ());
+        if (b % 50 == 0) midi.addEvent (on (48 + (b / 50) % 24, .8f), 0);
+        if (b % 50 == 40) midi.addEvent (off (48 + (b / 50) % 24), 0);
+        renderChecked (rig.processor, midi, Rig::kBlock, Rig::kBlock);
+        if (b == 3000) warm = rig.processor.assetMemoryBytes ();
+        if (b > 3000) peakAfterWarm = std::max (peakAfterWarm, rig.processor.assetMemoryBytes ());
+    }
+    assert (rig.processor.waitForSampleLoad (60000));
+    std::cout << "soak asset memory: warm " << warm << " peak after warm-up " << peakAfterWarm << " final " << rig.processor.assetMemoryBytes () << "\n";
+    assert (rig.processor.assetMemoryBytes () <= std::max (warm, peakAfterWarm));
+    assert (peakAfterWarm <= 2 * std::max<size_t> (warm, 1) + (8u << 20));
+    std::cout << "ok: 12 s engine soak with automation, imports, mode switches and reopen, finite and allocation-free\n";
+}
+
+int main (int argc, char** argv)
 {
 #ifdef _WIN32
     // Failed asserts print and exit instead of opening a modal dialog.
@@ -2299,8 +2365,17 @@ int main (int argc, char**)
     _set_abort_behavior (0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     juce::ScopedJuceInitialiser_GUI init;
+    if (argc > 1 && juce::String (argv[1]) == "--soak")
+    {
+        testDeclaredLatencyByImpulse ();
+        testEnginesSoak ();
+        folder.deleteRecursively ();
+        return 0;
+    }
     testGrainWindowEndpoints ();
     if (argc > 1) return 0;
+    testDeclaredLatencyByImpulse ();
+    testEnginesSoak ();
     testRegionLoopDirectionsAndTailedRelease ();
     testManualSlicesSharedAssetAndUndo ();
     testSfzSubsetImportAndDiagnostics ();

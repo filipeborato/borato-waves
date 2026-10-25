@@ -678,6 +678,18 @@ void testSpectralFilterAndPhaseAlignedMix ()
         assert (rms (invAudio, 0, invAudio.size ()) < 1.0e-7);
     }
 
+    // Edges that cross mid-note (e.g. matrix modulation) also attenuate fully, without a stage-layout change.
+    {
+        auto cLive = whole (*data);
+        cLive.loop = true;
+        cLive.filter.lowHz = 200.0f; cLive.filter.highHz = 8000.0f;
+        player.reset (data.get (), cLive, kRate);
+        const auto before = render (player, cLive, 8000).first;
+        cLive.filter.lowHz = 6000.0f; cLive.filter.highHz = 900.0f;
+        const auto after = render (player, cLive, 12000).first;
+        assert (rms (before, 4000, 8000) > 1.0e-3 && rms (after, 6000, 12000) < 1.0e-6);
+    }
+
     // 3. Filter shift (+12 st doubles effective cutoff from 1000 Hz to 2000 Hz; custom curve shifts safely).
     bw::SpectralFilter fShiftedUp { 20.0f, 1000.0f, 12.0f, false, false, nullptr };
     bw::SpectralFilter fRef2k { 40.0f, 2000.0f, 0.0f, false, false, nullptr };
