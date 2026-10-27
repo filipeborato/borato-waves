@@ -357,6 +357,7 @@ public:
     void reset (const SpectralData* source, const SpectralControls& controls, double hostRate) noexcept
     {
         data = source; finished = data == nullptr; accumulator = {}; dryAccumulator = {}; hopPosition = 0; initialised = false;
+        dryFrames = wetFrames = 0;
         filterLowHz = std::isfinite (controls.filter.lowHz) ? juce::jlimit (20.0, 20000.0, (double) controls.filter.lowHz) : 20.0;
         filterHighHz = std::isfinite (controls.filter.highHz) ? juce::jlimit (20.0, 20000.0, (double) controls.filter.highHz) : 20000.0;
         filterShiftSt = std::isfinite (controls.filter.shiftSemitones) ? juce::jlimit (-24.0, 24.0, (double) controls.filter.shiftSemitones) : 0.0;
@@ -391,7 +392,9 @@ public:
         const auto index = (size_t) hopPosition;
         const float targetWet = std::isfinite (controls.wet) ? juce::jlimit (0.0f, 1.0f, controls.wet) : 1.0f;
         const float wetStep = (float) std::min (1.0, rateRatio / (data->rate * 0.01));
-        smoothedWet += juce::jlimit (-wetStep, wetStep, targetWet - smoothedWet);
+        // A resumed branch needs all four overlapping frames before it can enter the mix.
+        if ((targetWet > smoothedWet && wetFrames == 4) || (targetWet < smoothedWet && dryFrames == 4))
+            smoothedWet += juce::jlimit (-wetStep, wetStep, targetWet - smoothedWet);
         const size_t rightCh = data->channels == 2 ? 1 : 0;
         const float dryL = dryAccumulator[0][index], dryR = dryAccumulator[rightCh][index];
         const float wetL = accumulator[0][index], wetR = accumulator[rightCh][index];
@@ -452,6 +455,11 @@ private:
 
     void synthesize (const SpectralControls& controls, double position) noexcept
     {
+        const float targetWet = std::isfinite (controls.wet) ? juce::jlimit (0.0f, 1.0f, controls.wet) : 1.0f;
+        const bool renderDry = targetWet < 1 || smoothedWet < 1;
+        const bool renderWet = targetWet > 0 || smoothedWet > 0;
+        dryFrames = renderDry ? std::min (4, dryFrames + 1) : 0;
+        wetFrames = renderWet ? std::min (4, wetFrames + 1) : 0;
         const int i = juce::jlimit (0, data->frames - 1, (int) std::floor (position)), j = juce::jmin (i + 1, data->frames - 1);
         const float t = (float) juce::jlimit (0.0, 1.0, position - i);
         const int nearest = t < .5f ? i : j;
@@ -571,21 +579,27 @@ private:
                 }
                 fft.performRealOnlyForwardTransform (out.data (), true);
             }
-            stageScratch = out;
-            stageScratch[1] = 0; stageScratch[2 * (kSpectralBins - 1) + 1] = 0;
-            fft.performRealOnlyInverseTransform (stageScratch.data ());
-            auto& dryAcc = dryAccumulator[(size_t) ch];
-            for (size_t n = 0; n < (size_t) kSpectralFftSize; ++n) dryAcc[n] += .5f * stageScratch[n] * spectralWindow[n];
-            transformStages (out, controls, ch == 0);
-            out[1] = 0; out[2 * (kSpectralBins - 1) + 1] = 0;
-            fft.performRealOnlyInverseTransform (out.data ());
-            auto& acc = accumulator[(size_t) ch];
-            for (size_t n = 0; n < (size_t) kSpectralFftSize; ++n) acc[n] += .5f*out[n]*spectralWindow[n];
+            if (renderDry)
+            {
+                stageScratch = out;
+                stageScratch[1] = 0; stageScratch[2 * (kSpectralBins - 1) + 1] = 0;
+                fft.performRealOnlyInverseTransform (stageScratch.data ());
+                auto& dryAcc = dryAccumulator[(size_t) ch];
+                for (size_t n = 0; n < (size_t) kSpectralFftSize; ++n) dryAcc[n] += .5f * stageScratch[n] * spectralWindow[n];
+            }
+            transformStages (out, controls, ch == 0, renderWet);
+            if (renderWet)
+            {
+                out[1] = 0; out[2 * (kSpectralBins - 1) + 1] = 0;
+                fft.performRealOnlyInverseTransform (out.data ());
+                auto& acc = accumulator[(size_t) ch];
+                for (size_t n = 0; n < (size_t) kSpectralFftSize; ++n) acc[n] += .5f*out[n]*spectralWindow[n];
+            }
         }
     }
 
     const SpectralData* data = nullptr;
-    void transformStages (SpectralBuffer& out, const SpectralControls& controls, bool update) noexcept
+    void transformStages (SpectralBuffer& out, const SpectralControls& controls, bool update, bool render) noexcept
     {
         const double step = std::min (1.0, kSpectralHop * rateRatio / (data->rate * .02));
         if (update)
@@ -621,6 +635,7 @@ private:
                 }
             }
         }
+        if (! render) return;
         auto apply = [&] (SpectralBuffer& bins, const SpectralControls& c)
         {
             const double binHz = data->rate / (rateRatio * kSpectralFftSize);
@@ -677,6 +692,7 @@ private:
     std::array<std::array<float, 2 * kSpectralFftSize>, 2> spectrum {};
     double framePosition = 0, rateRatio = 1;
     int hopPosition = 0;
+    int dryFrames = 0, wetFrames = 0;
     bool initialised = false;
 };
 } // namespace bw

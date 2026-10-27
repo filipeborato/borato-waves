@@ -2158,6 +2158,61 @@ void testGranularJitterPanAndLevel ()
 }
 } // namespace
 
+void testGrainInterpolation ()
+{
+    double worstResidual = 0, worstPassband = 0, originalResidual = 0, originalPassband = 0;
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        bw::Sample sample; sample.rate = rate; sample.data.resize (256); sample.right.resize (256);
+        for (int hz = 250; hz <= 16000; hz += 250)
+        {
+            const double omega = juce::MathConstants<double>::twoPi * hz / rate;
+            for (size_t n = 0; n < sample.data.size (); ++n)
+            {
+                sample.data[n] = (float) std::sin (omega * n);
+                sample.right[n] = (float) std::cos (omega * n);
+            }
+            for (int p = 0; p < 257; ++p)
+            {
+                const double position = 64 + (p + .37) / 257;
+                const auto [l, r] = bw::readGrainStereo (sample, position, .5, 0, 256);
+                const auto original = sample.readFilteredStereo (position, .5, 0, 256);
+                const double gain = std::hypot ((double) l, (double) r);
+                worstPassband = std::max (worstPassband, std::abs (20 * std::log10 (gain)));
+                originalPassband = std::max (originalPassband, std::abs (20 * std::log10 (std::hypot ((double) original.first, (double) original.second))));
+                if (hz == 1000)
+                {
+                    worstResidual = std::max (worstResidual, std::hypot (l - std::sin (omega * position), r - std::cos (omega * position)));
+                    originalResidual = std::max (originalResidual, std::hypot (original.first - std::sin (omega * position), original.second - std::cos (omega * position)));
+                }
+            }
+        }
+        // Finite, continuous filter handover, then exactly the existing anti-aliasing path.
+        for (double step : { .98, 1.0 })
+        {
+            const auto a = bw::readGrainStereo (sample, 64.37, step - 1e-8, 0, 256);
+            const auto b = bw::readGrainStereo (sample, 64.37, step + 1e-8, 0, 256);
+            assert (std::abs (a.first - b.first) < 1e-5 && std::abs (a.second - b.second) < 1e-5);
+        }
+        for (double step : { 1.0, 1.001, 2.0, 4.0 })
+            assert (bw::readGrainStereo (sample, 64.37, step, 0, 256) == sample.readFilteredStereo (64.37, step, 0, 256));
+        sample.right.clear ();
+        for (size_t n = 0; n < sample.data.size (); ++n) sample.data[n] = n >= 32 && n < 48 ? 1.0f : 1000.0f;
+        for (double position : { -10.0, 32.0, 32.01, 40.37, 46.99, 47.0, 300.0 })
+        {
+            const auto out = bw::readGrainStereo (sample, position, .5, 32, 48);
+            assert (std::abs (out.first - 1) < 1e-6 && out.second == out.first);
+        }
+        const auto invalid = bw::readGrainStereo (sample, std::numeric_limits<double>::quiet_NaN (), .5, 32, 48);
+        assert (invalid.first == 0 && invalid.second == 0);
+    }
+    const double residualDb = 20 * std::log10 (worstResidual);
+    std::cout << "grain interpolation worst residual " << residualDb << " dB, passband " << worstPassband << " dB\n";
+    std::cout << "original sinc on same fixture: residual " << 20 * std::log10 (originalResidual)
+              << " dB, passband " << originalPassband << " dB\n";
+    assert (residualDb <= -80 && worstPassband <= .1);
+}
+
 void testGrainWindowEndpoints ()
 {
     // Independent double evaluator of the ticket's formulas, not the production table builder.
@@ -2372,6 +2427,7 @@ int main (int argc, char** argv)
         folder.deleteRecursively ();
         return 0;
     }
+    testGrainInterpolation ();
     testGrainWindowEndpoints ();
     if (argc > 1) return 0;
     testDeclaredLatencyByImpulse ();

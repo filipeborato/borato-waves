@@ -5,6 +5,66 @@ namespace bw
 {
 constexpr int kMaxGrainsPerVoice = 32;
 constexpr int kMaxGrainBatch = 8;
+
+// Normalised 16-tap Blackman sinc; interpolation between phases avoids coefficient steps.
+struct GrainKernelTable
+{
+    static constexpr int radius = 8, taps = 2 * radius, phases = 1024;
+    std::array<std::array<float, taps>, phases + 1> weights {};
+    GrainKernelTable ()
+    {
+        for (int p = 0; p <= phases; ++p)
+        {
+            std::array<double, taps> values {};
+            double sum = 0;
+            for (int k = 0; k < taps; ++k)
+            {
+                const double x = k - radius + 1 - (double) p / phases;
+                const double a = juce::MathConstants<double>::pi * x;
+                values[(size_t) k] = (x == 0 ? 1 : std::sin (a) / a)
+                    * (.42 + .5 * std::cos (a / radius) + .08 * std::cos (2 * a / radius));
+                sum += values[(size_t) k];
+            }
+            for (int k = 0; k < taps; ++k) weights[(size_t) p][(size_t) k] = (float) (values[(size_t) k] / sum);
+        }
+    }
+};
+inline const GrainKernelTable grainKernel;
+
+inline std::pair<float, float> readGrainStereo (const Sample& sample, double position, double increment,
+                                               double first, double last) noexcept
+{
+    if (sample.data.empty () || ! std::isfinite (position) || ! std::isfinite (increment)
+        || ! std::isfinite (first) || ! std::isfinite (last) || increment <= 0) return {};
+    if (increment >= 1) return sample.readFilteredStereo (position, increment, first, last);
+    const int lo = juce::jlimit (0, sample.numFrames () - 1, (int) std::ceil (first));
+    const int hi = juce::jlimit (lo, sample.numFrames () - 1, (int) std::ceil (last) - 1);
+    position = juce::jlimit ((double) lo, (double) hi, position);
+    const int base = (int) std::floor (position);
+    const bool stereo = sample.isStereo ();
+    if (position == base) return { sample.data[(size_t) base], stereo ? sample.right[(size_t) base] : sample.data[(size_t) base] };
+    const double phase = (position - base) * GrainKernelTable::phases;
+    const auto p = (size_t) phase;
+    const float fraction = (float) (phase - p);
+    double left = 0, right = 0;
+    for (int k = 0; k < GrainKernelTable::taps; ++k)
+    {
+        const auto index = (size_t) juce::jlimit (lo, hi, base + k - GrainKernelTable::radius + 1);
+        const float weight = grainKernel.weights[p][(size_t) k]
+            + fraction * (grainKernel.weights[p + 1][(size_t) k] - grainKernel.weights[p][(size_t) k]);
+        left += weight * sample.data[index];
+        if (stereo) right += weight * sample.right[index];
+    }
+    std::pair<float, float> out { (float) left, (float) (stereo ? right : left) };
+    // Meet the existing ascending-pitch filter continuously during bend/glide across unity.
+    if (increment > .98)
+    {
+        const auto full = sample.readFilteredStereo (position, increment, first, last);
+        const float mix = (float) ((increment - .98) / .02);
+        out.first += mix * (full.first - out.first); out.second += mix * (full.second - out.second);
+    }
+    return out;
+}
 struct DeterministicRng
 {
     uint64_t state = 1;
@@ -193,7 +253,7 @@ struct Grain
     std::array<double, 2> positions {};
     int age = 0, duration = 1;
     float gainL = 1, gainR = 1;
-    bool active = false;
+    bool active = false, warped = false, neutralWindow = true;
     GrainWindowType window = GrainWindowType::hann;
     float windowAmount = 0, windowSkew = .5f, windowGain = 1;
     double pitchRatio = 1;
@@ -292,23 +352,21 @@ public:
         {
             if (! grain.active) continue;
             const double phase = (double) grain.age / grain.duration;
-            const float window = grainWindow (grain, phase);
+            const float window = grain.neutralWindow ? grainWindow (phase) : grainWindow (grain, phase);
             windowSum += window;
             double u = phase, nextU = (double) (grain.age + 1) / grain.duration;
-            for (const auto& warp : grain.warp)
+            if (grain.warped) for (const auto& warp : grain.warp)
             {
                 u = applyGrainWarp (u, warp.type, warp.amount);
                 nextU = applyGrainWarp (nextU, warp.type, warp.amount);
             }
-            const bool warped = (grain.warp[0].type != GrainWarpType::identity && grain.warp[0].amount != 0)
-                             || (grain.warp[1].type != GrainWarpType::identity && grain.warp[1].amount != 0);
             for (size_t l = 0; l < 2; ++l)
             {
                 const auto& source = grain.sources[l];
                 if (! source.sample || source.weight <= 0) continue;
                 const double increment = frequency * source.ratio * grain.pitchRatio * (grain.reverse ? -1 : 1)
-                                       * (warped ? (nextU - u) * grain.duration : 1);
-                const auto value = source.sample->readFilteredStereo (grain.positions[l], std::abs (increment), source.from, source.to);
+                                       * (grain.warped ? (nextU - u) * grain.duration : 1);
+                const auto value = readGrainStereo (*source.sample, grain.positions[l], std::abs (increment), source.from, source.to);
                 const double weight = window * source.weight;
                 left += value.first * weight * grain.gainL; right += value.second * weight * grain.gainR;
                 grain.positions[l] = advance (grain.positions[l], increment, source, controls.loop);
@@ -377,6 +435,8 @@ private:
         free->warp = controls.warp;
         for (auto& warp : free->warp) warp.amount = (float) juce::jlimit (-1.0, 1.0, bounded (warp.amount, -1, 1) + spread (bounded (controls.warpSpread, 0, 1)));
         free->windowGain = grainWindowGain (free->window, free->windowAmount, free->windowSkew);
+        free->neutralWindow = free->windowSkew == .5f && (free->windowAmount == 0 || free->window == GrainWindowType::hann);
+        for (const auto& warp : free->warp) free->warped |= warp.type != GrainWarpType::identity && warp.amount != 0;
         // Without grain loop a grain must end inside the region: shorter regions shorten it, later starts move back.
         const size_t lead = sources[0].sample ? 0u : 1u;
         const double increment = frequency * sources[lead].ratio * free->pitchRatio, span = sources[lead].to - sources[lead].from - 1;

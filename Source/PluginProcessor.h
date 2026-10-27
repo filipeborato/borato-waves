@@ -164,7 +164,7 @@ private:
     bw::SpectralVoicePlayer spectral;
     juce::SmoothedValue<float> spectralMix, spectralPosition, spectralSpeed, spectralPitch;
     void startSpectral () noexcept;
-    bw::SpectralControls spectralControls (float position, float speed, float semitones) const noexcept;
+    bw::SpectralControls spectralControls (float position, float speed, float semitones, const bw::SpectralData* data) const noexcept;
     int swapLeft = 0, swapLength = 240, cachedSampleRoot = -1;
     float cachedSampleSemitones = 10000, cachedSamplePan = 10000, sampleLeftGain = 1, sampleRightGain = 1;
     double sampleRatio = 1;

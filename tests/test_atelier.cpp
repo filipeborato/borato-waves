@@ -98,6 +98,26 @@ int main (int argc, char** argv)
     if (output != File ()) assert (output.createDirectory ());
     WaveProcessor p;
     const auto& presets = bw::factoryPresets ();
+    // Reject malformed embedded audio before FFT; never feed NaN/Inf into playback.
+    int lastAtelier = (int) presets.size () - 1;
+    while (lastAtelier >= 0 && ! String (presets[(size_t) lastAtelier].name).startsWith ("Atelier - ")) --lastAtelier;
+    assert (lastAtelier >= 0 && presets[(size_t) lastAtelier].tables[0] != nullptr);
+    p.loadFactoryPreset (lastAtelier);
+    MemoryBlock state;
+    p.getStateInformation (state);
+    auto xml = AudioProcessor::getXmlFromBinary (state.getData (), (int) state.getSize ());
+    assert (xml != nullptr && xml->getChildByName ("USERTABLES") != nullptr);
+    auto* entry = xml->getChildByName ("USERTABLES")->getChildByName ("TABLE");
+    assert (entry != nullptr);
+    MemoryBlock bytes;
+    assert (bytes.fromBase64Encoding (entry->getStringAttribute ("data")));
+    const float invalid = std::numeric_limits<float>::quiet_NaN ();
+    bytes.copyFrom (&invalid, 0, sizeof (invalid));
+    entry->setAttribute ("data", bytes.toBase64Encoding ());
+    AudioProcessor::copyXmlToBinary (*xml, state);
+    p.setStateInformation (state.getData (), (int) state.getSize ());
+    assert (p.userTable (0) == nullptr && p.matchingFactoryPreset () == -1);
+
     int checked = 0;
     for (int index = 0; index < (int) presets.size (); ++index)
     {
@@ -192,21 +212,5 @@ int main (int argc, char** argv)
         std::fflush (stdout);
     }
     assert (checked == 12);
-    // Reject malformed embedded audio before FFT; never feed NaN/Inf into playback.
-    int lastAtelier = (int) presets.size () - 1;
-    while (! String (presets[(size_t) lastAtelier].name).startsWith ("Atelier")) --lastAtelier;
-    p.loadFactoryPreset (lastAtelier);
-    MemoryBlock state;
-    p.getStateInformation (state);
-    auto xml = AudioProcessor::getXmlFromBinary (state.getData (), (int) state.getSize ());
-    auto* entry = xml->getChildByName ("USERTABLES")->getChildByName ("TABLE");
-    MemoryBlock bytes;
-    assert (bytes.fromBase64Encoding (entry->getStringAttribute ("data")));
-    const float invalid = std::numeric_limits<float>::quiet_NaN ();
-    bytes.copyFrom (&invalid, 0, sizeof (invalid));
-    entry->setAttribute ("data", bytes.toBase64Encoding ());
-    AudioProcessor::copyXmlToBinary (*xml, state);
-    p.setStateInformation (state.getData (), (int) state.getSize ());
-    assert (p.userTable (0) == nullptr && p.matchingFactoryPreset () == -1);
     std::printf ("ok: %d Atelier patches\n", checked);
 }
