@@ -37,7 +37,7 @@ jobs:
       - name: Configure Debug tests
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBORATOWAVE_FETCH_JUCE=ON -DBORATOWAVE_BUILD_TESTS=ON
       - name: Build tests
-        run: cmake --build build --parallel 2 --target test_wavetable test_interface test_sources test_modulation test_effects test_presets test_atelier test_voices test_sample test_table_editor test_history test_tuned_import
+        run: cmake --build build --parallel 2 --target test_wavetable test_interface test_sources test_modulation test_effects test_presets test_atelier test_voices test_sample test_table_editor test_history test_tuned_import test_spectral
       - name: Run tests with assertions enabled
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" ctest --test-dir build --output-on-failure --no-tests=error --parallel 1
 
