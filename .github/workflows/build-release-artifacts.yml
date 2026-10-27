@@ -123,7 +123,7 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then
             test -d "$root/Standalone/Borato Waves.app"
             for bundle in "$root/VST3/Borato Waves.vst3" "$root/Standalone/Borato Waves.app"; do
-              lipo -verify_arch "$ARCH" "$bundle/Contents/MacOS/Borato Waves"
+              lipo "$bundle/Contents/MacOS/Borato Waves" -verify_arch "$ARCH"
               codesign --force --deep --sign - "$bundle"
               codesign --verify --deep --strict "$bundle"
             done
