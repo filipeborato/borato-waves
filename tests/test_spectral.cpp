@@ -97,6 +97,60 @@ double phaseAt (const std::vector<float>& x, size_t from, size_t to, double hz)
     return std::atan2 (c, s);
 }
 
+void testSleepingMixBranches ()
+{
+    const auto sample = makeSample (48000, sine (440), sine (660));
+    const auto data = analyze (*sample);
+    for (double rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        auto controls = whole (*data); controls.loop = true;
+        controls.stages[0] = { bw::SpectralStageType::binShift, .1f, false };
+        auto low = controls, high = controls;
+        low.wet = .25f; high.wet = .75f;
+        bw::SpectralVoicePlayer quarter, threeQuarters, dry, wet;
+        quarter.reset (data.get (), low, rate); threeQuarters.reset (data.get (), high, rate);
+        auto d = controls, w = controls; d.wet = 0; w.wet = 1;
+        dry.reset (data.get (), d, rate); wet.reset (data.get (), w, rate);
+        double error = 0;
+        const auto heapBefore = gAudioHeapOps.load ();
+        for (int n = 0; n < 24000; ++n)
+        {
+            ScopedAudioHeapGuard guard;
+            // Move the stage while the processed branch is asleep: its phase must keep advancing.
+            if (n == 4000) low.stages[0].amount = high.stages[0].amount = d.stages[0].amount = w.stages[0].amount = -.15f;
+            if (n == 8003) { d.wet = 1; w.wet = 0; }
+            const auto a = quarter.process (low), b = threeQuarters.process (high);
+            const auto x = dry.process (d), y = wet.process (w);
+            assert (std::isfinite (x.first) && std::isfinite (y.second));
+            // Four-hop pre-roll plus the existing 10 ms mix ramp must settle within this bound.
+            if (n < 8003 || n > 8003 + 4 * bw::kSpectralHop + (int) (rate * .01) + 2)
+            {
+                const double expectedDry = 1.5 * a.first - .5 * b.first;
+                const double expectedWet = 1.5 * b.first - .5 * a.first;
+                error = std::max (error, std::abs (x.first - (n < 8003 ? expectedDry : expectedWet)));
+                error = std::max (error, std::abs (y.first - (n < 8003 ? expectedWet : expectedDry)));
+                const double rightDry = 1.5 * a.second - .5 * b.second;
+                const double rightWet = 1.5 * b.second - .5 * a.second;
+                error = std::max (error, std::abs (x.second - (n < 8003 ? rightDry : rightWet)));
+                error = std::max (error, std::abs (y.second - (n < 8003 ? rightWet : rightDry)));
+            }
+        }
+        assert (gAudioHeapOps.load () == heapBefore);
+        std::cout << "sleeping spectral branches " << rate << " max error " << error << '\n';
+        assert (error < 2e-6);
+        // Rapid reversals during pre-roll must remain finite.
+        for (int n = 0; n < 8000; ++n)
+        {
+            if (n % 173 == 0) d.wet = 1 - d.wet;
+            const auto out = dry.process (d);
+            assert (std::isfinite (out.first) && std::abs (out.first) < 2);
+        }
+        d.loop = false;
+        for (int n = 0; n < 120000 && ! dry.idle (); ++n) dry.process (d);
+        assert (dry.idle ());
+    }
+}
+
 void testIdentityReconstruction ()
 {
     const int frames = 48000;
@@ -827,6 +881,7 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     if (argc > 1 && juce::String (argv[1]) == "--filter") { testSpectralFilterAndPhaseAlignedMix (); folder.deleteRecursively (); return 0; }
     if (argc > 1) { testTransientIdentity (); testSpectralStages (); testPhaseLockFixtures (); testTransientRatesAndCloseAttacks (); testSpectralFilterAndPhaseAlignedMix (); folder.deleteRecursively (); return 0; }
+    testSleepingMixBranches ();
     testIdentityReconstruction ();
     testCancellation ();
     testTransientIdentity ();

@@ -574,7 +574,7 @@ void benchmarkProfiles()
 
 // Issue 28: the sample engines under their factory presets, 16 held notes, three 2 s runs per rate.
 // Per-block times are reported against the block period; gate: mean <= 70%, p99 < 70%, max < 100%.
-void benchmarkEngines()
+void benchmarkEngines (bool multisampleWithoutFx = false)
 {
     struct Case { const char* name; const char* preset; bool saturateGrains; int notes = 16; };
     constexpr Case cases[] {
@@ -590,6 +590,7 @@ void benchmarkEngines()
     const auto& presets = bw::factoryPresets();
     for (const auto& c : cases)
     {
+        if (multisampleWithoutFx && ! juce::String (c.name).startsWith ("multisample")) continue;
         int index = -1;
         for (int i = 0; i < (int) presets.size(); ++i) if (juce::String (presets[(size_t) i].name) == c.preset) index = i;
         if (index < 0) std::abort();
@@ -598,6 +599,8 @@ void benchmarkEngines()
             {
                 WaveProcessor p;
                 p.loadFactoryPreset (index);
+                if (multisampleWithoutFx)
+                    for (auto id : { "distOn", "chorusOn", "delayOn", "reverbOn", "eqOn", "compOn" }) set (p, id, 0);
                 // Dense, long grains fill every voice's 32-grain pool.
                 if (c.saturateGrains) { set (p, "grainDensity", 100); set (p, "grainSize", 500); }
                 p.prepareToPlay (rate, blockSize);
@@ -634,7 +637,7 @@ void benchmarkEngines()
                 std::sort (times.begin(), times.end());
                 const double p99 = times[(size_t) (0.99 * (double) (times.size() - 1))], worst = times.back();
                 const bool pass = mean <= 70 && p99 < 70 && worst < 100;
-                std::cout << "engine_benchmark case=" << c.name << " rate=" << rate << " block=" << blockSize << " run=" << run
+                std::cout << "engine_benchmark case=" << c.name << (multisampleWithoutFx ? "_no_fx" : "") << " rate=" << rate << " block=" << blockSize << " run=" << run
                           << " notes=" << c.notes << " max_grains=" << maxGrains << " mean_pct=" << mean << " p99_pct=" << p99
                           << " max_pct=" << worst << " gate=" << (pass ? "PASS" : "FAIL") << '\n';
             }
@@ -648,6 +651,7 @@ int main (int argc, char** argv)
     const bool benchmark = argc > 1 && juce::String (argv[1]) == "--benchmark";
     if (benchmark) { benchmarkProfiles(); return 0; }
     if (argc > 1 && juce::String (argv[1]) == "--benchmark-engines") { benchmarkEngines(); return 0; }
+    if (argc > 1 && juce::String (argv[1]) == "--benchmark-multisample-no-fx") { benchmarkEngines (true); return 0; }
     WaveProcessor processor;
     initialise (processor);
     testCurves(); testTableFade (processor.wavetableBank);

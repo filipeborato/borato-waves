@@ -440,10 +440,9 @@ bw::GrainSources WaveVoice::grainSources () const noexcept
     return result;
 }
 
-bw::SpectralControls WaveVoice::spectralControls (float position, float speed, float semitones) const noexcept
+bw::SpectralControls WaveVoice::spectralControls (float position, float speed, float semitones, const bw::SpectralData* data) const noexcept
 {
     bw::SpectralControls c;
-    const auto* data = spectral.source () ? spectral.source () : params.spectral;
     if (! data) return c;
     // A bank plays its first zone's region, loop and root; the single sample its own parameters.
     const auto* zone = params.sampleBank && ! params.sampleBank->zones.empty () ? &params.sampleBank->zones[0] : nullptr;
@@ -476,10 +475,8 @@ bw::SpectralControls WaveVoice::spectralControls (float position, float speed, f
 void WaveVoice::startSpectral () noexcept
 {
     if (! params.spectral) return;
-    // Controls read the analysis this voice will play, so point at it before computing them.
-    spectral.reset (params.spectral, {}, getSampleRate ());
     spectral.reset (params.spectral, spectralControls (spectralPosition.getCurrentValue (), spectralSpeed.getCurrentValue (),
-                                                       samplePitch.getCurrentValue () + bend.getCurrentValue () + glideOffset.getCurrentValue () + spectralPitch.getCurrentValue ()),
+                                                       samplePitch.getCurrentValue () + bend.getCurrentValue () + glideOffset.getCurrentValue () + spectralPitch.getCurrentValue (), params.spectral),
                     getSampleRate ());
 }
 
@@ -790,7 +787,7 @@ void WaveVoice::renderNextBlock (juce::AudioBuffer<float>& out, int start, int n
             if (spectralMode && ! spectral.source () && sampleGate > 0) startSpectral ();
             if (spectralAmount > 0 || ! spectral.idle ())
             {
-                auto controls = spectralControls (spectralPos, spectralRate, sampleSemitones + spectralSemitones);
+                auto controls = spectralControls (spectralPos, spectralRate, sampleSemitones + spectralSemitones, spectral.source () ? spectral.source () : params.spectral);
                 controls.stages[0].amount = effective (bw::kSpectralStage1Destination, controls.stages[0].amount);
                 controls.stages[1].amount = effective (bw::kSpectralStage2Destination, controls.stages[1].amount);
                 controls.filter.lowHz = effective (bw::kSpectralFilterLowDestination, controls.filter.lowHz);
